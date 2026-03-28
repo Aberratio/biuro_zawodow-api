@@ -29,6 +29,8 @@ CREATE TABLE events (
     event_date DATE NOT NULL,
     location VARCHAR(255) NOT NULL,
     organization_id VARCHAR(64) NOT NULL,
+    office_open_at DATETIME NOT NULL,
+    office_close_at DATETIME NOT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     PRIMARY KEY (id),
@@ -118,8 +120,7 @@ CREATE TABLE participants (
     bib_number VARCHAR(32) NULL,
     qr_code VARCHAR(128) NULL,
     custom_fields_json LONGTEXT NULL,
-    status ENUM('pending', 'checked_in') NOT NULL DEFAULT 'pending',
-    package_status ENUM('not_collected', 'collected') NOT NULL DEFAULT 'not_collected',
+    status ENUM('not_checked_in', 'checked_in', 'checked_in_not_starting') NOT NULL DEFAULT 'not_checked_in',
     email_status ENUM('not_sent', 'sent') NOT NULL DEFAULT 'not_sent',
     checked_in_at DATETIME NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -184,16 +185,18 @@ ON DUPLICATE KEY UPDATE
     name = VALUES(name),
     event_limit = VALUES(event_limit);
 
-INSERT INTO events (id, name, event_date, location, organization_id)
+INSERT INTO events (id, name, event_date, location, organization_id, office_open_at, office_close_at)
 VALUES
-    ('evt-1', 'Bieg Piastowski 10km', '2026-04-12', 'Gniezno, Park Miejski', 'org-1'),
-    ('evt-2', 'Triathlon Poznan Sprint', '2026-05-18', 'Poznan, Malta', 'org-1'),
-    ('evt-3', 'Maraton Wroclaw', '2026-06-07', 'Wroclaw, Hala Stulecia', 'org-2')
+    ('evt-1', 'Bieg Piastowski 10km', '2026-04-12', 'Gniezno, Park Miejski', 'org-1', '2026-03-28 07:00:00', '2026-03-28 18:00:00'),
+    ('evt-2', 'Triathlon Poznan Sprint', '2026-05-18', 'Poznan, Malta', 'org-1', '2026-05-18 06:30:00', '2026-05-18 14:30:00'),
+    ('evt-3', 'Maraton Wroclaw', '2026-06-07', 'Wroclaw, Hala Stulecia', 'org-2', '2026-06-07 05:30:00', '2026-06-07 16:00:00')
 ON DUPLICATE KEY UPDATE
     name = VALUES(name),
     event_date = VALUES(event_date),
     location = VALUES(location),
-    organization_id = VALUES(organization_id);
+    organization_id = VALUES(organization_id),
+    office_open_at = VALUES(office_open_at),
+    office_close_at = VALUES(office_close_at);
 
 INSERT INTO users (id, name, email, password, role, organization_id)
 VALUES
@@ -226,10 +229,10 @@ VALUES
 ON DUPLICATE KEY UPDATE
     organization_id = VALUES(organization_id);
 
-INSERT INTO participants (event_id, first_name, last_name, display_name, email, organization, bib_number, qr_code, custom_fields_json, status, package_status, email_status)
+INSERT INTO participants (event_id, first_name, last_name, display_name, email, organization, bib_number, qr_code, custom_fields_json, status, email_status)
 VALUES
-    ('evt-1', 'Anna', 'Kowalska', 'Anna Kowalska', 'anna.kowalska@example.com', 'Politechnika Warszawska', '101', 'QR-evt-1-101', NULL, 'pending', 'not_collected', 'not_sent'),
-    ('evt-2', 'Jan', 'Nowak', 'Jan Nowak', 'jan.nowak@example.com', 'Uniwersytet Warszawski', '201', 'QR-evt-2-201', NULL, 'pending', 'not_collected', 'not_sent')
+    ('evt-1', 'Anna', 'Kowalska', 'Anna Kowalska', 'anna.kowalska@example.com', 'Politechnika Warszawska', '101', 'QR-evt-1-101', NULL, 'not_checked_in', 'not_sent'),
+    ('evt-2', 'Jan', 'Nowak', 'Jan Nowak', 'jan.nowak@example.com', 'Uniwersytet Warszawski', '201', 'QR-evt-2-201', NULL, 'not_checked_in', 'not_sent')
 ON DUPLICATE KEY UPDATE
     first_name = VALUES(first_name),
     last_name = VALUES(last_name),
@@ -239,7 +242,6 @@ ON DUPLICATE KEY UPDATE
     qr_code = VALUES(qr_code),
     custom_fields_json = VALUES(custom_fields_json),
     status = VALUES(status),
-    package_status = VALUES(package_status),
     email_status = VALUES(email_status);
 
 INSERT INTO activity_logs (id, action, participant_id, participant_name_snapshot, user_id, user_name_snapshot)
