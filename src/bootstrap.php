@@ -88,6 +88,35 @@ function isValidDateString(string $value): bool
     return $date !== false && $date->format('Y-m-d') === $value;
 }
 
+function parseLocalDateTimeString(string $value): ?DateTimeImmutable
+{
+    $trimmed = trim($value);
+    if ($trimmed === '') {
+        return null;
+    }
+
+    $formats = ['Y-m-d\TH:i:s', 'Y-m-d\TH:i'];
+    foreach ($formats as $format) {
+        $dateTime = DateTimeImmutable::createFromFormat($format, $trimmed);
+        if ($dateTime !== false && $dateTime->format($format) === $trimmed) {
+            return $dateTime;
+        }
+    }
+
+    return null;
+}
+
+function isValidLocalDateTimeString(string $value): bool
+{
+    return parseLocalDateTimeString($value) !== null;
+}
+
+function normalizeLocalDateTimeString(string $value): ?string
+{
+    $dateTime = parseLocalDateTimeString($value);
+    return $dateTime?->format('Y-m-d H:i:s');
+}
+
 function setCorsHeaders(): void
 {
     $allowedOriginsRaw = getenv('APP_CORS_ORIGIN') ?: '*';
@@ -1379,8 +1408,7 @@ function openApiDocument(): array
                         'organization' => ['type' => 'string', 'nullable' => true, 'example' => 'AGH'],
                         'bib_number' => ['type' => 'string', 'nullable' => true, 'example' => '101'],
                         'qr_code' => ['type' => 'string', 'nullable' => true, 'example' => 'QR-evt-1-101'],
-                        'status' => ['type' => 'string', 'enum' => ['pending', 'checked_in'], 'default' => 'pending'],
-                        'package_status' => ['type' => 'string', 'enum' => ['not_collected', 'collected'], 'default' => 'not_collected'],
+                        'status' => ['type' => 'string', 'enum' => ['not_checked_in', 'checked_in', 'checked_in_not_starting'], 'default' => 'not_checked_in'],
                         'email_status' => ['type' => 'string', 'enum' => ['not_sent', 'sent'], 'default' => 'not_sent'],
                     ],
                 ],
@@ -1407,13 +1435,15 @@ function openApiDocument(): array
                 ],
                 'Event' => [
                     'type' => 'object',
-                    'required' => ['id', 'name', 'date', 'location', 'organization_id'],
+                    'required' => ['id', 'name', 'date', 'location', 'organization_id', 'office_open_at', 'office_close_at'],
                     'properties' => [
                         'id' => ['type' => 'string', 'example' => 'evt-1'],
                         'name' => ['type' => 'string', 'example' => 'Bieg Piastowski 10km'],
                         'date' => ['type' => 'string', 'format' => 'date'],
                         'location' => ['type' => 'string', 'example' => 'Gniezno, Park Miejski'],
                         'organization_id' => ['type' => 'string', 'example' => 'org-1'],
+                        'office_open_at' => ['type' => 'string', 'format' => 'date-time', 'example' => '2026-04-12T07:00:00'],
+                        'office_close_at' => ['type' => 'string', 'format' => 'date-time', 'example' => '2026-04-12T15:00:00'],
                     ],
                 ],
                 'EventResponse' => [
@@ -1427,12 +1457,14 @@ function openApiDocument(): array
                 ],
                 'CreateEventRequest' => [
                     'type' => 'object',
-                    'required' => ['name', 'date', 'location', 'organization_id'],
+                    'required' => ['name', 'date', 'location', 'organization_id', 'office_open_at', 'office_close_at'],
                     'properties' => [
                         'name' => ['type' => 'string', 'example' => 'Bieg Jesienny 5km'],
                         'date' => ['type' => 'string', 'format' => 'date', 'example' => '2026-09-20'],
                         'location' => ['type' => 'string', 'example' => 'Krakow, Blonia'],
                         'organization_id' => ['type' => 'string', 'example' => 'org-1'],
+                        'office_open_at' => ['type' => 'string', 'format' => 'date-time', 'example' => '2026-09-20T08:00:00'],
+                        'office_close_at' => ['type' => 'string', 'format' => 'date-time', 'example' => '2026-09-20T16:00:00'],
                     ],
                 ],
                 'UpdateOrganizationEventLimitRequest' => [
@@ -1506,7 +1538,7 @@ function openApiDocument(): array
                 ],
                 'Participant' => [
                     'type' => 'object',
-                    'required' => ['id', 'first_name', 'last_name', 'email', 'status', 'package_status', 'email_status', 'created_at', 'updated_at'],
+                    'required' => ['id', 'first_name', 'last_name', 'email', 'status', 'email_status', 'created_at', 'updated_at'],
                     'properties' => [
                         'id' => ['type' => 'integer', 'format' => 'int64', 'example' => 1],
                         'event_id' => ['type' => 'string', 'nullable' => true, 'example' => 'evt-1'],
@@ -1516,8 +1548,7 @@ function openApiDocument(): array
                         'organization' => ['type' => 'string', 'nullable' => true],
                         'bib_number' => ['type' => 'string', 'nullable' => true],
                         'qr_code' => ['type' => 'string', 'nullable' => true],
-                        'status' => ['type' => 'string', 'enum' => ['pending', 'checked_in']],
-                        'package_status' => ['type' => 'string', 'enum' => ['not_collected', 'collected']],
+                        'status' => ['type' => 'string', 'enum' => ['not_checked_in', 'checked_in', 'checked_in_not_starting']],
                         'email_status' => ['type' => 'string', 'enum' => ['not_sent', 'sent']],
                         'checked_in_at' => ['type' => 'string', 'format' => 'date-time', 'nullable' => true],
                         'created_at' => ['type' => 'string', 'format' => 'date-time'],

@@ -79,7 +79,14 @@ try {
 
     $loadEventById = static function (PDO $pdo, string $eventId): array|false {
         $stmt = $pdo->prepare('
-            SELECT id, name, event_date AS date, location, organization_id
+            SELECT
+                id,
+                name,
+                event_date AS date,
+                location,
+                organization_id,
+                DATE_FORMAT(office_open_at, "%Y-%m-%dT%H:%i:%s") AS office_open_at,
+                DATE_FORMAT(office_close_at, "%Y-%m-%dT%H:%i:%s") AS office_close_at
             FROM events
             WHERE id = :id
             LIMIT 1
@@ -88,6 +95,24 @@ try {
 
         return $stmt->fetch();
     };
+
+    $participantStatuses = [
+        'not_checked_in' => [
+            'label' => 'Nieodprawiony',
+            'counts_as_checked_in' => false,
+        ],
+        'checked_in' => [
+            'label' => 'Odprawiony',
+            'counts_as_checked_in' => true,
+        ],
+        'checked_in_not_starting' => [
+            'label' => 'Odprawiony bez startu',
+            'counts_as_checked_in' => true,
+        ],
+    ];
+
+    $isValidParticipantStatus = static fn(string $status): bool => isset($participantStatuses[$status]);
+    $participantStatusCountsAsCheckedIn = static fn(string $status): bool => (bool)($participantStatuses[$status]['counts_as_checked_in'] ?? false);
 
     $loadUserById = static function (PDO $pdo, string $userId) use ($loadAdminOrganizationIds, $loadAssignedEvents): array|false {
         $stmt = $pdo->prepare('
@@ -259,9 +284,28 @@ try {
         return $canAccessOrganization($authUser, (string)$event['organization_id']);
     };
 
-    $canAccessEvent = static function (array $authUser, array $event) use ($canAccessOrganization): bool {
-        return $canAccessOrganization($authUser, (string)$event['organization_id'])
-            || ($authUser['role'] === 'scanner' && in_array((string)$event['id'], $authUser['assigned_events'] ?? [], true));
+    $isEventOfficeOpenNow = static function (array $event): bool {
+        $openAt = parseLocalDateTimeString((string)($event['office_open_at'] ?? ''));
+        $closeAt = parseLocalDateTimeString((string)($event['office_close_at'] ?? ''));
+        if ($openAt === null || $closeAt === null) {
+            return false;
+        }
+
+        $now = new DateTimeImmutable();
+        return $now >= $openAt && $now <= $closeAt;
+    };
+
+    $canAccessEvent = static function (array $authUser, array $event) use ($canAccessOrganization, $isEventOfficeOpenNow): bool {
+        if ($canAccessOrganization($authUser, (string)$event['organization_id'])) {
+            return true;
+        }
+
+        if ($authUser['role'] !== 'scanner') {
+            return false;
+        }
+
+        return in_array((string)$event['id'], $authUser['assigned_events'] ?? [], true)
+            && $isEventOfficeOpenNow($event);
     };
 
     $generateUniqueParticipantQrCode = static function (PDO $pdo): string {
@@ -338,6 +382,60 @@ try {
         }, $stmt->fetchAll());
     };
 
+    $buildParticipantDataFromMappings = static function (
+        array $mappings,
+        array $fieldValues,
+        bool $requireAllActiveFields = false,
+        ?string $preservedBibNumber = null
+    ): array {
+        $displayNameParts = [];
+        $customFields = [];
+        $bibNumber = $preservedBibNumber;
+        $missingFields = [];
+
+        foreach ($mappings as $mapping) {
+            if (!($mapping['is_active'] ?? true) || $mapping['field_role'] === 'email') {
+                continue;
+            }
+
+            $alias = trim((string)($mapping['alias'] ?? ''));
+            if ($alias === '') {
+                continue;
+            }
+
+            $isRequired = $requireAllActiveFields || (bool)($mapping['is_required'] ?? false);
+            $value = trim((string)($fieldValues[$alias] ?? ''));
+
+            if ($mapping['field_role'] === 'bib_number' && $preservedBibNumber !== null && trim($preservedBibNumber) !== '') {
+                $value = trim($preservedBibNumber);
+            }
+
+            if ($value === '') {
+                if ($isRequired) {
+                    $missingFields[] = $alias;
+                }
+                continue;
+            }
+
+            if ($mapping['field_role'] === 'display_name_part') {
+                $displayNameParts[] = $value;
+            }
+
+            if ($mapping['field_role'] === 'bib_number') {
+                $bibNumber = $value;
+            }
+
+            $customFields[$alias] = $value;
+        }
+
+        return [
+            'display_name' => trim(implode(' ', $displayNameParts)),
+            'custom_fields' => $customFields,
+            'bib_number' => $bibNumber,
+            'missing_fields' => $missingFields,
+        ];
+    };
+
     $ensureParticipantQrCode = static function (PDO $pdo, array $participant) use ($generateUniqueParticipantQrCode): array {
         $qrCode = trim((string)($participant['qr_code'] ?? ''));
         if (QrCodeService::isSecureToken($qrCode)) {
@@ -369,7 +467,6 @@ try {
                 qr_code,
                 custom_fields_json,
                 status,
-                package_status,
                 email_status,
                 checked_in_at,
                 created_at,
@@ -403,7 +500,6 @@ try {
                 qr_code,
                 custom_fields_json,
                 status,
-                package_status,
                 email_status,
                 checked_in_at,
                 created_at,
@@ -434,7 +530,6 @@ try {
                 'email' => (string)$participant['email'],
                 'bib_number' => (string)($participant['bib_number'] ?? ''),
                 'status' => (string)$participant['status'],
-                'package_status' => (string)$participant['package_status'],
                 'email_status' => (string)$participant['email_status'],
                 'checked_in_at' => $participant['checked_in_at'],
                 'qr_code' => (string)$participant['qr_code'],
@@ -444,6 +539,9 @@ try {
                 'name' => (string)$event['name'],
                 'date' => (string)$event['date'],
                 'location' => (string)$event['location'],
+                'organization_id' => (string)$event['organization_id'],
+                'office_open_at' => (string)$event['office_open_at'],
+                'office_close_at' => (string)$event['office_close_at'],
             ],
             'access' => [
                 'allowed' => $canAccess,
@@ -467,6 +565,28 @@ try {
         }
 
         return [$event, null];
+    };
+
+    $updateParticipantStatus = static function (
+        PDO $pdo,
+        array $participant,
+        string $status
+    ) use ($loadParticipantById, $isValidParticipantStatus, $participantStatusCountsAsCheckedIn): array {
+        if (!$isValidParticipantStatus($status)) {
+            throw new InvalidArgumentException('Unsupported participant status');
+        }
+
+        $checkedInAt = $participantStatusCountsAsCheckedIn($status)
+            ? ($participant['checked_in_at'] ?? gmdate('Y-m-d H:i:s'))
+            : null;
+
+        $stmt = $pdo->prepare('UPDATE participants SET status = :status, checked_in_at = :checked_in_at WHERE id = :id');
+        $stmt->bindValue(':status', $status);
+        $stmt->bindValue(':checked_in_at', $checkedInAt, $checkedInAt === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
+        $stmt->bindValue(':id', (int)$participant['id'], PDO::PARAM_INT);
+        $stmt->execute();
+
+        return $loadParticipantById($pdo, (int)$participant['id']) ?: $participant;
     };
 
     $normalizeImportHeader = static function (string $header): string {
@@ -677,7 +797,6 @@ try {
                 qr_code,
                 custom_fields_json,
                 status,
-                package_status,
                 email_status
             ) VALUES (
                 :event_id,
@@ -690,7 +809,6 @@ try {
                 :qr_code,
                 :custom_fields_json,
                 :status,
-                :package_status,
                 :email_status
             )
         ');
@@ -704,8 +822,7 @@ try {
             'bib_number' => $resolvedBibNumber,
             'qr_code' => $resolvedQrCode,
             'custom_fields_json' => $customFields !== [] ? json_encode($customFields, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) : null,
-            'status' => 'pending',
-            'package_status' => 'not_collected',
+            'status' => 'not_checked_in',
             'email_status' => 'not_sent',
         ]);
 
@@ -940,7 +1057,14 @@ try {
         ')->fetchAll();
 
         $events = $pdo->query('
-            SELECT id, name, event_date AS date, location, organization_id
+            SELECT
+                id,
+                name,
+                event_date AS date,
+                location,
+                organization_id,
+                DATE_FORMAT(office_open_at, "%Y-%m-%dT%H:%i:%s") AS office_open_at,
+                DATE_FORMAT(office_close_at, "%Y-%m-%dT%H:%i:%s") AS office_close_at
             FROM events
             ORDER BY event_date ASC
         ')->fetchAll();
@@ -983,7 +1107,6 @@ try {
                 qr_code,
                 custom_fields_json,
                 status,
-                package_status,
                 email_status,
                 checked_in_at,
                 created_at,
@@ -1128,14 +1251,33 @@ try {
         $date = trim((string)($input['date'] ?? ''));
         $location = trim((string)($input['location'] ?? ''));
         $organizationId = trim((string)($input['organization_id'] ?? ''));
+        $officeOpenAt = trim((string)($input['office_open_at'] ?? ''));
+        $officeCloseAt = trim((string)($input['office_close_at'] ?? ''));
 
-        if ($name === '' || $date === '' || $location === '' || $organizationId === '') {
-            jsonResponse(422, ['error' => 'name, date, location and organization_id are required']);
+        if ($name === '' || $date === '' || $location === '' || $organizationId === '' || $officeOpenAt === '' || $officeCloseAt === '') {
+            jsonResponse(422, ['error' => 'name, date, location, organization_id, office_open_at and office_close_at are required']);
             exit;
         }
 
         if (!isValidDateString($date)) {
             jsonResponse(422, ['error' => 'date must be a valid YYYY-MM-DD value']);
+            exit;
+        }
+
+        if (!isValidLocalDateTimeString($officeOpenAt) || !isValidLocalDateTimeString($officeCloseAt)) {
+            jsonResponse(422, ['error' => 'office_open_at and office_close_at must be valid local date-time values']);
+            exit;
+        }
+
+        $normalizedOfficeOpenAt = normalizeLocalDateTimeString($officeOpenAt);
+        $normalizedOfficeCloseAt = normalizeLocalDateTimeString($officeCloseAt);
+        if ($normalizedOfficeOpenAt === null || $normalizedOfficeCloseAt === null) {
+            jsonResponse(422, ['error' => 'office_open_at and office_close_at must be valid local date-time values']);
+            exit;
+        }
+
+        if ($normalizedOfficeOpenAt >= $normalizedOfficeCloseAt) {
+            jsonResponse(422, ['error' => 'office_open_at must be earlier than office_close_at']);
             exit;
         }
 
@@ -1165,8 +1307,8 @@ try {
 
         try {
             $insertEventStmt = $pdo->prepare('
-                INSERT INTO events (id, name, event_date, location, organization_id)
-                VALUES (:id, :name, :event_date, :location, :organization_id)
+                INSERT INTO events (id, name, event_date, location, organization_id, office_open_at, office_close_at)
+                VALUES (:id, :name, :event_date, :location, :organization_id, :office_open_at, :office_close_at)
             ');
             $insertEventStmt->execute([
                 'id' => $eventId,
@@ -1174,6 +1316,8 @@ try {
                 'event_date' => $date,
                 'location' => $location,
                 'organization_id' => $organizationId,
+                'office_open_at' => $normalizedOfficeOpenAt,
+                'office_close_at' => $normalizedOfficeCloseAt,
             ]);
 
             $activityStmt = $pdo->prepare('
@@ -1628,7 +1772,7 @@ try {
         }
 
         $input = readJsonBody();
-        $email = trim((string)($input['email'] ?? ''));
+        $email = normalizeEmailAddress((string)($input['email'] ?? ''));
         $fieldValues = is_array($input['field_values'] ?? null) ? $input['field_values'] : [];
 
         if ($email === '' || !isValidEmailAddress($email)) {
@@ -1636,39 +1780,25 @@ try {
             exit;
         }
 
-        $displayNameParts = [];
-        $customFields = [];
-        $bibNumber = null;
-
-        foreach ($mappings as $mapping) {
-            if (!($mapping['is_active'] ?? true) || $mapping['field_role'] === 'email') {
-                continue;
-            }
-
-            $alias = (string)$mapping['alias'];
-            $value = trim((string)($fieldValues[$alias] ?? ''));
-            if ($value === '') {
-                continue;
-            }
-
-            if ($mapping['field_role'] === 'display_name_part') {
-                $displayNameParts[] = $value;
-            }
-
-            if ($mapping['field_role'] === 'bib_number') {
-                $bibNumber = $value;
-            }
-
-            $customFields[$alias] = $value;
-        }
-
-        $displayName = trim(implode(' ', $displayNameParts));
-        if ($displayName === '') {
+        $resolvedData = $buildParticipantDataFromMappings($mappings, $fieldValues);
+        if ($resolvedData['display_name'] === '') {
             jsonResponse(422, ['error' => 'At least one display name field is required']);
             exit;
         }
 
-        $participant = $insertParticipantRecord($pdo, $eventId, $displayName, $email, $bibNumber, $customFields);
+        if ($resolvedData['missing_fields'] !== []) {
+            jsonResponse(422, ['error' => 'Missing required participant fields', 'missing_fields' => $resolvedData['missing_fields']]);
+            exit;
+        }
+
+        $participant = $insertParticipantRecord(
+            $pdo,
+            $eventId,
+            $resolvedData['display_name'],
+            $email,
+            is_string($resolvedData['bib_number']) ? $resolvedData['bib_number'] : null,
+            is_array($resolvedData['custom_fields']) ? $resolvedData['custom_fields'] : []
+        );
         jsonResponse(201, ['data' => $participant]);
         exit;
     }
@@ -2165,7 +2295,6 @@ try {
                 qr_code,
                 custom_fields_json,
                 status,
-                package_status,
                 email_status,
                 checked_in_at,
                 created_at,
@@ -2276,13 +2405,7 @@ try {
         }
 
         if ($autoCheckIn && (string)$participant['status'] !== 'checked_in') {
-            $checkInStmt = $pdo->prepare('UPDATE participants SET status = :status, checked_in_at = UTC_TIMESTAMP() WHERE id = :id');
-            $checkInStmt->execute([
-                'status' => 'checked_in',
-                'id' => (int)$participant['id'],
-            ]);
-            $participant['status'] = 'checked_in';
-            $participant['checked_in_at'] = gmdate('Y-m-d H:i:s');
+            $participant = $updateParticipantStatus($pdo, $participant, 'checked_in');
             $addActivityLog(
                 $pdo,
                 'Check-in przez skaner QR',
@@ -2306,6 +2429,119 @@ try {
         exit;
     }
 
+    if (preg_match('#^/participants/(\d+)$#', $path, $matches) === 1 && $method === 'PATCH') {
+        $authUser = requireAnyRole(['superadmin', 'admin', 'editor'], $resolveAuthenticatedUser);
+        $participant = $loadParticipantById($pdo, (int)$matches[1]);
+
+        if ($participant === false) {
+            jsonResponse(404, ['error' => 'Participant not found']);
+            exit;
+        }
+
+        [$event, $accessError] = $assertParticipantEventAccess($pdo, $authUser, $participant);
+        if ($accessError !== null || $event === null || !$canManageEventParticipants($authUser, $event)) {
+            jsonResponse($accessError === 'Forbidden' ? 403 : 422, ['error' => $accessError ?? 'Forbidden']);
+            exit;
+        }
+
+        $input = readJsonBody();
+        $nextStatus = trim((string)($input['status'] ?? ''));
+        $email = array_key_exists('email', $input) ? normalizeEmailAddress((string)$input['email']) : null;
+        $fieldValues = is_array($input['field_values'] ?? null) ? $input['field_values'] : null;
+
+        if ($nextStatus === '' && $email === null && $fieldValues === null) {
+            jsonResponse(422, ['error' => 'At least one participant field must be provided']);
+            exit;
+        }
+
+        if ($nextStatus !== '') {
+            if (!$isValidParticipantStatus($nextStatus)) {
+                jsonResponse(422, ['error' => 'Unsupported participant status']);
+                exit;
+            }
+
+            if ($nextStatus !== (string)$participant['status']) {
+                $participant = $updateParticipantStatus($pdo, $participant, $nextStatus);
+                $addActivityLog(
+                    $pdo,
+                    'Zmieniono status uczestnika',
+                    (int)$participant['id'],
+                    (string)$participant['display_name'],
+                    (string)$authUser['id'],
+                    (string)$authUser['name']
+                );
+            }
+        }
+
+        if ($email !== null || $fieldValues !== null) {
+            $mappings = $loadParticipantFieldMappings($pdo, (string)$participant['event_id']);
+            if ($mappings === []) {
+                jsonResponse(422, ['error' => 'Participant reassignment requires saved field mapping for the event']);
+                exit;
+            }
+
+            $resolvedEmail = $email ?? normalizeEmailAddress((string)$participant['email']);
+            if ($resolvedEmail === '' || !isValidEmailAddress($resolvedEmail)) {
+                jsonResponse(422, ['error' => 'A valid email is required']);
+                exit;
+            }
+
+            $participantFieldValues = $fieldValues ?? ($participant['custom_fields'] ?? []);
+            $resolvedData = $buildParticipantDataFromMappings(
+                $mappings,
+                is_array($participantFieldValues) ? $participantFieldValues : [],
+                true,
+                (string)($participant['bib_number'] ?? '')
+            );
+
+            if ($resolvedData['missing_fields'] !== []) {
+                jsonResponse(422, ['error' => 'All participant columns are required for package reassignment', 'missing_fields' => $resolvedData['missing_fields']]);
+                exit;
+            }
+
+            if ($resolvedData['display_name'] === '') {
+                jsonResponse(422, ['error' => 'At least one display name field is required']);
+                exit;
+            }
+
+            $nameParts = splitParticipantDisplayName($resolvedData['display_name']);
+            $emailChanged = $resolvedEmail !== normalizeEmailAddress((string)$participant['email']);
+            $updateStmt = $pdo->prepare('
+                UPDATE participants
+                SET
+                    first_name = :first_name,
+                    last_name = :last_name,
+                    display_name = :display_name,
+                    email = :email,
+                    custom_fields_json = :custom_fields_json,
+                    email_status = :email_status
+                WHERE id = :id
+            ');
+            $updateStmt->execute([
+                'first_name' => $nameParts['first_name'],
+                'last_name' => $nameParts['last_name'],
+                'display_name' => $resolvedData['display_name'],
+                'email' => $resolvedEmail,
+                'custom_fields_json' => $resolvedData['custom_fields'] !== [] ? json_encode($resolvedData['custom_fields'], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) : null,
+                'email_status' => $emailChanged ? 'not_sent' : (string)$participant['email_status'],
+                'id' => (int)$participant['id'],
+            ]);
+
+            $participant = $loadParticipantById($pdo, (int)$participant['id']);
+            $addActivityLog(
+                $pdo,
+                'Przepisano pakiet na inna osobe',
+                (int)$participant['id'],
+                (string)$participant['display_name'],
+                (string)$authUser['id'],
+                (string)$authUser['name']
+            );
+        }
+
+        jsonResponse(200, ['data' => $participant]);
+        exit;
+    }
+
     if (preg_match('#^/participants/(\d+)/check-in$#', $path, $matches) === 1 && $method === 'POST') {
         $authUser = requireAuth($resolveAuthenticatedUser);
         $participant = $loadParticipantById($pdo, (int)$matches[1]);
@@ -2321,12 +2557,7 @@ try {
             exit;
         }
 
-        $stmt = $pdo->prepare('UPDATE participants SET status = :status, checked_in_at = UTC_TIMESTAMP() WHERE id = :id');
-        $stmt->execute([
-            'status' => 'checked_in',
-            'id' => (int)$participant['id'],
-        ]);
-        $participant = $loadParticipantById($pdo, (int)$participant['id']);
+        $participant = $updateParticipantStatus($pdo, $participant, 'checked_in');
         $addActivityLog(
             $pdo,
             'Check-in',
@@ -2355,49 +2586,10 @@ try {
             exit;
         }
 
-        $stmt = $pdo->prepare('UPDATE participants SET status = :status, checked_in_at = NULL WHERE id = :id');
-        $stmt->execute([
-            'status' => 'pending',
-            'id' => (int)$participant['id'],
-        ]);
-        $participant = $loadParticipantById($pdo, (int)$participant['id']);
+        $participant = $updateParticipantStatus($pdo, $participant, 'not_checked_in');
         $addActivityLog(
             $pdo,
             'Cofnieto odprawe',
-            (int)$participant['id'],
-            (string)$participant['display_name'],
-            (string)$authUser['id'],
-            (string)$authUser['name']
-        );
-
-        jsonResponse(200, ['data' => $participant]);
-        exit;
-    }
-
-    if (preg_match('#^/participants/(\d+)/collect-package$#', $path, $matches) === 1 && $method === 'POST') {
-        $authUser = requireAuth($resolveAuthenticatedUser);
-        $participant = $loadParticipantById($pdo, (int)$matches[1]);
-
-        if ($participant === false) {
-            jsonResponse(404, ['error' => 'Participant not found']);
-            exit;
-        }
-
-        [$event, $accessError] = $assertParticipantEventAccess($pdo, $authUser, $participant);
-        if ($accessError !== null || $event === null) {
-            jsonResponse($accessError === 'Forbidden' ? 403 : 422, ['error' => $accessError ?? 'Forbidden']);
-            exit;
-        }
-
-        $stmt = $pdo->prepare('UPDATE participants SET package_status = :package_status WHERE id = :id');
-        $stmt->execute([
-            'package_status' => 'collected',
-            'id' => (int)$participant['id'],
-        ]);
-        $participant = $loadParticipantById($pdo, (int)$participant['id']);
-        $addActivityLog(
-            $pdo,
-            'Wydano pakiet',
             (int)$participant['id'],
             (string)$participant['display_name'],
             (string)$authUser['id'],
@@ -2424,7 +2616,6 @@ try {
                 qr_code,
                 custom_fields_json,
                 status,
-                package_status,
                 email_status,
                 checked_in_at,
                 created_at,
