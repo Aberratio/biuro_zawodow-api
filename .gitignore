@@ -1,0 +1,4 @@
+﻿# Ignore local env and runtime artifacts
+.env
+vendor/
+mysql-data/
