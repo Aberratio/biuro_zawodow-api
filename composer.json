@@ -1,0 +1,9 @@
+{
+  "name": "biuro-zawodow/api",
+  "type": "project",
+  "require": {
+    "php": "^8.2",
+    "phpmailer/phpmailer": "^6.10",
+    "endroid/qr-code": "^6.0"
+  }
+}

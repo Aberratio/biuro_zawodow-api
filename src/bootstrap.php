@@ -3,6 +3,13 @@
 declare(strict_types=1);
 
 require_once __DIR__ . '/Database.php';
+require_once __DIR__ . '/MailService.php';
+require_once __DIR__ . '/QrCodeService.php';
+
+$composerAutoloadPath = __DIR__ . '/../vendor/autoload.php';
+if (is_file($composerAutoloadPath)) {
+    require_once $composerAutoloadPath;
+}
 
 loadEnv(__DIR__ . '/../.env');
 
@@ -139,6 +146,11 @@ function isValidEmailAddress(string $email): bool
     return filter_var($email, FILTER_VALIDATE_EMAIL) !== false;
 }
 
+function normalizeEmailAddress(string $email): string
+{
+    return strtolower(trim($email));
+}
+
 function splitParticipantDisplayName(string $displayName): array
 {
     $parts = preg_split('/\s+/', trim($displayName)) ?: [];
@@ -191,6 +203,38 @@ function validatePasswordRules(string $password): ?string
     }
 
     return null;
+}
+
+function appFrontendUrl(): string
+{
+    $fallbackUrl = getenv('APP_URL') ?: 'http://localhost:8080';
+
+    return rtrim(getenv('APP_FRONTEND_URL') ?: $fallbackUrl, '/');
+}
+
+function appUrl(): string
+{
+    return rtrim(getenv('APP_URL') ?: 'http://localhost:8080', '/');
+}
+
+function qrCodeImageUrl(string $token): string
+{
+    return appUrl() . '/qr-images/' . rawurlencode($token) . '.svg';
+}
+
+function passwordResetTokenHash(string $token): string
+{
+    return hash_hmac('sha256', $token, authSecret());
+}
+
+function passwordResetExpiresAt(): string
+{
+    return gmdate('Y-m-d H:i:s', time() + 60 * 60);
+}
+
+function forgotPasswordSuccessMessage(): string
+{
+    return 'Jeśli konto istnieje, wysłaliśmy link do resetu hasła.';
 }
 
 function issueAuthToken(array $user): string
@@ -377,6 +421,72 @@ function openApiDocument(): array
                     ],
                 ],
             ],
+            '/auth/forgot-password' => [
+                'post' => [
+                    'tags' => ['Auth'],
+                    'summary' => 'Request password reset email',
+                    'requestBody' => [
+                        'required' => true,
+                        'content' => [
+                            'application/json' => [
+                                'schema' => [
+                                    '$ref' => '#/components/schemas/ForgotPasswordRequest',
+                                ],
+                            ],
+                        ],
+                    ],
+                    'responses' => [
+                        '200' => [
+                            'description' => 'Neutral response for existing and non-existing accounts',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => [
+                                        '$ref' => '#/components/schemas/MessageResponse',
+                                    ],
+                                ],
+                            ],
+                        ],
+                    ],
+                ],
+            ],
+            '/auth/reset-password' => [
+                'post' => [
+                    'tags' => ['Auth'],
+                    'summary' => 'Reset password with one-time token',
+                    'requestBody' => [
+                        'required' => true,
+                        'content' => [
+                            'application/json' => [
+                                'schema' => [
+                                    '$ref' => '#/components/schemas/ResetPasswordRequest',
+                                ],
+                            ],
+                        ],
+                    ],
+                    'responses' => [
+                        '200' => [
+                            'description' => 'Password reset completed',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => [
+                                        '$ref' => '#/components/schemas/MessageResponse',
+                                    ],
+                                ],
+                            ],
+                        ],
+                        '422' => [
+                            'description' => 'Validation error or invalid token',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => [
+                                        '$ref' => '#/components/schemas/ErrorResponse',
+                                    ],
+                                ],
+                            ],
+                        ],
+                    ],
+                ],
+            ],
             '/auth/me' => [
                 'get' => [
                     'tags' => ['Auth'],
@@ -397,6 +507,50 @@ function openApiDocument(): array
                         ],
                         '401' => [
                             '$ref' => '#/components/responses/Unauthorized',
+                        ],
+                    ],
+                ],
+            ],
+            '/auth/change-password' => [
+                'post' => [
+                    'tags' => ['Auth'],
+                    'summary' => 'Change password for current user',
+                    'security' => [
+                        ['bearerAuth' => []],
+                    ],
+                    'requestBody' => [
+                        'required' => true,
+                        'content' => [
+                            'application/json' => [
+                                'schema' => [
+                                    '$ref' => '#/components/schemas/ChangePasswordRequest',
+                                ],
+                            ],
+                        ],
+                    ],
+                    'responses' => [
+                        '200' => [
+                            'description' => 'Password changed',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => [
+                                        '$ref' => '#/components/schemas/MessageResponse',
+                                    ],
+                                ],
+                            ],
+                        ],
+                        '401' => [
+                            '$ref' => '#/components/responses/Unauthorized',
+                        ],
+                        '422' => [
+                            'description' => 'Validation error',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => [
+                                        '$ref' => '#/components/schemas/ErrorResponse',
+                                    ],
+                                ],
+                            ],
                         ],
                     ],
                 ],
@@ -784,7 +938,7 @@ function openApiDocument(): array
                                         '$ref' => '#/components/schemas/ErrorResponse',
                                     ],
                                     'example' => [
-                                        'error' => 'name, email, password and role are required',
+                                        'error' => 'name, email and role are required',
                                     ],
                                 ],
                             ],
@@ -1100,6 +1254,38 @@ function openApiDocument(): array
                         'user' => ['$ref' => '#/components/schemas/User'],
                     ],
                 ],
+                'ForgotPasswordRequest' => [
+                    'type' => 'object',
+                    'required' => ['email'],
+                    'properties' => [
+                        'email' => ['type' => 'string', 'format' => 'email', 'example' => 'super@biurozawodow.pl'],
+                    ],
+                ],
+                'ResetPasswordRequest' => [
+                    'type' => 'object',
+                    'required' => ['token', 'password', 'password_confirmation'],
+                    'properties' => [
+                        'token' => ['type' => 'string'],
+                        'password' => ['type' => 'string', 'format' => 'password'],
+                        'password_confirmation' => ['type' => 'string', 'format' => 'password'],
+                    ],
+                ],
+                'ChangePasswordRequest' => [
+                    'type' => 'object',
+                    'required' => ['current_password', 'new_password', 'new_password_confirmation'],
+                    'properties' => [
+                        'current_password' => ['type' => 'string', 'format' => 'password'],
+                        'new_password' => ['type' => 'string', 'format' => 'password'],
+                        'new_password_confirmation' => ['type' => 'string', 'format' => 'password'],
+                    ],
+                ],
+                'MessageResponse' => [
+                    'type' => 'object',
+                    'required' => ['message'],
+                    'properties' => [
+                        'message' => ['type' => 'string'],
+                    ],
+                ],
                 'CurrentUserResponse' => [
                     'type' => 'object',
                     'required' => ['data'],
@@ -1302,11 +1488,10 @@ function openApiDocument(): array
                 ],
                 'CreateUserRequest' => [
                     'type' => 'object',
-                    'required' => ['name', 'email', 'password', 'role'],
+                    'required' => ['name', 'email', 'role'],
                     'properties' => [
                         'name' => ['type' => 'string', 'example' => 'Admin New Org'],
                         'email' => ['type' => 'string', 'format' => 'email', 'example' => 'admin.new@example.com'],
-                        'password' => ['type' => 'string', 'format' => 'password', 'example' => 'demo123'],
                         'role' => ['type' => 'string', 'enum' => ['admin', 'editor', 'scanner']],
                         'organization_id' => ['type' => 'string', 'nullable' => true, 'example' => 'org-1'],
                         'organization_ids' => [
