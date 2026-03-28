@@ -113,6 +113,71 @@ try {
         return $user;
     };
 
+    $loadUserWithPasswordByEmail = static function (PDO $pdo, string $email): array|false {
+        $stmt = $pdo->prepare('
+            SELECT id, name, email, password, role, organization_id
+            FROM users
+            WHERE email = :email
+            LIMIT 1
+        ');
+        $stmt->execute(['email' => $email]);
+
+        return $stmt->fetch();
+    };
+
+    $invalidatePasswordResetTokensForUser = static function (PDO $pdo, string $userId): void {
+        $stmt = $pdo->prepare('
+            UPDATE password_resets
+            SET used_at = COALESCE(used_at, UTC_TIMESTAMP())
+            WHERE user_id = :user_id
+              AND used_at IS NULL
+        ');
+        $stmt->execute(['user_id' => $userId]);
+    };
+
+    $createPasswordResetToken = static function (PDO $pdo, string $userId) use ($invalidatePasswordResetTokensForUser): string {
+        $token = bin2hex(random_bytes(32));
+        $invalidatePasswordResetTokensForUser($pdo, $userId);
+
+        $stmt = $pdo->prepare('
+            INSERT INTO password_resets (id, user_id, token_hash, expires_at)
+            VALUES (:id, :user_id, :token_hash, :expires_at)
+        ');
+        $stmt->execute([
+            'id' => 'pr-' . bin2hex(random_bytes(8)),
+            'user_id' => $userId,
+            'token_hash' => passwordResetTokenHash($token),
+            'expires_at' => passwordResetExpiresAt(),
+        ]);
+
+        return $token;
+    };
+
+    $loadActivePasswordReset = static function (PDO $pdo, string $token): array|false {
+        $stmt = $pdo->prepare('
+            SELECT pr.id, pr.user_id, pr.expires_at, u.email, u.name
+            FROM password_resets pr
+            INNER JOIN users u ON u.id = pr.user_id
+            WHERE pr.token_hash = :token_hash
+              AND pr.used_at IS NULL
+              AND pr.expires_at >= UTC_TIMESTAMP()
+            LIMIT 1
+        ');
+        $stmt->execute(['token_hash' => passwordResetTokenHash($token)]);
+
+        return $stmt->fetch();
+    };
+
+    $markPasswordResetTokensUsed = static function (PDO $pdo, string $userId): void {
+        $stmt = $pdo->prepare('
+            UPDATE password_resets
+            SET used_at = COALESCE(used_at, UTC_TIMESTAMP())
+            WHERE user_id = :user_id
+              AND used_at IS NULL
+        ');
+        $stmt->execute(['user_id' => $userId]);
+    };
+
     $resolveAuthenticatedUser = static function (array $tokenUser) use ($pdo, $loadUserById): ?array {
         $userId = trim((string)($tokenUser['id'] ?? ''));
         if ($userId === '') {
@@ -194,6 +259,58 @@ try {
         return $canAccessOrganization($authUser, (string)$event['organization_id']);
     };
 
+    $canAccessEvent = static function (array $authUser, array $event) use ($canAccessOrganization): bool {
+        return $canAccessOrganization($authUser, (string)$event['organization_id'])
+            || ($authUser['role'] === 'scanner' && in_array((string)$event['id'], $authUser['assigned_events'] ?? [], true));
+    };
+
+    $generateUniqueParticipantQrCode = static function (PDO $pdo): string {
+        $checkStmt = $pdo->prepare('SELECT id FROM participants WHERE qr_code = :qr_code LIMIT 1');
+
+        do {
+            $token = QrCodeService::generateToken();
+            $checkStmt->execute(['qr_code' => $token]);
+            $collision = $checkStmt->fetch();
+        } while ($collision !== false);
+
+        return $token;
+    };
+
+    $addActivityLog = static function (
+        PDO $pdo,
+        string $action,
+        ?int $participantId = null,
+        ?string $participantName = null,
+        ?string $userId = null,
+        ?string $userName = null
+    ): void {
+        $stmt = $pdo->prepare('
+            INSERT INTO activity_logs (
+                id,
+                action,
+                participant_id,
+                participant_name_snapshot,
+                user_id,
+                user_name_snapshot
+            ) VALUES (
+                :id,
+                :action,
+                :participant_id,
+                :participant_name_snapshot,
+                :user_id,
+                :user_name_snapshot
+            )
+        ');
+        $stmt->execute([
+            'id' => 'log-' . bin2hex(random_bytes(8)),
+            'action' => $action,
+            'participant_id' => $participantId,
+            'participant_name_snapshot' => $participantName,
+            'user_id' => $userId,
+            'user_name_snapshot' => $userName,
+        ]);
+    };
+
     $loadParticipantFieldMappings = static function (PDO $pdo, string $eventId): array {
         $stmt = $pdo->prepare('
             SELECT
@@ -221,7 +338,24 @@ try {
         }, $stmt->fetchAll());
     };
 
-    $loadParticipantById = static function (PDO $pdo, int $participantId): array|false {
+    $ensureParticipantQrCode = static function (PDO $pdo, array $participant) use ($generateUniqueParticipantQrCode): array {
+        $qrCode = trim((string)($participant['qr_code'] ?? ''));
+        if (QrCodeService::isSecureToken($qrCode)) {
+            return $participant;
+        }
+
+        $newQrCode = $generateUniqueParticipantQrCode($pdo);
+        $updateStmt = $pdo->prepare('UPDATE participants SET qr_code = :qr_code WHERE id = :id');
+        $updateStmt->execute([
+            'qr_code' => $newQrCode,
+            'id' => (int)$participant['id'],
+        ]);
+
+        $participant['qr_code'] = $newQrCode;
+        return $participant;
+    };
+
+    $loadParticipantById = static function (PDO $pdo, int $participantId) use (&$ensureParticipantQrCode): array|false {
         $stmt = $pdo->prepare('
             SELECT
                 id,
@@ -252,7 +386,87 @@ try {
         $participant['custom_fields'] = decodeJsonObject($participant['custom_fields_json'] ?? null);
         unset($participant['custom_fields_json']);
 
-        return $participant;
+        return $ensureParticipantQrCode($pdo, $participant);
+    };
+
+    $loadParticipantByQrCode = static function (PDO $pdo, string $qrCode) use (&$ensureParticipantQrCode): array|false {
+        $stmt = $pdo->prepare('
+            SELECT
+                id,
+                event_id,
+                first_name,
+                last_name,
+                display_name,
+                email,
+                organization,
+                bib_number,
+                qr_code,
+                custom_fields_json,
+                status,
+                package_status,
+                email_status,
+                checked_in_at,
+                created_at,
+                updated_at
+            FROM participants
+            WHERE qr_code = :qr_code
+            LIMIT 1
+        ');
+        $stmt->execute(['qr_code' => $qrCode]);
+        $participant = $stmt->fetch();
+
+        if ($participant === false) {
+            return false;
+        }
+
+        $participant['custom_fields'] = decodeJsonObject($participant['custom_fields_json'] ?? null);
+        unset($participant['custom_fields_json']);
+
+        return $ensureParticipantQrCode($pdo, $participant);
+    };
+
+    $serializeParticipantScanResponse = static function (array $participant, array $event, bool $canAccess): array {
+        return [
+            'participant' => [
+                'id' => (int)$participant['id'],
+                'event_id' => (string)$participant['event_id'],
+                'display_name' => (string)$participant['display_name'],
+                'email' => (string)$participant['email'],
+                'bib_number' => (string)($participant['bib_number'] ?? ''),
+                'status' => (string)$participant['status'],
+                'package_status' => (string)$participant['package_status'],
+                'email_status' => (string)$participant['email_status'],
+                'checked_in_at' => $participant['checked_in_at'],
+                'qr_code' => (string)$participant['qr_code'],
+            ],
+            'event' => [
+                'id' => (string)$event['id'],
+                'name' => (string)$event['name'],
+                'date' => (string)$event['date'],
+                'location' => (string)$event['location'],
+            ],
+            'access' => [
+                'allowed' => $canAccess,
+            ],
+        ];
+    };
+
+    $assertParticipantEventAccess = static function (PDO $pdo, array $authUser, array $participant) use ($loadEventById, $canAccessEvent, $canManageEventParticipants): array {
+        $eventId = trim((string)($participant['event_id'] ?? ''));
+        if ($eventId === '') {
+            return [null, 'Participant is not assigned to an event'];
+        }
+
+        $event = $loadEventById($pdo, $eventId);
+        if ($event === false) {
+            return [null, 'Event not found'];
+        }
+
+        if (!$canAccessEvent($authUser, $event) && !$canManageEventParticipants($authUser, $event)) {
+            return [null, 'Forbidden'];
+        }
+
+        return [$event, null];
     };
 
     $normalizeImportHeader = static function (string $header): string {
@@ -442,14 +656,14 @@ try {
         array $customFields,
         string $organization = '',
         ?string $qrCode = null
-    ) use ($loadParticipantById, $nextBibNumberForEvent): array {
+    ) use ($loadParticipantById, $nextBibNumberForEvent, $generateUniqueParticipantQrCode): array {
         $nameParts = splitParticipantDisplayName($displayName);
         $resolvedBibNumber = $bibNumber !== null && trim($bibNumber) !== ''
             ? trim($bibNumber)
             : $nextBibNumberForEvent($pdo, $eventId);
-        $resolvedQrCode = $qrCode !== null && trim($qrCode) !== ''
+        $resolvedQrCode = $qrCode !== null && QrCodeService::isSecureToken(trim($qrCode))
             ? trim($qrCode)
-            : sprintf('QR-%s-%s', $eventId, $resolvedBibNumber);
+            : $generateUniqueParticipantQrCode($pdo);
 
         $stmt = $pdo->prepare('
             INSERT INTO participants (
@@ -499,9 +713,27 @@ try {
         return $loadParticipantById($pdo, $participantId) ?: [];
     };
 
+    if (preg_match('#^/qr-images/([A-Za-z0-9_%-]+)\.svg$#', $path, $matches) === 1 && $method === 'GET') {
+        $qrCode = rawurldecode((string)$matches[1]);
+        $participant = $loadParticipantByQrCode($pdo, $qrCode);
+
+        if ($participant === false) {
+            http_response_code(404);
+            header('Content-Type: text/plain; charset=utf-8');
+            echo 'QR image not found';
+            exit;
+        }
+
+        http_response_code(200);
+        header('Content-Type: image/svg+xml; charset=utf-8');
+        header('Cache-Control: public, max-age=300');
+        echo QrCodeService::renderSvg((string)$participant['qr_code'], 320, 10);
+        exit;
+    }
+
     if ($path === '/auth/login' && $method === 'POST') {
         $input = readJsonBody();
-        $email = trim((string)($input['email'] ?? ''));
+        $email = normalizeEmailAddress((string)($input['email'] ?? ''));
         $password = (string)($input['password'] ?? '');
 
         if ($email === '' || $password === '') {
@@ -509,14 +741,7 @@ try {
             exit;
         }
 
-        $stmt = $pdo->prepare('
-            SELECT id, name, email, password, role, organization_id
-            FROM users
-            WHERE email = :email
-            LIMIT 1
-        ');
-        $stmt->execute(['email' => $email]);
-        $user = $stmt->fetch();
+        $user = $loadUserWithPasswordByEmail($pdo, $email);
 
         if ($user === false || !passwordMatches($password, (string)$user['password'])) {
             jsonResponse(401, ['error' => 'Invalid credentials']);
@@ -546,6 +771,139 @@ try {
             'expires_in' => 28800,
             'user' => $user,
         ]);
+        exit;
+    }
+
+    if ($path === '/auth/forgot-password' && $method === 'POST') {
+        $input = readJsonBody();
+        $email = normalizeEmailAddress((string)($input['email'] ?? ''));
+
+        if ($email === '' || !isValidEmailAddress($email)) {
+            jsonResponse(200, ['message' => forgotPasswordSuccessMessage()]);
+            exit;
+        }
+
+        $user = $loadUserWithPasswordByEmail($pdo, $email);
+        if ($user !== false) {
+            try {
+                $token = $createPasswordResetToken($pdo, (string)$user['id']);
+                $resetUrl = appFrontendUrl() . '/reset-password?token=' . urlencode($token);
+                MailService::sendPasswordResetEmail((string)$user['email'], (string)$user['name'], $resetUrl);
+            } catch (Throwable $exception) {
+                if ((getenv('APP_DEBUG') ?: 'false') === 'true') {
+                    jsonResponse(500, ['error' => $exception->getMessage()]);
+                    exit;
+                }
+            }
+        }
+
+        jsonResponse(200, ['message' => forgotPasswordSuccessMessage()]);
+        exit;
+    }
+
+    if ($path === '/auth/reset-password' && $method === 'POST') {
+        $input = readJsonBody();
+        $token = trim((string)($input['token'] ?? ''));
+        $password = (string)($input['password'] ?? '');
+        $passwordConfirmation = (string)($input['password_confirmation'] ?? '');
+
+        if ($token === '' || $password === '' || $passwordConfirmation === '') {
+            jsonResponse(422, ['error' => 'token, password and password_confirmation are required']);
+            exit;
+        }
+
+        if ($password !== $passwordConfirmation) {
+            jsonResponse(422, ['error' => 'Password confirmation does not match']);
+            exit;
+        }
+
+        $passwordValidationError = validatePasswordRules($password);
+        if ($passwordValidationError !== null) {
+            jsonResponse(422, ['error' => $passwordValidationError]);
+            exit;
+        }
+
+        $passwordReset = $loadActivePasswordReset($pdo, $token);
+        if ($passwordReset === false) {
+            jsonResponse(422, ['error' => 'Link resetu hasła jest nieważny lub wygasł']);
+            exit;
+        }
+
+        $pdo->beginTransaction();
+
+        try {
+            $updatePasswordStmt = $pdo->prepare('UPDATE users SET password = :password WHERE id = :id');
+            $updatePasswordStmt->execute([
+                'password' => password_hash($password, PASSWORD_DEFAULT),
+                'id' => $passwordReset['user_id'],
+            ]);
+
+            $markPasswordResetTokensUsed($pdo, (string)$passwordReset['user_id']);
+            $pdo->commit();
+        } catch (Throwable $exception) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+
+            throw $exception;
+        }
+
+        jsonResponse(200, ['message' => 'Hasło zostało zmienione.']);
+        exit;
+    }
+
+    if ($path === '/auth/change-password' && $method === 'POST') {
+        $authUser = requireAuth($resolveAuthenticatedUser);
+        $input = readJsonBody();
+        $currentPassword = (string)($input['current_password'] ?? '');
+        $newPassword = (string)($input['new_password'] ?? '');
+        $newPasswordConfirmation = (string)($input['new_password_confirmation'] ?? '');
+
+        if ($currentPassword === '' || $newPassword === '' || $newPasswordConfirmation === '') {
+            jsonResponse(422, ['error' => 'current_password, new_password and new_password_confirmation are required']);
+            exit;
+        }
+
+        if ($newPassword !== $newPasswordConfirmation) {
+            jsonResponse(422, ['error' => 'Password confirmation does not match']);
+            exit;
+        }
+
+        $passwordValidationError = validatePasswordRules($newPassword);
+        if ($passwordValidationError !== null) {
+            jsonResponse(422, ['error' => $passwordValidationError]);
+            exit;
+        }
+
+        $stmt = $pdo->prepare('SELECT password FROM users WHERE id = :id LIMIT 1');
+        $stmt->execute(['id' => $authUser['id']]);
+        $userPasswordRow = $stmt->fetch();
+
+        if ($userPasswordRow === false || !passwordMatches($currentPassword, (string)$userPasswordRow['password'])) {
+            jsonResponse(422, ['error' => 'Aktualne hasło jest nieprawidłowe']);
+            exit;
+        }
+
+        $pdo->beginTransaction();
+
+        try {
+            $updatePasswordStmt = $pdo->prepare('UPDATE users SET password = :password WHERE id = :id');
+            $updatePasswordStmt->execute([
+                'password' => password_hash($newPassword, PASSWORD_DEFAULT),
+                'id' => $authUser['id'],
+            ]);
+
+            $markPasswordResetTokensUsed($pdo, (string)$authUser['id']);
+            $pdo->commit();
+        } catch (Throwable $exception) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+
+            throw $exception;
+        }
+
+        jsonResponse(200, ['message' => 'Hasło zostało zmienione.']);
         exit;
     }
 
@@ -637,6 +995,7 @@ try {
         foreach ($participants as &$participant) {
             $participant['custom_fields'] = decodeJsonObject($participant['custom_fields_json'] ?? null);
             unset($participant['custom_fields_json']);
+            $participant = $ensureParticipantQrCode($pdo, $participant);
         }
         unset($participant);
 
@@ -871,10 +1230,7 @@ try {
             exit;
         }
 
-        $canAccessEvent = $canAccessOrganization($authUser, (string)$event['organization_id'])
-            || ($authUser['role'] === 'scanner' && in_array((string)$event['id'], $authUser['assigned_events'] ?? [], true));
-
-        if (!$canAccessEvent) {
+        if (!$canAccessEvent($authUser, $event)) {
             jsonResponse(403, ['error' => 'Forbidden']);
             exit;
         }
@@ -1364,8 +1720,7 @@ try {
         $input = readJsonBody();
 
         $name = trim((string)($input['name'] ?? ''));
-        $email = trim((string)($input['email'] ?? ''));
-        $password = (string)($input['password'] ?? '');
+        $email = normalizeEmailAddress((string)($input['email'] ?? ''));
         $role = trim((string)($input['role'] ?? ''));
         $organizationId = trim((string)($input['organization_id'] ?? ''));
         $assignedEvents = array_values(array_filter(
@@ -1373,19 +1728,13 @@ try {
             static fn(mixed $eventId): bool => is_string($eventId) && trim($eventId) !== ''
         ));
 
-        if ($name === '' || $email === '' || $password === '' || $role === '') {
-            jsonResponse(422, ['error' => 'name, email, password and role are required']);
+        if ($name === '' || $email === '' || $role === '') {
+            jsonResponse(422, ['error' => 'name, email and role are required']);
             exit;
         }
 
         if (!isValidEmailAddress($email)) {
             jsonResponse(422, ['error' => 'email must be a valid email address']);
-            exit;
-        }
-
-        $passwordValidationError = validatePasswordRules($password);
-        if ($passwordValidationError !== null) {
-            jsonResponse(422, ['error' => $passwordValidationError]);
             exit;
         }
 
@@ -1456,7 +1805,7 @@ try {
         }
 
         $userId = 'u-' . bin2hex(random_bytes(8));
-        $passwordHash = password_hash($password, PASSWORD_DEFAULT);
+        $passwordHash = password_hash(bin2hex(random_bytes(24)), PASSWORD_DEFAULT);
 
         $pdo->beginTransaction();
 
@@ -1522,6 +1871,10 @@ try {
                 'user_id' => $authUser['id'],
                 'user_name_snapshot' => $authUser['name'],
             ]);
+
+            $setupToken = $createPasswordResetToken($pdo, $userId);
+            $setupUrl = appFrontendUrl() . '/reset-password?token=' . urlencode($setupToken);
+            MailService::sendAccountSetupEmail($email, $name, $setupUrl);
 
             $pdo->commit();
         } catch (Throwable $exception) {
@@ -1706,6 +2059,355 @@ try {
         exit;
     }
 
+    if (preg_match('#^/participants/(\d+)/qr-preview$#', $path, $matches) === 1 && $method === 'GET') {
+        $authUser = requireAnyRole(['superadmin', 'admin', 'editor'], $resolveAuthenticatedUser);
+        $participant = $loadParticipantById($pdo, (int)$matches[1]);
+
+        if ($participant === false) {
+            jsonResponse(404, ['error' => 'Participant not found']);
+            exit;
+        }
+
+        [$event, $accessError] = $assertParticipantEventAccess($pdo, $authUser, $participant);
+        if ($accessError !== null || $event === null || !$canManageEventParticipants($authUser, $event)) {
+            jsonResponse($accessError === 'Forbidden' ? 403 : 422, ['error' => $accessError ?? 'Forbidden']);
+            exit;
+        }
+
+        jsonResponse(200, [
+            'data' => [
+                'participant' => $participant,
+                'event' => $event,
+                'qr_code_svg_data_uri' => QrCodeService::renderSvgDataUri((string)$participant['qr_code'], 320, 10),
+                'qr_code_image_url' => qrCodeImageUrl((string)$participant['qr_code']),
+            ],
+        ]);
+        exit;
+    }
+
+    if (preg_match('#^/participants/(\d+)/send-qr-email$#', $path, $matches) === 1 && $method === 'POST') {
+        $authUser = requireAnyRole(['superadmin', 'admin', 'editor'], $resolveAuthenticatedUser);
+        $participant = $loadParticipantById($pdo, (int)$matches[1]);
+
+        if ($participant === false) {
+            jsonResponse(404, ['error' => 'Participant not found']);
+            exit;
+        }
+
+        [$event, $accessError] = $assertParticipantEventAccess($pdo, $authUser, $participant);
+        if ($accessError !== null || $event === null || !$canManageEventParticipants($authUser, $event)) {
+            jsonResponse($accessError === 'Forbidden' ? 403 : 422, ['error' => $accessError ?? 'Forbidden']);
+            exit;
+        }
+
+        try {
+            MailService::sendParticipantQrEmail(
+                recipientEmail: (string)$participant['email'],
+                recipientName: (string)$participant['display_name'],
+                eventName: (string)$event['name'],
+                eventDate: (string)$event['date'],
+                eventLocation: (string)$event['location'],
+                bibNumber: (string)($participant['bib_number'] ?? ''),
+                qrToken: (string)$participant['qr_code']
+            );
+
+            $updateStmt = $pdo->prepare('UPDATE participants SET email_status = :email_status WHERE id = :id');
+            $updateStmt->execute([
+                'email_status' => 'sent',
+                'id' => (int)$participant['id'],
+            ]);
+            $participant['email_status'] = 'sent';
+
+            $addActivityLog(
+                $pdo,
+                'Ponownie wyslano kod QR',
+                (int)$participant['id'],
+                (string)$participant['display_name'],
+                (string)$authUser['id'],
+                (string)$authUser['name']
+            );
+
+            jsonResponse(200, ['data' => $participant]);
+        } catch (Throwable $exception) {
+            jsonResponse(422, ['error' => $exception->getMessage()]);
+        }
+        exit;
+    }
+
+    if (preg_match('#^/events/([^/]+)/send-qr-emails$#', $path, $matches) === 1 && $method === 'POST') {
+        $authUser = requireAnyRole(['superadmin', 'admin', 'editor'], $resolveAuthenticatedUser);
+        $eventId = (string)$matches[1];
+        $event = $loadEventById($pdo, $eventId);
+
+        if ($event === false) {
+            jsonResponse(404, ['error' => 'Event not found']);
+            exit;
+        }
+
+        if (!$canManageEventParticipants($authUser, $event)) {
+            jsonResponse(403, ['error' => 'Forbidden']);
+            exit;
+        }
+
+        $input = readJsonBody();
+        $resendAll = (bool)($input['resend_all'] ?? false);
+
+        $stmt = $pdo->prepare('
+            SELECT
+                id,
+                event_id,
+                first_name,
+                last_name,
+                display_name,
+                email,
+                organization,
+                bib_number,
+                qr_code,
+                custom_fields_json,
+                status,
+                package_status,
+                email_status,
+                checked_in_at,
+                created_at,
+                updated_at
+            FROM participants
+            WHERE event_id = :event_id
+            ORDER BY id ASC
+        ');
+        $stmt->execute(['event_id' => $eventId]);
+        $participants = $stmt->fetchAll();
+
+        $sentCount = 0;
+        $errorCount = 0;
+        $errors = [];
+        $updatedParticipantIds = [];
+
+        foreach ($participants as $participantRow) {
+            $participantRow['custom_fields'] = decodeJsonObject($participantRow['custom_fields_json'] ?? null);
+            unset($participantRow['custom_fields_json']);
+            $participantRow = $ensureParticipantQrCode($pdo, $participantRow);
+
+            if (!$resendAll && (string)$participantRow['email_status'] === 'sent') {
+                continue;
+            }
+
+            try {
+                MailService::sendParticipantQrEmail(
+                    recipientEmail: (string)$participantRow['email'],
+                    recipientName: (string)$participantRow['display_name'],
+                    eventName: (string)$event['name'],
+                    eventDate: (string)$event['date'],
+                    eventLocation: (string)$event['location'],
+                    bibNumber: (string)($participantRow['bib_number'] ?? ''),
+                    qrToken: (string)$participantRow['qr_code']
+                );
+
+                $updatedParticipantIds[] = (int)$participantRow['id'];
+                $sentCount++;
+            } catch (Throwable $exception) {
+                $errorCount++;
+                $errors[] = [
+                    'participant_id' => (int)$participantRow['id'],
+                    'participant_name' => (string)$participantRow['display_name'],
+                    'error' => $exception->getMessage(),
+                ];
+            }
+        }
+
+        if ($updatedParticipantIds !== []) {
+            $placeholders = implode(',', array_fill(0, count($updatedParticipantIds), '?'));
+            $updateStmt = $pdo->prepare("UPDATE participants SET email_status = 'sent' WHERE id IN ({$placeholders})");
+            $updateStmt->execute($updatedParticipantIds);
+            $addActivityLog(
+                $pdo,
+                $resendAll ? 'Wyslano ponownie kody QR dla wydarzenia' : 'Wyslano kody QR dla wydarzenia',
+                null,
+                null,
+                (string)$authUser['id'],
+                (string)$authUser['name']
+            );
+        }
+
+        jsonResponse(200, [
+            'data' => [
+                'sent_count' => $sentCount,
+                'error_count' => $errorCount,
+                'errors' => $errors,
+            ],
+        ]);
+        exit;
+    }
+
+    if ($path === '/participants/scan' && $method === 'POST') {
+        $authUser = requireAuth($resolveAuthenticatedUser);
+        $input = readJsonBody();
+        $qrCode = trim((string)($input['qr_code'] ?? ''));
+        $autoCheckIn = (bool)($input['auto_check_in'] ?? false);
+
+        if ($qrCode === '') {
+            jsonResponse(422, ['error' => 'qr_code is required']);
+            exit;
+        }
+
+        $participant = $loadParticipantByQrCode($pdo, $qrCode);
+        if ($participant === false) {
+            jsonResponse(404, ['error' => 'Participant not found']);
+            exit;
+        }
+
+        $eventId = trim((string)($participant['event_id'] ?? ''));
+        if ($eventId === '') {
+            jsonResponse(422, ['error' => 'Participant is not assigned to an event']);
+            exit;
+        }
+
+        $event = $loadEventById($pdo, $eventId);
+        if ($event === false) {
+            jsonResponse(404, ['error' => 'Event not found']);
+            exit;
+        }
+
+        if (!$canAccessEvent($authUser, $event)) {
+            jsonResponse(403, [
+                'error' => 'QR belongs to an event outside your permissions',
+                'data' => $serializeParticipantScanResponse($participant, $event, false),
+            ]);
+            exit;
+        }
+
+        if ($autoCheckIn && (string)$participant['status'] !== 'checked_in') {
+            $checkInStmt = $pdo->prepare('UPDATE participants SET status = :status, checked_in_at = UTC_TIMESTAMP() WHERE id = :id');
+            $checkInStmt->execute([
+                'status' => 'checked_in',
+                'id' => (int)$participant['id'],
+            ]);
+            $participant['status'] = 'checked_in';
+            $participant['checked_in_at'] = gmdate('Y-m-d H:i:s');
+            $addActivityLog(
+                $pdo,
+                'Check-in przez skaner QR',
+                (int)$participant['id'],
+                (string)$participant['display_name'],
+                (string)$authUser['id'],
+                (string)$authUser['name']
+            );
+        } else {
+            $addActivityLog(
+                $pdo,
+                'Skan QR',
+                (int)$participant['id'],
+                (string)$participant['display_name'],
+                (string)$authUser['id'],
+                (string)$authUser['name']
+            );
+        }
+
+        jsonResponse(200, ['data' => $serializeParticipantScanResponse($participant, $event, true)]);
+        exit;
+    }
+
+    if (preg_match('#^/participants/(\d+)/check-in$#', $path, $matches) === 1 && $method === 'POST') {
+        $authUser = requireAuth($resolveAuthenticatedUser);
+        $participant = $loadParticipantById($pdo, (int)$matches[1]);
+
+        if ($participant === false) {
+            jsonResponse(404, ['error' => 'Participant not found']);
+            exit;
+        }
+
+        [$event, $accessError] = $assertParticipantEventAccess($pdo, $authUser, $participant);
+        if ($accessError !== null || $event === null) {
+            jsonResponse($accessError === 'Forbidden' ? 403 : 422, ['error' => $accessError ?? 'Forbidden']);
+            exit;
+        }
+
+        $stmt = $pdo->prepare('UPDATE participants SET status = :status, checked_in_at = UTC_TIMESTAMP() WHERE id = :id');
+        $stmt->execute([
+            'status' => 'checked_in',
+            'id' => (int)$participant['id'],
+        ]);
+        $participant = $loadParticipantById($pdo, (int)$participant['id']);
+        $addActivityLog(
+            $pdo,
+            'Check-in',
+            (int)$participant['id'],
+            (string)$participant['display_name'],
+            (string)$authUser['id'],
+            (string)$authUser['name']
+        );
+
+        jsonResponse(200, ['data' => $participant]);
+        exit;
+    }
+
+    if (preg_match('#^/participants/(\d+)/undo-check-in$#', $path, $matches) === 1 && $method === 'POST') {
+        $authUser = requireAuth($resolveAuthenticatedUser);
+        $participant = $loadParticipantById($pdo, (int)$matches[1]);
+
+        if ($participant === false) {
+            jsonResponse(404, ['error' => 'Participant not found']);
+            exit;
+        }
+
+        [$event, $accessError] = $assertParticipantEventAccess($pdo, $authUser, $participant);
+        if ($accessError !== null || $event === null) {
+            jsonResponse($accessError === 'Forbidden' ? 403 : 422, ['error' => $accessError ?? 'Forbidden']);
+            exit;
+        }
+
+        $stmt = $pdo->prepare('UPDATE participants SET status = :status, checked_in_at = NULL WHERE id = :id');
+        $stmt->execute([
+            'status' => 'pending',
+            'id' => (int)$participant['id'],
+        ]);
+        $participant = $loadParticipantById($pdo, (int)$participant['id']);
+        $addActivityLog(
+            $pdo,
+            'Cofnieto odprawe',
+            (int)$participant['id'],
+            (string)$participant['display_name'],
+            (string)$authUser['id'],
+            (string)$authUser['name']
+        );
+
+        jsonResponse(200, ['data' => $participant]);
+        exit;
+    }
+
+    if (preg_match('#^/participants/(\d+)/collect-package$#', $path, $matches) === 1 && $method === 'POST') {
+        $authUser = requireAuth($resolveAuthenticatedUser);
+        $participant = $loadParticipantById($pdo, (int)$matches[1]);
+
+        if ($participant === false) {
+            jsonResponse(404, ['error' => 'Participant not found']);
+            exit;
+        }
+
+        [$event, $accessError] = $assertParticipantEventAccess($pdo, $authUser, $participant);
+        if ($accessError !== null || $event === null) {
+            jsonResponse($accessError === 'Forbidden' ? 403 : 422, ['error' => $accessError ?? 'Forbidden']);
+            exit;
+        }
+
+        $stmt = $pdo->prepare('UPDATE participants SET package_status = :package_status WHERE id = :id');
+        $stmt->execute([
+            'package_status' => 'collected',
+            'id' => (int)$participant['id'],
+        ]);
+        $participant = $loadParticipantById($pdo, (int)$participant['id']);
+        $addActivityLog(
+            $pdo,
+            'Wydano pakiet',
+            (int)$participant['id'],
+            (string)$participant['display_name'],
+            (string)$authUser['id'],
+            (string)$authUser['name']
+        );
+
+        jsonResponse(200, ['data' => $participant]);
+        exit;
+    }
+
     if ($path === '/participants' && $method === 'GET') {
         requireAuth($resolveAuthenticatedUser);
 
@@ -1734,6 +2436,7 @@ try {
         foreach ($participants as &$participant) {
             $participant['custom_fields'] = decodeJsonObject($participant['custom_fields_json'] ?? null);
             unset($participant['custom_fields_json']);
+            $participant = $ensureParticipantQrCode($pdo, $participant);
         }
         unset($participant);
 
