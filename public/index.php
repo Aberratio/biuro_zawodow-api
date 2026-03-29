@@ -5,6 +5,7 @@ declare(strict_types=1);
 require_once __DIR__ . '/../src/bootstrap.php';
 
 setCorsHeaders();
+validateServerSecurityConfiguration();
 
 if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'OPTIONS') {
     http_response_code(204);
@@ -26,6 +27,50 @@ if (($path === '/docs' || $path === '/docs/') && $method === 'GET') {
 
 try {
     $pdo = Database::connect();
+
+    $requestRateLimitsTableExistsStmt = $pdo->query("
+        SELECT COUNT(*) AS total
+        FROM information_schema.TABLES
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = 'request_rate_limits'
+    ");
+    $requestRateLimitsTableExists = (int)($requestRateLimitsTableExistsStmt->fetch()['total'] ?? 0) > 0;
+    if (!$requestRateLimitsTableExists) {
+        $pdo->exec("
+            CREATE TABLE request_rate_limits (
+                bucket_key VARCHAR(128) NOT NULL,
+                bucket_name VARCHAR(64) NOT NULL,
+                attempt_count INT UNSIGNED NOT NULL DEFAULT 0,
+                window_started_at DATETIME NOT NULL,
+                blocked_until DATETIME NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                PRIMARY KEY (bucket_key),
+                KEY idx_request_rate_limits_bucket_name (bucket_name),
+                KEY idx_request_rate_limits_blocked_until (blocked_until)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        ");
+    }
+
+    $activityLogEventIdColumnExistsStmt = $pdo->query("
+        SELECT COUNT(*) AS total
+        FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = 'activity_logs'
+          AND COLUMN_NAME = 'event_id'
+    ");
+    $activityLogEventIdColumnExists = (int)($activityLogEventIdColumnExistsStmt->fetch()['total'] ?? 0) > 0;
+    if (!$activityLogEventIdColumnExists) {
+        $pdo->exec("
+            ALTER TABLE activity_logs
+            ADD COLUMN event_id VARCHAR(64) NULL AFTER action,
+            ADD KEY idx_activity_logs_event_id (event_id),
+            ADD CONSTRAINT fk_activity_logs_event
+                FOREIGN KEY (event_id) REFERENCES events(id)
+                ON DELETE SET NULL
+                ON UPDATE CASCADE
+        ");
+    }
 
     $loadAdminOrganizationIds = static function (PDO $pdo, string $userId): array {
         $stmt = $pdo->prepare('
@@ -77,12 +122,27 @@ try {
         return $stmt->fetch();
     };
 
+    $loadAllOrganizations = static function (PDO $pdo): array {
+        return $pdo->query('
+            SELECT
+                o.id,
+                o.name,
+                o.logo,
+                o.event_limit,
+                aoa.user_id AS admin_user_id,
+                admin_user.name AS admin_user_name
+            FROM organizations o
+            LEFT JOIN admin_organization_assignments aoa ON aoa.organization_id = o.id
+            LEFT JOIN users admin_user ON admin_user.id = aoa.user_id
+            ORDER BY o.name ASC
+        ')->fetchAll();
+    };
+
     $loadEventById = static function (PDO $pdo, string $eventId): array|false {
         $stmt = $pdo->prepare('
             SELECT
                 id,
                 name,
-                event_date AS date,
                 location,
                 organization_id,
                 DATE_FORMAT(office_open_at, "%Y-%m-%dT%H:%i:%s") AS office_open_at,
@@ -94,6 +154,20 @@ try {
         $stmt->execute(['id' => $eventId]);
 
         return $stmt->fetch();
+    };
+
+    $loadAllEvents = static function (PDO $pdo): array {
+        return $pdo->query('
+            SELECT
+                id,
+                name,
+                location,
+                organization_id,
+                DATE_FORMAT(office_open_at, "%Y-%m-%dT%H:%i:%s") AS office_open_at,
+                DATE_FORMAT(office_close_at, "%Y-%m-%dT%H:%i:%s") AS office_close_at
+            FROM events
+            ORDER BY event_date ASC
+        ')->fetchAll();
     };
 
     $participantStatuses = [
@@ -136,6 +210,26 @@ try {
             : [];
 
         return $user;
+    };
+
+    $loadAllUsers = static function (PDO $pdo) use ($loadAdminOrganizationIds, $loadAssignedEvents): array {
+        $users = $pdo->query('
+            SELECT id, name, email, role, organization_id
+            FROM users
+            ORDER BY name ASC
+        ')->fetchAll();
+
+        foreach ($users as &$user) {
+            $user['organization_ids'] = $user['role'] === 'admin'
+                ? $loadAdminOrganizationIds($pdo, (string)$user['id'])
+                : [];
+            $user['assigned_events'] = $user['role'] === 'scanner'
+                ? $loadAssignedEvents($pdo, (string)$user['id'])
+                : [];
+        }
+        unset($user);
+
+        return $users;
     };
 
     $loadUserWithPasswordByEmail = static function (PDO $pdo, string $email): array|false {
@@ -295,6 +389,21 @@ try {
         return $now >= $openAt && $now <= $closeAt;
     };
 
+    $formatEventOfficeWindow = static function (array $event): string {
+        $openAt = parseLocalDateTimeString((string)($event['office_open_at'] ?? ''));
+        $closeAt = parseLocalDateTimeString((string)($event['office_close_at'] ?? ''));
+        if ($openAt === null || $closeAt === null) {
+            return 'Godziny biura zawodów niedostępne';
+        }
+
+        return sprintf(
+            '%s, %s - %s',
+            $openAt->format('d.m.Y'),
+            $openAt->format('H:i'),
+            $closeAt->format('H:i')
+        );
+    };
+
     $canAccessEvent = static function (array $authUser, array $event) use ($canAccessOrganization, $isEventOfficeOpenNow): bool {
         if ($canAccessOrganization($authUser, (string)$event['organization_id'])) {
             return true;
@@ -306,6 +415,220 @@ try {
 
         return in_array((string)$event['id'], $authUser['assigned_events'] ?? [], true)
             && $isEventOfficeOpenNow($event);
+    };
+
+    $filterAccessibleEvents = static function (array $authUser, array $events) use ($canAccessEvent, $canManageEventParticipants): array {
+        return array_values(array_filter(
+            $events,
+            static function (array $event) use ($authUser, $canAccessEvent, $canManageEventParticipants): bool {
+                return $canAccessEvent($authUser, $event) || $canManageEventParticipants($authUser, $event);
+            }
+        ));
+    };
+
+    $loadAccessibleEvents = static function (PDO $pdo, array $authUser) use ($loadAllEvents, $filterAccessibleEvents): array {
+        return $filterAccessibleEvents($authUser, $loadAllEvents($pdo));
+    };
+
+    $filterAccessibleOrganizations = static function (array $authUser, array $organizations, array $accessibleEvents): array {
+        if ($authUser['role'] === 'superadmin') {
+            return array_values($organizations);
+        }
+
+        if ($authUser['role'] === 'admin') {
+            $allowedOrganizationIds = $authUser['organization_ids'] ?? [];
+        } elseif ($authUser['role'] === 'editor') {
+            $allowedOrganizationIds = [(string)($authUser['organization_id'] ?? '')];
+        } else {
+            $allowedOrganizationIds = array_map(
+                static fn(array $event): string => (string)$event['organization_id'],
+                $accessibleEvents
+            );
+        }
+
+        $allowedOrganizationIds = array_values(array_unique(array_filter(
+            $allowedOrganizationIds,
+            static fn(string $organizationId): bool => $organizationId !== ''
+        )));
+
+        return array_values(array_filter(
+            $organizations,
+            static fn(array $organization): bool => in_array((string)$organization['id'], $allowedOrganizationIds, true)
+        ));
+    };
+
+    $filterAccessibleUsers = static function (array $authUser, array $users, array $accessibleOrganizations): array {
+        if ($authUser['role'] === 'superadmin') {
+            return array_values($users);
+        }
+
+        if ($authUser['role'] === 'scanner') {
+            return array_values(array_filter(
+                $users,
+                static fn(array $user): bool => (string)$user['id'] === (string)$authUser['id']
+            ));
+        }
+
+        $accessibleOrganizationIds = array_map(
+            static fn(array $organization): string => (string)$organization['id'],
+            $accessibleOrganizations
+        );
+        $accessibleAdminIds = array_values(array_filter(
+            array_map(
+                static fn(array $organization): string => trim((string)($organization['admin_user_id'] ?? '')),
+                $accessibleOrganizations
+            ),
+            static fn(string $userId): bool => $userId !== ''
+        ));
+
+        return array_values(array_filter(
+            $users,
+            static function (array $user) use ($authUser, $accessibleOrganizationIds, $accessibleAdminIds): bool {
+                if ((string)$user['id'] === (string)$authUser['id']) {
+                    return true;
+                }
+
+                if (in_array((string)($user['organization_id'] ?? ''), $accessibleOrganizationIds, true)) {
+                    return true;
+                }
+
+                return in_array((string)$user['id'], $accessibleAdminIds, true);
+            }
+        ));
+    };
+
+    $filterAccessibleActivityLogs = static function (array $activityLogs, array $accessibleEventIds, array $accessibleParticipantIds): array {
+        $accessibleEventLookup = array_fill_keys($accessibleEventIds, true);
+        $accessibleParticipantLookup = array_fill_keys($accessibleParticipantIds, true);
+
+        return array_values(array_filter(
+            $activityLogs,
+            static function (array $log) use ($accessibleEventLookup, $accessibleParticipantLookup): bool {
+                $eventId = trim((string)($log['event_id'] ?? ''));
+                if ($eventId !== '' && isset($accessibleEventLookup[$eventId])) {
+                    return true;
+                }
+
+                $participantId = trim((string)($log['participant_id'] ?? ''));
+                return $participantId !== '' && isset($accessibleParticipantLookup[$participantId]);
+            }
+        ));
+    };
+
+    $rateLimitBucketKey = static function (string $bucketName, ?string $subject = null): string {
+        $parts = [$bucketName, clientIpAddress()];
+        $normalizedSubject = strtolower(trim((string)$subject));
+        if ($normalizedSubject !== '') {
+            $parts[] = $normalizedSubject;
+        }
+
+        return hash('sha256', implode('|', $parts));
+    };
+
+    $consumeRateLimitAttempt = static function (
+        PDO $pdo,
+        string $bucketName,
+        int $maxAttempts,
+        int $windowSeconds,
+        ?string $subject = null
+    ) use ($rateLimitBucketKey): array {
+        $bucketKey = $rateLimitBucketKey($bucketName, $subject);
+        $now = new DateTimeImmutable('now', new DateTimeZone('UTC'));
+        $nowString = $now->format('Y-m-d H:i:s');
+
+        $pdo->beginTransaction();
+
+        try {
+            $selectStmt = $pdo->prepare('
+                SELECT bucket_key, attempt_count, window_started_at, blocked_until
+                FROM request_rate_limits
+                WHERE bucket_key = :bucket_key
+                LIMIT 1
+                FOR UPDATE
+            ');
+            $selectStmt->execute(['bucket_key' => $bucketKey]);
+            $row = $selectStmt->fetch();
+
+            if ($row === false) {
+                $insertStmt = $pdo->prepare('
+                    INSERT INTO request_rate_limits (bucket_key, bucket_name, attempt_count, window_started_at, blocked_until)
+                    VALUES (:bucket_key, :bucket_name, 1, :window_started_at, NULL)
+                ');
+                $insertStmt->execute([
+                    'bucket_key' => $bucketKey,
+                    'bucket_name' => $bucketName,
+                    'window_started_at' => $nowString,
+                ]);
+
+                $pdo->commit();
+                return ['allowed' => true, 'retry_after' => 0];
+            }
+
+            $blockedUntilRaw = trim((string)($row['blocked_until'] ?? ''));
+            $blockedUntil = $blockedUntilRaw !== ''
+                ? new DateTimeImmutable($blockedUntilRaw, new DateTimeZone('UTC'))
+                : null;
+
+            if ($blockedUntil !== null && $blockedUntil > $now) {
+                $pdo->commit();
+                return [
+                    'allowed' => false,
+                    'retry_after' => max($blockedUntil->getTimestamp() - $now->getTimestamp(), 1),
+                ];
+            }
+
+            $windowStartedAt = new DateTimeImmutable((string)$row['window_started_at'], new DateTimeZone('UTC'));
+            $windowExpiresAt = $windowStartedAt->modify(sprintf('+%d seconds', $windowSeconds));
+
+            if ($windowExpiresAt <= $now) {
+                $resetStmt = $pdo->prepare('
+                    UPDATE request_rate_limits
+                    SET attempt_count = 1, window_started_at = :window_started_at, blocked_until = NULL
+                    WHERE bucket_key = :bucket_key
+                ');
+                $resetStmt->execute([
+                    'window_started_at' => $nowString,
+                    'bucket_key' => $bucketKey,
+                ]);
+
+                $pdo->commit();
+                return ['allowed' => true, 'retry_after' => 0];
+            }
+
+            $attemptCount = (int)($row['attempt_count'] ?? 0) + 1;
+            $isBlocked = $attemptCount > $maxAttempts;
+            $retryAfter = $isBlocked
+                ? max($windowExpiresAt->getTimestamp() - $now->getTimestamp(), 1)
+                : 0;
+            $nextBlockedUntil = $isBlocked
+                ? $now->modify(sprintf('+%d seconds', $retryAfter))->format('Y-m-d H:i:s')
+                : null;
+
+            $updateStmt = $pdo->prepare('
+                UPDATE request_rate_limits
+                SET attempt_count = :attempt_count, blocked_until = :blocked_until
+                WHERE bucket_key = :bucket_key
+            ');
+            $updateStmt->bindValue(':attempt_count', $attemptCount, PDO::PARAM_INT);
+            $updateStmt->bindValue(':blocked_until', $nextBlockedUntil, $nextBlockedUntil === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
+            $updateStmt->bindValue(':bucket_key', $bucketKey, PDO::PARAM_STR);
+            $updateStmt->execute();
+
+            $pdo->commit();
+
+            return ['allowed' => !$isBlocked, 'retry_after' => $retryAfter];
+        } catch (Throwable $exception) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+
+            throw $exception;
+        }
+    };
+
+    $clearRateLimitBucket = static function (PDO $pdo, string $bucketName, ?string $subject = null) use ($rateLimitBucketKey): void {
+        $deleteStmt = $pdo->prepare('DELETE FROM request_rate_limits WHERE bucket_key = :bucket_key');
+        $deleteStmt->execute(['bucket_key' => $rateLimitBucketKey($bucketName, $subject)]);
     };
 
     $generateUniqueParticipantQrCode = static function (PDO $pdo): string {
@@ -323,6 +646,7 @@ try {
     $addActivityLog = static function (
         PDO $pdo,
         string $action,
+        ?string $eventId = null,
         ?int $participantId = null,
         ?string $participantName = null,
         ?string $userId = null,
@@ -332,6 +656,7 @@ try {
             INSERT INTO activity_logs (
                 id,
                 action,
+                event_id,
                 participant_id,
                 participant_name_snapshot,
                 user_id,
@@ -339,6 +664,7 @@ try {
             ) VALUES (
                 :id,
                 :action,
+                :event_id,
                 :participant_id,
                 :participant_name_snapshot,
                 :user_id,
@@ -348,6 +674,7 @@ try {
         $stmt->execute([
             'id' => 'log-' . bin2hex(random_bytes(8)),
             'action' => $action,
+            'event_id' => $eventId,
             'participant_id' => $participantId,
             'participant_name_snapshot' => $participantName,
             'user_id' => $userId,
@@ -521,6 +848,100 @@ try {
         return $ensureParticipantQrCode($pdo, $participant);
     };
 
+    $loadParticipantsByEventId = static function (PDO $pdo, string $eventId) use (&$ensureParticipantQrCode): array {
+        $stmt = $pdo->prepare('
+            SELECT
+                id,
+                event_id,
+                first_name,
+                last_name,
+                display_name,
+                email,
+                organization,
+                bib_number,
+                qr_code,
+                custom_fields_json,
+                status,
+                email_status,
+                checked_in_at,
+                created_at,
+                updated_at
+            FROM participants
+            WHERE event_id = :event_id
+            ORDER BY id ASC
+        ');
+        $stmt->execute(['event_id' => $eventId]);
+        $participants = $stmt->fetchAll();
+
+        foreach ($participants as &$participant) {
+            $participant['custom_fields'] = decodeJsonObject($participant['custom_fields_json'] ?? null);
+            unset($participant['custom_fields_json']);
+            $participant = $ensureParticipantQrCode($pdo, $participant);
+        }
+        unset($participant);
+
+        return $participants;
+    };
+
+    $loadParticipantsByEventIds = static function (PDO $pdo, array $eventIds) use (&$ensureParticipantQrCode): array {
+        $normalizedEventIds = array_values(array_filter(
+            array_map(static fn(mixed $eventId): string => trim((string)$eventId), $eventIds),
+            static fn(string $eventId): bool => $eventId !== ''
+        ));
+        if ($normalizedEventIds === []) {
+            return [];
+        }
+
+        $placeholders = implode(', ', array_fill(0, count($normalizedEventIds), '?'));
+        $stmt = $pdo->prepare("
+            SELECT
+                id,
+                event_id,
+                first_name,
+                last_name,
+                display_name,
+                email,
+                organization,
+                bib_number,
+                qr_code,
+                custom_fields_json,
+                status,
+                email_status,
+                checked_in_at,
+                created_at,
+                updated_at
+            FROM participants
+            WHERE event_id IN ($placeholders)
+            ORDER BY id DESC
+        ");
+        $stmt->execute($normalizedEventIds);
+        $participants = $stmt->fetchAll();
+
+        foreach ($participants as &$participant) {
+            $participant['custom_fields'] = decodeJsonObject($participant['custom_fields_json'] ?? null);
+            unset($participant['custom_fields_json']);
+            $participant = $ensureParticipantQrCode($pdo, $participant);
+        }
+        unset($participant);
+
+        return $participants;
+    };
+
+    $loadAllActivityLogs = static function (PDO $pdo): array {
+        return $pdo->query('
+            SELECT
+                id,
+                event_id,
+                participant_id,
+                created_at AS timestamp,
+                action,
+                participant_name_snapshot AS participant_name,
+                user_name_snapshot AS user_name
+            FROM activity_logs
+            ORDER BY created_at DESC
+        ')->fetchAll();
+    };
+
     $serializeParticipantScanResponse = static function (array $participant, array $event, bool $canAccess): array {
         return [
             'participant' => [
@@ -537,7 +958,6 @@ try {
             'event' => [
                 'id' => (string)$event['id'],
                 'name' => (string)$event['name'],
-                'date' => (string)$event['date'],
                 'location' => (string)$event['location'],
                 'organization_id' => (string)$event['organization_id'],
                 'office_open_at' => (string)$event['office_open_at'],
@@ -852,6 +1272,14 @@ try {
         $input = readJsonBody();
         $email = normalizeEmailAddress((string)($input['email'] ?? ''));
         $password = (string)($input['password'] ?? '');
+        $loginRateLimit = $consumeRateLimitAttempt($pdo, 'auth_login', 5, 900, $email);
+        if (!$loginRateLimit['allowed']) {
+            jsonResponse(429, [
+                'error' => 'Too many login attempts. Please try again later.',
+                'retry_after' => (int)$loginRateLimit['retry_after'],
+            ]);
+            exit;
+        }
 
         if ($email === '' || $password === '') {
             jsonResponse(422, ['error' => 'email and password are required']);
@@ -881,6 +1309,7 @@ try {
             ? $loadAssignedEvents($pdo, (string)$user['id'])
             : [];
         unset($user['password']);
+        $clearRateLimitBucket($pdo, 'auth_login', $email);
 
         jsonResponse(200, [
             'token_type' => 'Bearer',
@@ -894,6 +1323,14 @@ try {
     if ($path === '/auth/forgot-password' && $method === 'POST') {
         $input = readJsonBody();
         $email = normalizeEmailAddress((string)($input['email'] ?? ''));
+        $forgotPasswordRateLimit = $consumeRateLimitAttempt($pdo, 'auth_forgot_password', 5, 900, $email);
+        if (!$forgotPasswordRateLimit['allowed']) {
+            jsonResponse(429, [
+                'error' => forgotPasswordSuccessMessage(),
+                'retry_after' => (int)$forgotPasswordRateLimit['retry_after'],
+            ]);
+            exit;
+        }
 
         if ($email === '' || !isValidEmailAddress($email)) {
             jsonResponse(200, ['message' => forgotPasswordSuccessMessage()]);
@@ -923,6 +1360,14 @@ try {
         $token = trim((string)($input['token'] ?? ''));
         $password = (string)($input['password'] ?? '');
         $passwordConfirmation = (string)($input['password_confirmation'] ?? '');
+        $resetRateLimit = $consumeRateLimitAttempt($pdo, 'auth_reset_password', 8, 900, $token);
+        if (!$resetRateLimit['allowed']) {
+            jsonResponse(429, [
+                'error' => 'Too many password reset attempts. Please try again later.',
+                'retry_after' => (int)$resetRateLimit['retry_after'],
+            ]);
+            exit;
+        }
 
         if ($token === '' || $password === '' || $passwordConfirmation === '') {
             jsonResponse(422, ['error' => 'token, password and password_confirmation are required']);
@@ -965,6 +1410,7 @@ try {
             throw $exception;
         }
 
+        $clearRateLimitBucket($pdo, 'auth_reset_password', $token);
         jsonResponse(200, ['message' => 'Hasło zostało zmienione.']);
         exit;
     }
@@ -1040,98 +1486,24 @@ try {
     }
 
     if ($path === '/bootstrap' && $method === 'GET') {
-        requireAuth($resolveAuthenticatedUser);
-
-        $organizations = $pdo->query('
-            SELECT
-                o.id,
-                o.name,
-                o.logo,
-                o.event_limit,
-                aoa.user_id AS admin_user_id,
-                admin_user.name AS admin_user_name
-            FROM organizations o
-            LEFT JOIN admin_organization_assignments aoa ON aoa.organization_id = o.id
-            LEFT JOIN users admin_user ON admin_user.id = aoa.user_id
-            ORDER BY o.name ASC
-        ')->fetchAll();
-
-        $events = $pdo->query('
-            SELECT
-                id,
-                name,
-                event_date AS date,
-                location,
-                organization_id,
-                DATE_FORMAT(office_open_at, "%Y-%m-%dT%H:%i:%s") AS office_open_at,
-                DATE_FORMAT(office_close_at, "%Y-%m-%dT%H:%i:%s") AS office_close_at
-            FROM events
-            ORDER BY event_date ASC
-        ')->fetchAll();
-
-        $users = $pdo->query('
-            SELECT id, name, email, role, organization_id
-            FROM users
-            ORDER BY name ASC
-        ')->fetchAll();
-
-        $assignments = $pdo->query('SELECT user_id, organization_id FROM admin_organization_assignments')->fetchAll();
-        $organizationIdsByAdmin = [];
-        foreach ($assignments as $assignment) {
-            $organizationIdsByAdmin[(string)$assignment['user_id']][] = (string)$assignment['organization_id'];
-        }
-
-        $userEventAssignments = $pdo->query('SELECT user_id, event_id FROM user_event_assignments ORDER BY event_id ASC')->fetchAll();
-        $assignedEventsByUser = [];
-        foreach ($userEventAssignments as $assignment) {
-            $assignedEventsByUser[(string)$assignment['user_id']][] = (string)$assignment['event_id'];
-        }
-
-        foreach ($users as &$user) {
-            $userId = (string)$user['id'];
-            $user['organization_ids'] = $user['role'] === 'admin' ? ($organizationIdsByAdmin[$userId] ?? []) : [];
-            $user['assigned_events'] = $user['role'] === 'scanner' ? ($assignedEventsByUser[$userId] ?? []) : [];
-        }
-        unset($user);
-
-        $participants = $pdo->query('
-            SELECT
-                id,
-                event_id,
-                first_name,
-                last_name,
-                display_name,
-                email,
-                organization,
-                bib_number,
-                qr_code,
-                custom_fields_json,
-                status,
-                email_status,
-                checked_in_at,
-                created_at,
-                updated_at
-            FROM participants
-            ORDER BY id DESC
-        ')->fetchAll();
-
-        foreach ($participants as &$participant) {
-            $participant['custom_fields'] = decodeJsonObject($participant['custom_fields_json'] ?? null);
-            unset($participant['custom_fields_json']);
-            $participant = $ensureParticipantQrCode($pdo, $participant);
-        }
-        unset($participant);
-
-        $activityLogs = $pdo->query('
-            SELECT
-                id,
-                created_at AS timestamp,
-                action,
-                participant_name_snapshot AS participant_name,
-                user_name_snapshot AS user_name
-            FROM activity_logs
-            ORDER BY created_at DESC
-        ')->fetchAll();
+        $authUser = requireAuth($resolveAuthenticatedUser);
+        $events = $loadAccessibleEvents($pdo, $authUser);
+        $organizations = $filterAccessibleOrganizations($authUser, $loadAllOrganizations($pdo), $events);
+        $users = $filterAccessibleUsers($authUser, $loadAllUsers($pdo), $organizations);
+        $accessibleEventIds = array_map(
+            static fn(array $event): string => (string)$event['id'],
+            $events
+        );
+        $participants = $loadParticipantsByEventIds($pdo, $accessibleEventIds);
+        $accessibleParticipantIds = array_map(
+            static fn(array $participant): string => (string)$participant['id'],
+            $participants
+        );
+        $activityLogs = $filterAccessibleActivityLogs(
+            $loadAllActivityLogs($pdo),
+            $accessibleEventIds,
+            $accessibleParticipantIds
+        );
 
         jsonResponse(200, [
             'data' => [
@@ -1243,24 +1615,163 @@ try {
         exit;
     }
 
+    if (preg_match('#^/organizations/([^/]+)$#', $path, $matches) === 1 && $method === 'PATCH') {
+        $authUser = requireAnyRole(['superadmin', 'admin'], $resolveAuthenticatedUser);
+        $organizationId = (string)$matches[1];
+
+        if (!$canAccessOrganization($authUser, $organizationId)) {
+            jsonResponse(403, ['error' => 'Forbidden']);
+            exit;
+        }
+
+        $organization = $loadOrganizationById($pdo, $organizationId);
+        if ($organization === false) {
+            jsonResponse(404, ['error' => 'Organization not found']);
+            exit;
+        }
+
+        $input = readJsonBody();
+        $hasName = array_key_exists('name', $input);
+        $hasEventLimit = array_key_exists('event_limit', $input);
+        if (!$hasName && !$hasEventLimit) {
+            jsonResponse(422, ['error' => 'At least one organization field must be provided']);
+            exit;
+        }
+
+        $name = $hasName ? trim((string)$input['name']) : (string)$organization['name'];
+        if ($name === '') {
+            jsonResponse(422, ['error' => 'name is required']);
+            exit;
+        }
+
+        $eventLimitValue = (int)$organization['event_limit'];
+        if ($hasEventLimit) {
+            $eventLimit = $input['event_limit'];
+            if (!is_int($eventLimit) && !(is_string($eventLimit) && ctype_digit($eventLimit))) {
+                jsonResponse(422, ['error' => 'event_limit must be a non-negative integer']);
+                exit;
+            }
+
+            $eventLimitValue = (int)$eventLimit;
+        }
+
+        $eventCountStmt = $pdo->prepare('SELECT COUNT(*) AS total FROM events WHERE organization_id = :organization_id');
+        $eventCountStmt->execute(['organization_id' => $organizationId]);
+        $eventCount = (int)($eventCountStmt->fetch()['total'] ?? 0);
+        if ($eventLimitValue < $eventCount) {
+            jsonResponse(422, ['error' => 'event_limit cannot be lower than the current number of events']);
+            exit;
+        }
+
+        $existingOrganizationStmt = $pdo->prepare('SELECT id FROM organizations WHERE name = :name AND id <> :id LIMIT 1');
+        $existingOrganizationStmt->execute([
+            'name' => $name,
+            'id' => $organizationId,
+        ]);
+        if ($existingOrganizationStmt->fetch() !== false) {
+            jsonResponse(409, ['error' => 'Organization with this name already exists']);
+            exit;
+        }
+
+        $updateStmt = $pdo->prepare('
+            UPDATE organizations
+            SET name = :name, event_limit = :event_limit
+            WHERE id = :id
+        ');
+        $updateStmt->execute([
+            'name' => $name,
+            'event_limit' => $eventLimitValue,
+            'id' => $organizationId,
+        ]);
+
+        if ($name !== (string)$organization['name']) {
+            $addActivityLog(
+                $pdo,
+                sprintf('Zmieniono nazwę organizacji na %s', $name),
+                null,
+                null,
+                null,
+                (string)$authUser['id'],
+                (string)$authUser['name']
+            );
+        }
+
+        if ($eventLimitValue !== (int)$organization['event_limit']) {
+            $addActivityLog(
+                $pdo,
+                sprintf('Zmieniono limit wydarzeń organizacji %s na %d', $name, $eventLimitValue),
+                null,
+                null,
+                null,
+                (string)$authUser['id'],
+                (string)$authUser['name']
+            );
+        }
+
+        jsonResponse(200, ['data' => $loadOrganizationById($pdo, $organizationId)]);
+        exit;
+    }
+
+    if (preg_match('#^/organizations/([^/]+)$#', $path, $matches) === 1 && $method === 'DELETE') {
+        $authUser = requireAnyRole(['superadmin', 'admin'], $resolveAuthenticatedUser);
+        $organizationId = (string)$matches[1];
+
+        if (!$canAccessOrganization($authUser, $organizationId)) {
+            jsonResponse(403, ['error' => 'Forbidden']);
+            exit;
+        }
+
+        $organization = $loadOrganizationById($pdo, $organizationId);
+        if ($organization === false) {
+            jsonResponse(404, ['error' => 'Organization not found']);
+            exit;
+        }
+
+        $eventCountStmt = $pdo->prepare('SELECT COUNT(*) AS total FROM events WHERE organization_id = :organization_id');
+        $eventCountStmt->execute(['organization_id' => $organizationId]);
+        $eventCount = (int)($eventCountStmt->fetch()['total'] ?? 0);
+        if ($eventCount > 0) {
+            jsonResponse(422, ['error' => 'Organization with events cannot be deleted']);
+            exit;
+        }
+
+        $memberCountStmt = $pdo->prepare('SELECT COUNT(*) AS total FROM users WHERE organization_id = :organization_id');
+        $memberCountStmt->execute(['organization_id' => $organizationId]);
+        $memberCount = (int)($memberCountStmt->fetch()['total'] ?? 0);
+        if ($memberCount > 0) {
+            jsonResponse(422, ['error' => 'Organization with assigned users cannot be deleted']);
+            exit;
+        }
+
+        $deleteStmt = $pdo->prepare('DELETE FROM organizations WHERE id = :id');
+        $deleteStmt->execute(['id' => $organizationId]);
+
+        $addActivityLog(
+            $pdo,
+            sprintf('Usunięto organizację: %s', (string)$organization['name']),
+            null,
+            null,
+            null,
+            (string)$authUser['id'],
+            (string)$authUser['name']
+        );
+
+        jsonResponse(200, ['success' => true]);
+        exit;
+    }
+
     if ($path === '/events' && $method === 'POST') {
         $authUser = requireAnyRole(['superadmin', 'admin', 'editor'], $resolveAuthenticatedUser);
         $input = readJsonBody();
 
         $name = trim((string)($input['name'] ?? ''));
-        $date = trim((string)($input['date'] ?? ''));
         $location = trim((string)($input['location'] ?? ''));
         $organizationId = trim((string)($input['organization_id'] ?? ''));
         $officeOpenAt = trim((string)($input['office_open_at'] ?? ''));
         $officeCloseAt = trim((string)($input['office_close_at'] ?? ''));
 
-        if ($name === '' || $date === '' || $location === '' || $organizationId === '' || $officeOpenAt === '' || $officeCloseAt === '') {
-            jsonResponse(422, ['error' => 'name, date, location, organization_id, office_open_at and office_close_at are required']);
-            exit;
-        }
-
-        if (!isValidDateString($date)) {
-            jsonResponse(422, ['error' => 'date must be a valid YYYY-MM-DD value']);
+        if ($name === '' || $location === '' || $organizationId === '' || $officeOpenAt === '' || $officeCloseAt === '') {
+            jsonResponse(422, ['error' => 'name, location, organization_id, office_open_at and office_close_at are required']);
             exit;
         }
 
@@ -1280,6 +1791,8 @@ try {
             jsonResponse(422, ['error' => 'office_open_at must be earlier than office_close_at']);
             exit;
         }
+
+        $eventDate = substr($normalizedOfficeOpenAt, 0, 10);
 
         if (!$canAccessOrganization($authUser, $organizationId)) {
             jsonResponse(403, ['error' => 'Forbidden']);
@@ -1313,7 +1826,7 @@ try {
             $insertEventStmt->execute([
                 'id' => $eventId,
                 'name' => $name,
-                'event_date' => $date,
+                'event_date' => $eventDate,
                 'location' => $location,
                 'organization_id' => $organizationId,
                 'office_open_at' => $normalizedOfficeOpenAt,
@@ -1324,6 +1837,7 @@ try {
                 INSERT INTO activity_logs (
                     id,
                     action,
+                    event_id,
                     participant_id,
                     participant_name_snapshot,
                     user_id,
@@ -1331,6 +1845,7 @@ try {
                 ) VALUES (
                     :id,
                     :action,
+                    :event_id,
                     NULL,
                     NULL,
                     :user_id,
@@ -1340,6 +1855,7 @@ try {
             $activityStmt->execute([
                 'id' => 'log-' . bin2hex(random_bytes(8)),
                 'action' => sprintf('Utworzono wydarzenie: %s', $name),
+                'event_id' => $eventId,
                 'user_id' => $authUser['id'],
                 'user_name_snapshot' => $authUser['name'],
             ]);
@@ -1357,9 +1873,10 @@ try {
             'data' => [
                 'id' => $eventId,
                 'name' => $name,
-                'date' => $date,
                 'location' => $location,
                 'organization_id' => $organizationId,
+                'office_open_at' => str_replace(' ', 'T', $normalizedOfficeOpenAt),
+                'office_close_at' => str_replace(' ', 'T', $normalizedOfficeCloseAt),
             ],
         ]);
         exit;
@@ -1383,6 +1900,347 @@ try {
         exit;
     }
 
+    if (preg_match('#^/events/([^/]+)$#', $path, $matches) === 1 && $method === 'PATCH') {
+        $authUser = requireAnyRole(['superadmin', 'admin', 'editor'], $resolveAuthenticatedUser);
+        $eventId = (string)$matches[1];
+        $event = $loadEventById($pdo, $eventId);
+
+        if ($event === false) {
+            jsonResponse(404, ['error' => 'Event not found']);
+            exit;
+        }
+
+        if (!$canAccessOrganization($authUser, (string)$event['organization_id'])) {
+            jsonResponse(403, ['error' => 'Forbidden']);
+            exit;
+        }
+
+        $input = readJsonBody();
+
+        $name = trim((string)($input['name'] ?? ''));
+        $location = trim((string)($input['location'] ?? ''));
+        $officeOpenAt = trim((string)($input['office_open_at'] ?? ''));
+        $officeCloseAt = trim((string)($input['office_close_at'] ?? ''));
+
+        if ($name === '' || $location === '' || $officeOpenAt === '' || $officeCloseAt === '') {
+            jsonResponse(422, ['error' => 'name, location, office_open_at and office_close_at are required']);
+            exit;
+        }
+
+        if (!isValidLocalDateTimeString($officeOpenAt) || !isValidLocalDateTimeString($officeCloseAt)) {
+            jsonResponse(422, ['error' => 'office_open_at and office_close_at must be valid local date-time values']);
+            exit;
+        }
+
+        $normalizedOfficeOpenAt = normalizeLocalDateTimeString($officeOpenAt);
+        $normalizedOfficeCloseAt = normalizeLocalDateTimeString($officeCloseAt);
+        if ($normalizedOfficeOpenAt === null || $normalizedOfficeCloseAt === null) {
+            jsonResponse(422, ['error' => 'office_open_at and office_close_at must be valid local date-time values']);
+            exit;
+        }
+
+        if ($normalizedOfficeOpenAt >= $normalizedOfficeCloseAt) {
+            jsonResponse(422, ['error' => 'office_open_at must be earlier than office_close_at']);
+            exit;
+        }
+
+        $eventDate = substr($normalizedOfficeOpenAt, 0, 10);
+
+        $stmt = $pdo->prepare('
+            UPDATE events
+            SET
+                name = :name,
+                event_date = :event_date,
+                location = :location,
+                office_open_at = :office_open_at,
+                office_close_at = :office_close_at
+            WHERE id = :id
+            LIMIT 1
+        ');
+        $stmt->execute([
+            'id' => $eventId,
+            'name' => $name,
+            'event_date' => $eventDate,
+            'location' => $location,
+            'office_open_at' => $normalizedOfficeOpenAt,
+            'office_close_at' => $normalizedOfficeCloseAt,
+        ]);
+
+        $addActivityLog(
+            $pdo,
+            sprintf('Zaktualizowano wydarzenie: %s', $name),
+            $eventId,
+            null,
+            null,
+            (string)$authUser['id'],
+            (string)$authUser['name']
+        );
+
+        jsonResponse(200, ['data' => $loadEventById($pdo, $eventId)]);
+        exit;
+    }
+
+    if (preg_match('#^/events/([^/]+)$#', $path, $matches) === 1 && $method === 'DELETE') {
+        $authUser = requireAnyRole(['superadmin', 'admin', 'editor'], $resolveAuthenticatedUser);
+        $eventId = (string)$matches[1];
+        $event = $loadEventById($pdo, $eventId);
+
+        if ($event === false) {
+            jsonResponse(404, ['error' => 'Event not found']);
+            exit;
+        }
+
+        if (!$canAccessOrganization($authUser, (string)$event['organization_id'])) {
+            jsonResponse(403, ['error' => 'Forbidden']);
+            exit;
+        }
+
+        $participantCountStmt = $pdo->prepare('SELECT COUNT(*) AS total FROM participants WHERE event_id = :event_id');
+        $participantCountStmt->execute(['event_id' => $eventId]);
+        $participantCount = (int)($participantCountStmt->fetch()['total'] ?? 0);
+
+        $pdo->beginTransaction();
+
+        try {
+            $addActivityLog(
+                $pdo,
+                sprintf('Usunięto wydarzenie: %s (%d uczestników)', (string)$event['name'], $participantCount),
+                $eventId,
+                null,
+                null,
+                (string)$authUser['id'],
+                (string)$authUser['name']
+            );
+
+            $deleteParticipantsStmt = $pdo->prepare('DELETE FROM participants WHERE event_id = :event_id');
+            $deleteParticipantsStmt->execute(['event_id' => $eventId]);
+
+            $deleteEventStmt = $pdo->prepare('DELETE FROM events WHERE id = :id');
+            $deleteEventStmt->execute(['id' => $eventId]);
+
+            $pdo->commit();
+        } catch (Throwable $exception) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+
+            throw $exception;
+        }
+
+        jsonResponse(200, ['success' => true]);
+        exit;
+    }
+
+    if (preg_match('#^/events/([^/]+)/export\.csv$#', $path, $matches) === 1 && $method === 'GET') {
+        $authUser = requireAnyRole(['superadmin', 'admin', 'editor'], $resolveAuthenticatedUser);
+        $eventId = (string)$matches[1];
+        $event = $loadEventById($pdo, $eventId);
+
+        if ($event === false) {
+            jsonResponse(404, ['error' => 'Event not found']);
+            exit;
+        }
+
+        if (!$canManageEventParticipants($authUser, $event)) {
+            jsonResponse(403, ['error' => 'Forbidden']);
+            exit;
+        }
+
+        $participants = $loadParticipantsByEventId($pdo, $eventId);
+        $mappings = $loadParticipantFieldMappings($pdo, $eventId);
+
+        $customFieldColumns = [];
+        foreach ($mappings as $mapping) {
+            $alias = trim((string)($mapping['alias'] ?? ''));
+            if ($alias === '' || in_array($alias, ['Email'], true)) {
+                continue;
+            }
+
+            $customFieldColumns[] = $alias;
+        }
+
+        foreach ($participants as $participant) {
+            foreach (($participant['custom_fields'] ?? []) as $fieldName => $value) {
+                $fieldName = trim((string)$fieldName);
+                if ($fieldName === '' || in_array($fieldName, $customFieldColumns, true)) {
+                    continue;
+                }
+
+                $customFieldColumns[] = $fieldName;
+            }
+        }
+
+        $columns = array_merge([
+            'participant_id',
+            'event_id',
+            'event_name',
+            'event_location',
+            'event_office_open_at',
+            'event_office_close_at',
+            'organization_id',
+            'display_name',
+            'first_name',
+            'last_name',
+            'email',
+            'organization',
+            'bib_number',
+            'status',
+            'email_status',
+            'checked_in_at',
+            'qr_code',
+            'created_at',
+            'updated_at',
+        ], $customFieldColumns);
+
+        $stream = fopen('php://temp', 'r+');
+        if ($stream === false) {
+            jsonResponse(500, ['error' => 'Failed to initialize CSV export']);
+            exit;
+        }
+
+        fputcsv($stream, $columns);
+
+        foreach ($participants as $participant) {
+            $row = [
+                'participant_id' => (string)$participant['id'],
+                'event_id' => (string)$event['id'],
+                'event_name' => (string)$event['name'],
+                'event_location' => (string)$event['location'],
+                'event_office_open_at' => (string)$event['office_open_at'],
+                'event_office_close_at' => (string)$event['office_close_at'],
+                'organization_id' => (string)$event['organization_id'],
+                'display_name' => (string)($participant['display_name'] ?? ''),
+                'first_name' => (string)($participant['first_name'] ?? ''),
+                'last_name' => (string)($participant['last_name'] ?? ''),
+                'email' => (string)($participant['email'] ?? ''),
+                'organization' => (string)($participant['organization'] ?? ''),
+                'bib_number' => (string)($participant['bib_number'] ?? ''),
+                'status' => (string)($participant['status'] ?? ''),
+                'email_status' => (string)($participant['email_status'] ?? ''),
+                'checked_in_at' => (string)($participant['checked_in_at'] ?? ''),
+                'qr_code' => (string)($participant['qr_code'] ?? ''),
+                'created_at' => (string)($participant['created_at'] ?? ''),
+                'updated_at' => (string)($participant['updated_at'] ?? ''),
+            ];
+
+            foreach ($customFieldColumns as $columnName) {
+                $row[$columnName] = (string)(($participant['custom_fields'] ?? [])[$columnName] ?? '');
+            }
+
+            fputcsv($stream, array_map(
+                static fn(string $columnName): string => (string)($row[$columnName] ?? ''),
+                $columns
+            ));
+        }
+
+        rewind($stream);
+        $csvContent = stream_get_contents($stream);
+        fclose($stream);
+
+        $addActivityLog(
+            $pdo,
+            'Wyeksportowano dane uczestnikow do CSV',
+            $eventId,
+            null,
+            null,
+            (string)$authUser['id'],
+            (string)$authUser['name']
+        );
+
+        if ($csvContent === false) {
+            jsonResponse(500, ['error' => 'Failed to build CSV export']);
+            exit;
+        }
+
+        $safeEventName = preg_replace('/[^a-zA-Z0-9_-]+/', '-', (string)$event['name']) ?: 'event';
+        header('Content-Type: text/csv; charset=UTF-8');
+        header(sprintf('Content-Disposition: attachment; filename="%s-participants.csv"', trim($safeEventName, '-')));
+        echo "\xEF\xBB\xBF";
+        echo $csvContent;
+        exit;
+    }
+
+    if (preg_match('#^/events/([^/]+)/logs/export\.csv$#', $path, $matches) === 1 && $method === 'GET') {
+        $authUser = requireAnyRole(['superadmin', 'admin', 'editor'], $resolveAuthenticatedUser);
+        $eventId = (string)$matches[1];
+        $event = $loadEventById($pdo, $eventId);
+
+        if ($event === false) {
+            jsonResponse(404, ['error' => 'Event not found']);
+            exit;
+        }
+
+        if (!$canManageEventParticipants($authUser, $event)) {
+            jsonResponse(403, ['error' => 'Forbidden']);
+            exit;
+        }
+
+        $stmt = $pdo->prepare('
+            SELECT
+                al.id,
+                COALESCE(al.event_id, p.event_id) AS event_id,
+                al.action,
+                al.participant_id,
+                al.participant_name_snapshot AS participant_name,
+                al.user_id,
+                al.user_name_snapshot AS user_name,
+                al.created_at AS timestamp
+            FROM activity_logs al
+            LEFT JOIN participants p ON p.id = al.participant_id
+            WHERE COALESCE(al.event_id, p.event_id) = :event_id
+            ORDER BY al.created_at DESC, al.id DESC
+        ');
+        $stmt->execute(['event_id' => $eventId]);
+        $logs = $stmt->fetchAll();
+
+        $stream = fopen('php://temp', 'r+');
+        if ($stream === false) {
+            jsonResponse(500, ['error' => 'Failed to initialize CSV export']);
+            exit;
+        }
+
+        fputcsv($stream, ['log_id', 'event_id', 'event_name', 'user_id', 'user_name', 'participant_id', 'participant_name', 'action', 'timestamp']);
+        foreach ($logs as $log) {
+            fputcsv($stream, [
+                (string)($log['id'] ?? ''),
+                (string)($log['event_id'] ?? ''),
+                (string)$event['name'],
+                (string)($log['user_id'] ?? ''),
+                (string)($log['user_name'] ?? ''),
+                (string)($log['participant_id'] ?? ''),
+                (string)($log['participant_name'] ?? ''),
+                (string)($log['action'] ?? ''),
+                (string)($log['timestamp'] ?? ''),
+            ]);
+        }
+
+        rewind($stream);
+        $csvContent = stream_get_contents($stream);
+        fclose($stream);
+
+        $addActivityLog(
+            $pdo,
+            'Wyeksportowano logi wydarzenia do CSV',
+            $eventId,
+            null,
+            null,
+            (string)$authUser['id'],
+            (string)$authUser['name']
+        );
+
+        if ($csvContent === false) {
+            jsonResponse(500, ['error' => 'Failed to build CSV export']);
+            exit;
+        }
+
+        $safeEventName = preg_replace('/[^a-zA-Z0-9_-]+/', '-', (string)$event['name']) ?: 'event';
+        header('Content-Type: text/csv; charset=UTF-8');
+        header(sprintf('Content-Disposition: attachment; filename="%s-logs.csv"', trim($safeEventName, '-')));
+        echo "\xEF\xBB\xBF";
+        echo $csvContent;
+        exit;
+    }
+
     if (preg_match('#^/events/([^/]+)/participant-imports/analyze$#', $path, $matches) === 1 && $method === 'POST') {
         $authUser = requireAnyRole(['superadmin', 'admin', 'editor'], $resolveAuthenticatedUser);
         $eventId = (string)$matches[1];
@@ -1398,7 +2256,7 @@ try {
             exit;
         }
 
-        $input = readJsonBody();
+        $input = readJsonBody(10485760);
         $csvContent = (string)($input['csv_content'] ?? '');
         if (trim($csvContent) === '') {
             jsonResponse(422, ['error' => 'csv_content is required']);
@@ -1583,6 +2441,16 @@ try {
             throw $exception;
         }
 
+        $addActivityLog(
+            $pdo,
+            'Zapisano mapowanie pol CSV dla wydarzenia',
+            $eventId,
+            null,
+            null,
+            (string)$authUser['id'],
+            (string)$authUser['name']
+        );
+
         jsonResponse(201, ['data' => $loadParticipantFieldMappings($pdo, $eventId)]);
         exit;
     }
@@ -1608,7 +2476,7 @@ try {
             exit;
         }
 
-        $input = readJsonBody();
+        $input = readJsonBody(10485760);
         $csvContent = (string)($input['csv_content'] ?? '');
         if (trim($csvContent) === '') {
             jsonResponse(422, ['error' => 'csv_content is required']);
@@ -1713,6 +2581,20 @@ try {
             }
         }
 
+        $addActivityLog(
+            $pdo,
+            sprintf(
+                'Zaimportowano CSV uczestnikow: dodano %d, duplikaty %d, niepoprawne %d',
+                count($createdParticipants),
+                $duplicateCount,
+                $invalidCount
+            ),
+            $eventId,
+            null,
+            null,
+            (string)$authUser['id'],
+            (string)$authUser['name']
+        );
         jsonResponse(200, [
             'data' => [
                 'created_count' => count($createdParticipants),
@@ -1799,6 +2681,15 @@ try {
             is_string($resolvedData['bib_number']) ? $resolvedData['bib_number'] : null,
             is_array($resolvedData['custom_fields']) ? $resolvedData['custom_fields'] : []
         );
+        $addActivityLog(
+            $pdo,
+            'Dodano uczestnika recznie',
+            $eventId,
+            (int)$participant['id'],
+            (string)$participant['display_name'],
+            (string)$authUser['id'],
+            (string)$authUser['name']
+        );
         jsonResponse(201, ['data' => $participant]);
         exit;
     }
@@ -1840,6 +2731,16 @@ try {
             'event_limit' => $eventLimitValue,
             'id' => $organizationId,
         ]);
+
+        $addActivityLog(
+            $pdo,
+            sprintf('Zmieniono limit wydarzeń organizacji %s na %d', (string)$organization['name'], $eventLimitValue),
+            null,
+            null,
+            null,
+            (string)$authUser['id'],
+            (string)$authUser['name']
+        );
 
         jsonResponse(200, ['data' => $loadOrganizationById($pdo, $organizationId)]);
         exit;
@@ -1975,6 +2876,15 @@ try {
                         'user_id' => $userId,
                         'event_id' => $eventId,
                     ]);
+                    $addActivityLog(
+                        $pdo,
+                        sprintf('Przypisano skanera %s do wydarzenia', $name),
+                        $eventId,
+                        null,
+                        null,
+                        (string)$authUser['id'],
+                        (string)$authUser['name']
+                    );
                 }
             }
 
@@ -1982,6 +2892,7 @@ try {
                 INSERT INTO activity_logs (
                     id,
                     action,
+                    event_id,
                     participant_id,
                     participant_name_snapshot,
                     user_id,
@@ -1989,6 +2900,7 @@ try {
                 ) VALUES (
                     :id,
                     :action,
+                    NULL,
                     NULL,
                     NULL,
                     :user_id,
@@ -2059,6 +2971,10 @@ try {
         $pdo->beginTransaction();
 
         try {
+            $previousAssignedEvents = array_values(array_filter(
+                is_array($targetUser['assigned_events'] ?? null) ? $targetUser['assigned_events'] : [],
+                static fn(mixed $eventId): bool => is_string($eventId) && trim($eventId) !== ''
+            ));
             $deleteStmt = $pdo->prepare('DELETE FROM user_event_assignments WHERE user_id = :user_id');
             $deleteStmt->execute(['user_id' => $userId]);
 
@@ -2074,6 +2990,33 @@ try {
                         'event_id' => $eventId,
                     ]);
                 }
+            }
+
+            $addedEventIds = array_values(array_diff($assignedEvents, $previousAssignedEvents));
+            $removedEventIds = array_values(array_diff($previousAssignedEvents, $assignedEvents));
+
+            foreach ($addedEventIds as $eventId) {
+                $addActivityLog(
+                    $pdo,
+                    sprintf('Przypisano skanera %s do wydarzenia', (string)$targetUser['name']),
+                    $eventId,
+                    null,
+                    null,
+                    (string)$authUser['id'],
+                    (string)$authUser['name']
+                );
+            }
+
+            foreach ($removedEventIds as $eventId) {
+                $addActivityLog(
+                    $pdo,
+                    sprintf('Usunieto skanera %s z wydarzenia', (string)$targetUser['name']),
+                    $eventId,
+                    null,
+                    null,
+                    (string)$authUser['id'],
+                    (string)$authUser['name']
+                );
             }
 
             $pdo->commit();
@@ -2235,7 +3178,7 @@ try {
                 recipientEmail: (string)$participant['email'],
                 recipientName: (string)$participant['display_name'],
                 eventName: (string)$event['name'],
-                eventDate: (string)$event['date'],
+                eventOfficeWindow: $formatEventOfficeWindow($event),
                 eventLocation: (string)$event['location'],
                 bibNumber: (string)($participant['bib_number'] ?? ''),
                 qrToken: (string)$participant['qr_code']
@@ -2251,6 +3194,7 @@ try {
             $addActivityLog(
                 $pdo,
                 'Ponownie wyslano kod QR',
+                (string)$event['id'],
                 (int)$participant['id'],
                 (string)$participant['display_name'],
                 (string)$authUser['id'],
@@ -2325,7 +3269,7 @@ try {
                     recipientEmail: (string)$participantRow['email'],
                     recipientName: (string)$participantRow['display_name'],
                     eventName: (string)$event['name'],
-                    eventDate: (string)$event['date'],
+                    eventOfficeWindow: $formatEventOfficeWindow($event),
                     eventLocation: (string)$event['location'],
                     bibNumber: (string)($participantRow['bib_number'] ?? ''),
                     qrToken: (string)$participantRow['qr_code']
@@ -2350,6 +3294,7 @@ try {
             $addActivityLog(
                 $pdo,
                 $resendAll ? 'Wyslano ponownie kody QR dla wydarzenia' : 'Wyslano kody QR dla wydarzenia',
+                $eventId,
                 null,
                 null,
                 (string)$authUser['id'],
@@ -2409,6 +3354,7 @@ try {
             $addActivityLog(
                 $pdo,
                 'Check-in przez skaner QR',
+                (string)$event['id'],
                 (int)$participant['id'],
                 (string)$participant['display_name'],
                 (string)$authUser['id'],
@@ -2418,6 +3364,7 @@ try {
             $addActivityLog(
                 $pdo,
                 'Skan QR',
+                (string)$event['id'],
                 (int)$participant['id'],
                 (string)$participant['display_name'],
                 (string)$authUser['id'],
@@ -2464,7 +3411,8 @@ try {
                 $participant = $updateParticipantStatus($pdo, $participant, $nextStatus);
                 $addActivityLog(
                     $pdo,
-                    'Zmieniono status uczestnika',
+                    sprintf('Zmieniono status uczestnika na %s', $nextStatus),
+                    (string)$participant['event_id'],
                     (int)$participant['id'],
                     (string)$participant['display_name'],
                     (string)$authUser['id'],
@@ -2531,6 +3479,7 @@ try {
             $addActivityLog(
                 $pdo,
                 'Przepisano pakiet na inna osobe',
+                (string)$participant['event_id'],
                 (int)$participant['id'],
                 (string)$participant['display_name'],
                 (string)$authUser['id'],
@@ -2561,6 +3510,7 @@ try {
         $addActivityLog(
             $pdo,
             'Check-in',
+            (string)$event['id'],
             (int)$participant['id'],
             (string)$participant['display_name'],
             (string)$authUser['id'],
@@ -2590,6 +3540,7 @@ try {
         $addActivityLog(
             $pdo,
             'Cofnieto odprawe',
+            (string)$event['id'],
             (int)$participant['id'],
             (string)$participant['display_name'],
             (string)$authUser['id'],
@@ -2601,47 +3552,24 @@ try {
     }
 
     if ($path === '/participants' && $method === 'GET') {
-        requireAuth($resolveAuthenticatedUser);
-
-        $stmt = $pdo->query('
-            SELECT
-                id,
-                event_id,
-                first_name,
-                last_name,
-                display_name,
-                email,
-                organization,
-                bib_number,
-                qr_code,
-                custom_fields_json,
-                status,
-                email_status,
-                checked_in_at,
-                created_at,
-                updated_at
-            FROM participants
-            ORDER BY id DESC
-        ');
-        $participants = $stmt->fetchAll();
-        foreach ($participants as &$participant) {
-            $participant['custom_fields'] = decodeJsonObject($participant['custom_fields_json'] ?? null);
-            unset($participant['custom_fields_json']);
-            $participant = $ensureParticipantQrCode($pdo, $participant);
-        }
-        unset($participant);
+        $authUser = requireAuth($resolveAuthenticatedUser);
+        $accessibleEventIds = array_map(
+            static fn(array $event): string => (string)$event['id'],
+            $loadAccessibleEvents($pdo, $authUser)
+        );
+        $participants = $loadParticipantsByEventIds($pdo, $accessibleEventIds);
 
         jsonResponse(200, ['data' => $participants]);
         exit;
     }
 
     if ($path === '/participants' && $method === 'POST') {
-        requireAuth($resolveAuthenticatedUser);
+        $authUser = requireAnyRole(['superadmin', 'admin', 'editor'], $resolveAuthenticatedUser);
 
         $input = readJsonBody();
         $firstName = trim((string)($input['first_name'] ?? ''));
         $lastName = trim((string)($input['last_name'] ?? ''));
-        $email = trim((string)($input['email'] ?? ''));
+        $email = normalizeEmailAddress((string)($input['email'] ?? ''));
         $organization = trim((string)($input['organization'] ?? ''));
         $eventId = trim((string)($input['event_id'] ?? ''));
         $bibNumber = trim((string)($input['bib_number'] ?? ''));
@@ -2650,6 +3578,22 @@ try {
 
         if ($eventId === '' || $displayName === '' || $email === '') {
             jsonResponse(422, ['error' => 'event_id, display_name and email are required']);
+            exit;
+        }
+
+        if (!isValidEmailAddress($email)) {
+            jsonResponse(422, ['error' => 'email must be a valid email address']);
+            exit;
+        }
+
+        $event = $loadEventById($pdo, $eventId);
+        if ($event === false) {
+            jsonResponse(422, ['error' => 'Event not found']);
+            exit;
+        }
+
+        if (!$canManageEventParticipants($authUser, $event)) {
+            jsonResponse(403, ['error' => 'Forbidden']);
             exit;
         }
 
@@ -2664,12 +3608,22 @@ try {
             $qrCode === '' ? null : $qrCode
         );
 
+        $addActivityLog(
+            $pdo,
+            'Dodano uczestnika',
+            $eventId,
+            (int)($participant['id'] ?? 0),
+            (string)$displayName,
+            (string)$authUser['id'],
+            (string)$authUser['name']
+        );
+
         jsonResponse(201, ['data' => $participant]);
         exit;
     }
 
     if (preg_match('#^/participants/(\d+)$#', $path, $matches) === 1 && $method === 'GET') {
-        requireAuth($resolveAuthenticatedUser);
+        $authUser = requireAuth($resolveAuthenticatedUser);
 
         $participant = $loadParticipantById($pdo, (int)$matches[1]);
 
@@ -2678,7 +3632,57 @@ try {
             exit;
         }
 
+        [$event, $accessError] = $assertParticipantEventAccess($pdo, $authUser, $participant);
+        if ($accessError !== null || $event === null) {
+            jsonResponse($accessError === 'Forbidden' ? 403 : 422, ['error' => $accessError ?? 'Forbidden']);
+            exit;
+        }
+
         jsonResponse(200, ['data' => $participant]);
+        exit;
+    }
+
+    if (preg_match('#^/participants/(\d+)$#', $path, $matches) === 1 && $method === 'DELETE') {
+        $authUser = requireAnyRole(['superadmin', 'admin', 'editor'], $resolveAuthenticatedUser);
+        $participant = $loadParticipantById($pdo, (int)$matches[1]);
+
+        if ($participant === false) {
+            jsonResponse(404, ['error' => 'Participant not found']);
+            exit;
+        }
+
+        [$event, $accessError] = $assertParticipantEventAccess($pdo, $authUser, $participant);
+        if ($accessError !== null || $event === null || !$canManageEventParticipants($authUser, $event)) {
+            jsonResponse($accessError === 'Forbidden' ? 403 : 422, ['error' => $accessError ?? 'Forbidden']);
+            exit;
+        }
+
+        $pdo->beginTransaction();
+
+        try {
+            $addActivityLog(
+                $pdo,
+                'Usunięto uczestnika',
+                (string)$event['id'],
+                (int)$participant['id'],
+                (string)$participant['display_name'],
+                (string)$authUser['id'],
+                (string)$authUser['name']
+            );
+
+            $deleteStmt = $pdo->prepare('DELETE FROM participants WHERE id = :id');
+            $deleteStmt->execute(['id' => (int)$participant['id']]);
+
+            $pdo->commit();
+        } catch (Throwable $exception) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+
+            throw $exception;
+        }
+
+        jsonResponse(200, ['success' => true]);
         exit;
     }
 

@@ -13,9 +13,9 @@ final class MailService
         self::sendActionEmail(
             recipientEmail: $recipientEmail,
             recipientName: $recipientName,
-            subject: 'Reset hasla',
-            introText: 'Otrzymalismy prosbe o ustawienie nowego hasla do Twojego konta.',
-            actionLabel: 'Ustaw nowe haslo',
+            subject: 'Reset hasła',
+            introText: 'Otrzymaliśmy prośbę o ustawienie nowego hasła do Twojego konta.',
+            actionLabel: 'Ustaw nowe hasło',
             actionUrl: $resetUrl
         );
     }
@@ -25,9 +25,9 @@ final class MailService
         self::sendActionEmail(
             recipientEmail: $recipientEmail,
             recipientName: $recipientName,
-            subject: 'Twoje konto zostalo utworzone',
-            introText: 'Twoje konto zostalo utworzone. Aby rozpoczac prace, ustaw wlasne haslo.',
-            actionLabel: 'Ustaw haslo',
+            subject: 'Twoje konto zostało utworzone',
+            introText: 'Twoje konto zostało utworzone. Aby rozpocząć pracę, ustaw własne hasło.',
+            actionLabel: 'Ustaw hasło',
             actionUrl: $resetUrl
         );
     }
@@ -36,7 +36,7 @@ final class MailService
         string $recipientEmail,
         string $recipientName,
         string $eventName,
-        string $eventDate,
+        string $eventOfficeWindow,
         string $eventLocation,
         string $bibNumber,
         string $qrToken
@@ -55,11 +55,11 @@ final class MailService
                 'image/svg+xml'
             );
             $mail->isHTML(true);
-            $mail->Subject = sprintf('Twoj kod QR na wydarzenie %s', $eventName);
+            $mail->Subject = sprintf('Twój kod QR na wydarzenie %s', $eventName);
             $mail->Body = self::participantQrHtml(
                 $recipientName,
                 $eventName,
-                $eventDate,
+                $eventOfficeWindow,
                 $eventLocation,
                 $bibNumber,
                 $imageUrl
@@ -67,7 +67,7 @@ final class MailService
             $mail->AltBody = self::participantQrText(
                 $recipientName,
                 $eventName,
-                $eventDate,
+                $eventOfficeWindow,
                 $eventLocation,
                 $bibNumber,
                 $imageUrl
@@ -111,7 +111,7 @@ final class MailService
         $username = trim((string)(getenv('MAIL_USERNAME') ?: ''));
         $password = (string)(getenv('MAIL_PASSWORD') ?: '');
         $fromAddress = trim((string)(getenv('MAIL_FROM_ADDRESS') ?: ''));
-        $fromName = trim((string)(getenv('MAIL_FROM_NAME') ?: 'Biuro Zawodow'));
+        $fromName = trim((string)(getenv('MAIL_FROM_NAME') ?: 'Biuro Zawodów'));
 
         if ($host === '' || $port <= 0 || $username === '' || $password === '' || $fromAddress === '') {
             throw new RuntimeException('SMTP is not configured. Fill MAIL_HOST, MAIL_PORT, MAIL_USERNAME, MAIL_PASSWORD and MAIL_FROM_ADDRESS.');
@@ -175,7 +175,7 @@ final class MailService
 
     private static function actionHtml(string $recipientName, string $introText, string $actionLabel, string $actionUrl): string
     {
-        $safeName = htmlspecialchars($recipientName !== '' ? $recipientName : 'Uzytkowniku', ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+        $safeName = htmlspecialchars($recipientName !== '' ? $recipientName : 'Użytkowniku', ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
         $safeIntroText = htmlspecialchars($introText, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
         $safeActionLabel = htmlspecialchars($actionLabel, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
         $safeUrl = htmlspecialchars($actionUrl, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
@@ -183,64 +183,64 @@ final class MailService
         return <<<HTML
 <div style="font-family:Arial,sans-serif;line-height:1.6;color:#111827;max-width:640px;margin:0 auto;padding:24px;">
   <h1 style="font-size:22px;margin:0 0 16px;">{$safeActionLabel}</h1>
-  <p style="margin:0 0 12px;">Czesc {$safeName},</p>
+  <p style="margin:0 0 12px;">Cześć {$safeName},</p>
   <p style="margin:0 0 12px;">{$safeIntroText}</p>
-  <p style="margin:0 0 20px;">Link jest wazny przez 60 minut.</p>
+  <p style="margin:0 0 20px;">Link jest ważny przez 60 minut.</p>
   <p style="margin:0 0 20px;">
     <a href="{$safeUrl}" style="display:inline-block;background:#111827;color:#ffffff;text-decoration:none;padding:12px 18px;border-radius:8px;">{$safeActionLabel}</a>
   </p>
-  <p style="margin:0 0 12px;">Jesli przycisk nie dziala, skopiuj ten adres do przegladarki:</p>
+  <p style="margin:0 0 12px;">Jeśli przycisk nie działa, skopiuj ten adres do przeglądarki:</p>
   <p style="margin:0 0 20px;word-break:break-all;"><a href="{$safeUrl}">{$safeUrl}</a></p>
-  <p style="margin:0;color:#6b7280;">Jesli to nie Ty, zignoruj te wiadomosc.</p>
+  <p style="margin:0;color:#6b7280;">Jeśli to nie Ty, zignoruj tę wiadomość.</p>
 </div>
 HTML;
     }
 
     private static function actionText(string $recipientName, string $introText, string $actionLabel, string $actionUrl): string
     {
-        $name = $recipientName !== '' ? $recipientName : 'Uzytkowniku';
+        $name = $recipientName !== '' ? $recipientName : 'Użytkowniku';
 
         return implode("\n\n", [
-            "Czesc {$name},",
+            "Cześć {$name},",
             $introText,
-            'Link jest wazny przez 60 minut.',
+            'Link jest ważny przez 60 minut.',
             "{$actionLabel}: {$actionUrl}",
-            'Jesli to nie Ty, zignoruj te wiadomosc.',
+            'Jeśli to nie Ty, zignoruj tę wiadomość.',
         ]);
     }
 
     private static function participantQrHtml(
         string $recipientName,
         string $eventName,
-        string $eventDate,
+        string $eventOfficeWindow,
         string $eventLocation,
         string $bibNumber,
         string $imageUrl
     ): string {
         $safeName = htmlspecialchars($recipientName !== '' ? $recipientName : 'Zawodniku', ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
         $safeEventName = htmlspecialchars($eventName, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
-        $safeEventDate = htmlspecialchars($eventDate, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+        $safeEventOfficeWindow = htmlspecialchars($eventOfficeWindow, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
         $safeEventLocation = htmlspecialchars($eventLocation, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
         $safeBibNumber = htmlspecialchars($bibNumber !== '' ? $bibNumber : '-', ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
         $safeImageUrl = htmlspecialchars($imageUrl, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
 
         return <<<HTML
 <div style="font-family:Arial,sans-serif;line-height:1.6;color:#111827;max-width:640px;margin:0 auto;padding:24px;">
-  <h1 style="font-size:24px;margin:0 0 16px;">Twoj kod QR na wydarzenie</h1>
-  <p style="margin:0 0 12px;">Czesc {$safeName},</p>
-  <p style="margin:0 0 16px;">Ponizej znajdziesz kod QR potrzebny do szybkiej odprawy w biurze zawodow.</p>
+  <h1 style="font-size:24px;margin:0 0 16px;">Twój kod QR na wydarzenie</h1>
+  <p style="margin:0 0 12px;">Cześć {$safeName},</p>
+  <p style="margin:0 0 16px;">Poniżej znajdziesz kod QR potrzebny do szybkiej odprawy w biurze zawodów.</p>
   <div style="border:1px solid #e5e7eb;border-radius:16px;padding:16px;margin:0 0 20px;background:#f9fafb;">
     <p style="margin:0 0 8px;font-weight:700;">{$safeEventName}</p>
-    <p style="margin:0 0 4px;">Data: {$safeEventDate}</p>
+    <p style="margin:0 0 4px;">Biuro zawodów: {$safeEventOfficeWindow}</p>
     <p style="margin:0 0 12px;">Miejsce: {$safeEventLocation}</p>
     <p style="margin:0 0 16px;font-size:18px;font-weight:700;">Numer startowy: #{$safeBibNumber}</p>
     <div style="text-align:center;background:#ffffff;padding:16px;border-radius:12px;">
       <img src="cid:participant-qr" alt="Kod QR uczestnika" style="max-width:280px;width:100%;height:auto;display:block;margin:0 auto 8px;" />
-      <p style="margin:0;font-size:12px;color:#6b7280;">Jesli obraz nie jest widoczny, otworz podglad online:</p>
+      <p style="margin:0;font-size:12px;color:#6b7280;">Jeśli obraz nie jest widoczny, otwórz podgląd online:</p>
       <p style="margin:8px 0 0;word-break:break-all;"><a href="{$safeImageUrl}">{$safeImageUrl}</a></p>
     </div>
   </div>
-  <p style="margin:0;color:#6b7280;">Zachowaj te wiadomosc i pokaz kod QR przy wejsciu lub w biurze zawodow.</p>
+  <p style="margin:0;color:#6b7280;">Zachowaj tę wiadomość i pokaż kod QR przy wejściu lub w biurze zawodów.</p>
 </div>
 HTML;
     }
@@ -248,7 +248,7 @@ HTML;
     private static function participantQrText(
         string $recipientName,
         string $eventName,
-        string $eventDate,
+        string $eventOfficeWindow,
         string $eventLocation,
         string $bibNumber,
         string $imageUrl
@@ -256,13 +256,13 @@ HTML;
         $name = $recipientName !== '' ? $recipientName : 'Zawodniku';
 
         return implode("\n\n", [
-            "Czesc {$name},",
-            'Twoj kod QR do odprawy jest gotowy.',
+            "Cześć {$name},",
+            'Twój kod QR do odprawy jest gotowy.',
             "Wydarzenie: {$eventName}",
-            "Data: {$eventDate}",
+            "Biuro zawodów: {$eventOfficeWindow}",
             "Miejsce: {$eventLocation}",
             "Numer startowy: #{$bibNumber}",
-            "Podglad QR: {$imageUrl}",
+            "Podgląd QR: {$imageUrl}",
         ]);
     }
 }

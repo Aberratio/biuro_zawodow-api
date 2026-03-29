@@ -1,6 +1,7 @@
 ﻿SET FOREIGN_KEY_CHECKS = 0;
 
 DROP TABLE IF EXISTS activity_logs;
+DROP TABLE IF EXISTS request_rate_limits;
 DROP TABLE IF EXISTS password_resets;
 DROP TABLE IF EXISTS admin_organization_assignments;
 DROP TABLE IF EXISTS user_event_assignments;
@@ -74,6 +75,19 @@ CREATE TABLE password_resets (
         FOREIGN KEY (user_id) REFERENCES users(id)
         ON DELETE CASCADE
         ON UPDATE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE request_rate_limits (
+    bucket_key VARCHAR(128) NOT NULL,
+    bucket_name VARCHAR(64) NOT NULL,
+    attempt_count INT UNSIGNED NOT NULL DEFAULT 0,
+    window_started_at DATETIME NOT NULL,
+    blocked_until DATETIME NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (bucket_key),
+    KEY idx_request_rate_limits_bucket_name (bucket_name),
+    KEY idx_request_rate_limits_blocked_until (blocked_until)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE user_event_assignments (
@@ -159,14 +173,20 @@ CREATE TABLE event_participant_field_mappings (
 CREATE TABLE activity_logs (
     id VARCHAR(64) NOT NULL,
     action VARCHAR(190) NOT NULL,
+    event_id VARCHAR(64) NULL,
     participant_id BIGINT UNSIGNED NULL,
     participant_name_snapshot VARCHAR(190) NULL,
     user_id VARCHAR(64) NULL,
     user_name_snapshot VARCHAR(190) NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (id),
+    KEY idx_activity_logs_event_id (event_id),
     KEY idx_activity_logs_participant_id (participant_id),
     KEY idx_activity_logs_user_id (user_id),
+    CONSTRAINT fk_activity_logs_event
+        FOREIGN KEY (event_id) REFERENCES events(id)
+        ON DELETE SET NULL
+        ON UPDATE CASCADE,
     CONSTRAINT fk_activity_logs_participant
         FOREIGN KEY (participant_id) REFERENCES participants(id)
         ON DELETE SET NULL
