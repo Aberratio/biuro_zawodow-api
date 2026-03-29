@@ -71,21 +71,37 @@ function htmlResponse(int $statusCode, string $html): void
     echo $html;
 }
 
-function readJsonBody(): array
+function readJsonBody(int $maxBytes = 262144): array
 {
+    $contentLength = isset($_SERVER['CONTENT_LENGTH']) ? (int)$_SERVER['CONTENT_LENGTH'] : 0;
+    if ($contentLength > $maxBytes) {
+        jsonResponse(413, ['error' => 'Request body too large']);
+        exit;
+    }
+
     $rawBody = file_get_contents('php://input');
     if ($rawBody === false || $rawBody === '') {
         return [];
     }
 
-    $decoded = json_decode($rawBody, true);
-    return is_array($decoded) ? $decoded : [];
-}
+    if (strlen($rawBody) > $maxBytes) {
+        jsonResponse(413, ['error' => 'Request body too large']);
+        exit;
+    }
 
-function isValidDateString(string $value): bool
-{
-    $date = DateTimeImmutable::createFromFormat('Y-m-d', $value);
-    return $date !== false && $date->format('Y-m-d') === $value;
+    try {
+        $decoded = json_decode($rawBody, true, 512, JSON_THROW_ON_ERROR);
+    } catch (JsonException) {
+        jsonResponse(400, ['error' => 'Invalid JSON body']);
+        exit;
+    }
+
+    if (!is_array($decoded) || array_is_list($decoded)) {
+        jsonResponse(400, ['error' => 'JSON body must be an object']);
+        exit;
+    }
+
+    return $decoded;
 }
 
 function parseLocalDateTimeString(string $value): ?DateTimeImmutable
@@ -134,6 +150,53 @@ function setCorsHeaders(): void
 
     header('Access-Control-Allow-Methods: GET, POST, PATCH, DELETE, OPTIONS');
     header('Access-Control-Allow-Headers: Content-Type, Authorization');
+    header('Access-Control-Max-Age: 600');
+    header('Vary: Origin');
+    header('Referrer-Policy: no-referrer');
+    header('X-Content-Type-Options: nosniff');
+    header('X-Frame-Options: DENY');
+    header('Permissions-Policy: camera=(), microphone=(), geolocation=()');
+}
+
+function appEnvironment(): string
+{
+    return strtolower(trim((string)(getenv('APP_ENV') ?: 'production')));
+}
+
+function isLocalEnvironment(): bool
+{
+    return in_array(appEnvironment(), ['local', 'development', 'dev', 'test'], true);
+}
+
+function clientIpAddress(): string
+{
+    $ip = trim((string)($_SERVER['REMOTE_ADDR'] ?? ''));
+    return filter_var($ip, FILTER_VALIDATE_IP) !== false ? $ip : 'unknown';
+}
+
+function validateServerSecurityConfiguration(): void
+{
+    $appKey = trim((string)(getenv('APP_KEY') ?: ''));
+    $allowedOrigins = trim((string)(getenv('APP_CORS_ORIGIN') ?: '*'));
+    $placeholderKeys = [
+        '',
+        'change-me-in-env',
+        'change-this-local-secret',
+        'local-dev-change-this-secret',
+        'secret',
+        'changeme',
+    ];
+
+    $isWeakAppKey = strlen($appKey) < 32 || in_array(strtolower($appKey), $placeholderKeys, true);
+    if (!isLocalEnvironment() && $isWeakAppKey) {
+        jsonResponse(500, ['error' => 'Server configuration error']);
+        exit;
+    }
+
+    if (!isLocalEnvironment() && $allowedOrigins === '*') {
+        jsonResponse(500, ['error' => 'Server configuration error']);
+        exit;
+    }
 }
 
 function base64UrlEncode(string $value): string
@@ -385,8 +448,8 @@ function openApiDocument(): array
         'openapi' => '3.0.3',
         'info' => [
             'title' => 'biuro_zawodow API',
-            'version' => '1.0.0',
-            'description' => 'Minimal PHP API for local event office management and participant operations.',
+            'version' => '1.1.0',
+            'description' => 'API do zarządzania biurem zawodów, wydarzeniami, użytkownikami, uczestnikami i operacjami importu / eksportu.',
         ],
         'servers' => [
             [
@@ -430,6 +493,9 @@ function openApiDocument(): array
                         ],
                         '401' => [
                             '$ref' => '#/components/responses/Unauthorized',
+                        ],
+                        '429' => [
+                            '$ref' => '#/components/responses/TooManyRequests',
                         ],
                         '422' => [
                             'description' => 'Validation error',
@@ -475,6 +541,9 @@ function openApiDocument(): array
                                 ],
                             ],
                         ],
+                        '429' => [
+                            '$ref' => '#/components/responses/TooManyRequests',
+                        ],
                     ],
                 ],
             ],
@@ -512,6 +581,9 @@ function openApiDocument(): array
                                     ],
                                 ],
                             ],
+                        ],
+                        '429' => [
+                            '$ref' => '#/components/responses/TooManyRequests',
                         ],
                     ],
                 ],
@@ -601,6 +673,38 @@ function openApiDocument(): array
                         ],
                         '500' => [
                             '$ref' => '#/components/responses/DatabaseError',
+                        ],
+                    ],
+                ],
+            ],
+            '/qr-images/{token}.svg' => [
+                'get' => [
+                    'tags' => ['Participants'],
+                    'summary' => 'Render participant QR code as SVG',
+                    'parameters' => [
+                        [
+                            'name' => 'token',
+                            'in' => 'path',
+                            'required' => true,
+                            'schema' => [
+                                'type' => 'string',
+                            ],
+                        ],
+                    ],
+                    'responses' => [
+                        '200' => [
+                            'description' => 'QR code image',
+                            'content' => [
+                                'image/svg+xml' => [
+                                    'schema' => [
+                                        'type' => 'string',
+                                        'format' => 'binary',
+                                    ],
+                                ],
+                            ],
+                        ],
+                        '404' => [
+                            '$ref' => '#/components/responses/NotFound',
                         ],
                     ],
                 ],
@@ -728,7 +832,58 @@ function openApiDocument(): array
                             ],
                         ],
                         '404' => [
-                            'description' => 'Event not found',
+                            '$ref' => '#/components/responses/NotFound',
+                        ],
+                        '401' => [
+                            '$ref' => '#/components/responses/Unauthorized',
+                        ],
+                    ],
+                ],
+                'patch' => [
+                    'tags' => ['Events'],
+                    'summary' => 'Update event',
+                    'security' => [
+                        ['bearerAuth' => []],
+                    ],
+                    'parameters' => [
+                        [
+                            'name' => 'id',
+                            'in' => 'path',
+                            'required' => true,
+                            'schema' => [
+                                'type' => 'string',
+                            ],
+                        ],
+                    ],
+                    'requestBody' => [
+                        'required' => true,
+                        'content' => [
+                            'application/json' => [
+                                'schema' => [
+                                    '$ref' => '#/components/schemas/UpdateEventRequest',
+                                ],
+                            ],
+                        ],
+                    ],
+                    'responses' => [
+                        '200' => [
+                            'description' => 'Event updated',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => [
+                                        '$ref' => '#/components/schemas/EventResponse',
+                                    ],
+                                ],
+                            ],
+                        ],
+                        '403' => [
+                            '$ref' => '#/components/responses/Forbidden',
+                        ],
+                        '404' => [
+                            '$ref' => '#/components/responses/NotFound',
+                        ],
+                        '422' => [
+                            'description' => 'Validation error',
                             'content' => [
                                 'application/json' => [
                                     'schema' => [
@@ -736,6 +891,483 @@ function openApiDocument(): array
                                     ],
                                 ],
                             ],
+                        ],
+                        '401' => [
+                            '$ref' => '#/components/responses/Unauthorized',
+                        ],
+                    ],
+                ],
+                'delete' => [
+                    'tags' => ['Events'],
+                    'summary' => 'Delete event with all its participants',
+                    'security' => [
+                        ['bearerAuth' => []],
+                    ],
+                    'parameters' => [
+                        [
+                            'name' => 'id',
+                            'in' => 'path',
+                            'required' => true,
+                            'schema' => [
+                                'type' => 'string',
+                            ],
+                        ],
+                    ],
+                    'responses' => [
+                        '200' => [
+                            'description' => 'Event deleted',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => [
+                                        '$ref' => '#/components/schemas/SuccessResponse',
+                                    ],
+                                ],
+                            ],
+                        ],
+                        '403' => [
+                            '$ref' => '#/components/responses/Forbidden',
+                        ],
+                        '404' => [
+                            '$ref' => '#/components/responses/NotFound',
+                        ],
+                        '401' => [
+                            '$ref' => '#/components/responses/Unauthorized',
+                        ],
+                    ],
+                ],
+            ],
+            '/events/{id}/export.csv' => [
+                'get' => [
+                    'tags' => ['Events'],
+                    'summary' => 'Export event participants to CSV',
+                    'security' => [
+                        ['bearerAuth' => []],
+                    ],
+                    'parameters' => [
+                        [
+                            'name' => 'id',
+                            'in' => 'path',
+                            'required' => true,
+                            'schema' => [
+                                'type' => 'string',
+                            ],
+                        ],
+                    ],
+                    'responses' => [
+                        '200' => [
+                            'description' => 'CSV export',
+                            'content' => [
+                                'text/csv' => [
+                                    'schema' => [
+                                        'type' => 'string',
+                                        'format' => 'binary',
+                                    ],
+                                ],
+                            ],
+                        ],
+                        '403' => [
+                            '$ref' => '#/components/responses/Forbidden',
+                        ],
+                        '404' => [
+                            '$ref' => '#/components/responses/NotFound',
+                        ],
+                        '500' => [
+                            '$ref' => '#/components/responses/DatabaseError',
+                        ],
+                        '401' => [
+                            '$ref' => '#/components/responses/Unauthorized',
+                        ],
+                    ],
+                ],
+            ],
+            '/events/{id}/logs/export.csv' => [
+                'get' => [
+                    'tags' => ['Events'],
+                    'summary' => 'Export event activity logs to CSV',
+                    'security' => [
+                        ['bearerAuth' => []],
+                    ],
+                    'parameters' => [
+                        [
+                            'name' => 'id',
+                            'in' => 'path',
+                            'required' => true,
+                            'schema' => [
+                                'type' => 'string',
+                            ],
+                        ],
+                    ],
+                    'responses' => [
+                        '200' => [
+                            'description' => 'CSV export',
+                            'content' => [
+                                'text/csv' => [
+                                    'schema' => [
+                                        'type' => 'string',
+                                        'format' => 'binary',
+                                    ],
+                                ],
+                            ],
+                        ],
+                        '403' => [
+                            '$ref' => '#/components/responses/Forbidden',
+                        ],
+                        '404' => [
+                            '$ref' => '#/components/responses/NotFound',
+                        ],
+                        '500' => [
+                            '$ref' => '#/components/responses/DatabaseError',
+                        ],
+                        '401' => [
+                            '$ref' => '#/components/responses/Unauthorized',
+                        ],
+                    ],
+                ],
+            ],
+            '/events/{id}/participant-imports/analyze' => [
+                'post' => [
+                    'tags' => ['Events'],
+                    'summary' => 'Analyze participant CSV before import',
+                    'security' => [
+                        ['bearerAuth' => []],
+                    ],
+                    'parameters' => [
+                        [
+                            'name' => 'id',
+                            'in' => 'path',
+                            'required' => true,
+                            'schema' => [
+                                'type' => 'string',
+                            ],
+                        ],
+                    ],
+                    'requestBody' => [
+                        'required' => true,
+                        'content' => [
+                            'application/json' => [
+                                'schema' => [
+                                    '$ref' => '#/components/schemas/ParticipantImportAnalyzeRequest',
+                                ],
+                            ],
+                        ],
+                    ],
+                    'responses' => [
+                        '200' => [
+                            'description' => 'CSV analysis result',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => [
+                                        '$ref' => '#/components/schemas/ParticipantImportAnalyzeResponse',
+                                    ],
+                                ],
+                            ],
+                        ],
+                        '400' => [
+                            '$ref' => '#/components/responses/BadRequest',
+                        ],
+                        '403' => [
+                            '$ref' => '#/components/responses/Forbidden',
+                        ],
+                        '404' => [
+                            '$ref' => '#/components/responses/NotFound',
+                        ],
+                        '413' => [
+                            '$ref' => '#/components/responses/PayloadTooLarge',
+                        ],
+                        '422' => [
+                            'description' => 'Invalid CSV payload',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => [
+                                        '$ref' => '#/components/schemas/ErrorResponse',
+                                    ],
+                                ],
+                            ],
+                        ],
+                        '401' => [
+                            '$ref' => '#/components/responses/Unauthorized',
+                        ],
+                    ],
+                ],
+            ],
+            '/events/{id}/participant-imports/confirm' => [
+                'post' => [
+                    'tags' => ['Events'],
+                    'summary' => 'Save participant CSV field mapping for event',
+                    'security' => [
+                        ['bearerAuth' => []],
+                    ],
+                    'parameters' => [
+                        [
+                            'name' => 'id',
+                            'in' => 'path',
+                            'required' => true,
+                            'schema' => [
+                                'type' => 'string',
+                            ],
+                        ],
+                    ],
+                    'requestBody' => [
+                        'required' => true,
+                        'content' => [
+                            'application/json' => [
+                                'schema' => [
+                                    '$ref' => '#/components/schemas/ParticipantImportConfirmRequest',
+                                ],
+                            ],
+                        ],
+                    ],
+                    'responses' => [
+                        '201' => [
+                            'description' => 'Mapping saved',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => [
+                                        '$ref' => '#/components/schemas/ParticipantImportConfirmResponse',
+                                    ],
+                                ],
+                            ],
+                        ],
+                        '403' => [
+                            '$ref' => '#/components/responses/Forbidden',
+                        ],
+                        '404' => [
+                            '$ref' => '#/components/responses/NotFound',
+                        ],
+                        '409' => [
+                            '$ref' => '#/components/responses/Conflict',
+                        ],
+                        '422' => [
+                            'description' => 'Validation error',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => [
+                                        '$ref' => '#/components/schemas/ErrorResponse',
+                                    ],
+                                ],
+                            ],
+                        ],
+                        '401' => [
+                            '$ref' => '#/components/responses/Unauthorized',
+                        ],
+                    ],
+                ],
+            ],
+            '/events/{id}/participant-imports/run' => [
+                'post' => [
+                    'tags' => ['Events'],
+                    'summary' => 'Import participants from CSV using saved mapping',
+                    'security' => [
+                        ['bearerAuth' => []],
+                    ],
+                    'parameters' => [
+                        [
+                            'name' => 'id',
+                            'in' => 'path',
+                            'required' => true,
+                            'schema' => [
+                                'type' => 'string',
+                            ],
+                        ],
+                    ],
+                    'requestBody' => [
+                        'required' => true,
+                        'content' => [
+                            'application/json' => [
+                                'schema' => [
+                                    '$ref' => '#/components/schemas/ParticipantImportAnalyzeRequest',
+                                ],
+                            ],
+                        ],
+                    ],
+                    'responses' => [
+                        '200' => [
+                            'description' => 'Import summary',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => [
+                                        '$ref' => '#/components/schemas/ParticipantImportRunResponse',
+                                    ],
+                                ],
+                            ],
+                        ],
+                        '400' => [
+                            '$ref' => '#/components/responses/BadRequest',
+                        ],
+                        '403' => [
+                            '$ref' => '#/components/responses/Forbidden',
+                        ],
+                        '404' => [
+                            '$ref' => '#/components/responses/NotFound',
+                        ],
+                        '413' => [
+                            '$ref' => '#/components/responses/PayloadTooLarge',
+                        ],
+                        '422' => [
+                            'description' => 'Import validation error',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => [
+                                        '$ref' => '#/components/schemas/ErrorResponse',
+                                    ],
+                                ],
+                            ],
+                        ],
+                        '500' => [
+                            '$ref' => '#/components/responses/DatabaseError',
+                        ],
+                        '401' => [
+                            '$ref' => '#/components/responses/Unauthorized',
+                        ],
+                    ],
+                ],
+            ],
+            '/events/{id}/participant-field-mappings' => [
+                'get' => [
+                    'tags' => ['Events'],
+                    'summary' => 'Get saved participant field mapping for event',
+                    'security' => [
+                        ['bearerAuth' => []],
+                    ],
+                    'parameters' => [
+                        [
+                            'name' => 'id',
+                            'in' => 'path',
+                            'required' => true,
+                            'schema' => [
+                                'type' => 'string',
+                            ],
+                        ],
+                    ],
+                    'responses' => [
+                        '200' => [
+                            'description' => 'Current mapping',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => [
+                                        '$ref' => '#/components/schemas/ParticipantFieldMappingsResponse',
+                                    ],
+                                ],
+                            ],
+                        ],
+                        '403' => [
+                            '$ref' => '#/components/responses/Forbidden',
+                        ],
+                        '404' => [
+                            '$ref' => '#/components/responses/NotFound',
+                        ],
+                        '401' => [
+                            '$ref' => '#/components/responses/Unauthorized',
+                        ],
+                    ],
+                ],
+            ],
+            '/events/{id}/participants/manual' => [
+                'post' => [
+                    'tags' => ['Events'],
+                    'summary' => 'Create participant manually using saved event mapping',
+                    'security' => [
+                        ['bearerAuth' => []],
+                    ],
+                    'parameters' => [
+                        [
+                            'name' => 'id',
+                            'in' => 'path',
+                            'required' => true,
+                            'schema' => [
+                                'type' => 'string',
+                            ],
+                        ],
+                    ],
+                    'requestBody' => [
+                        'required' => true,
+                        'content' => [
+                            'application/json' => [
+                                'schema' => [
+                                    '$ref' => '#/components/schemas/ManualParticipantRequest',
+                                ],
+                            ],
+                        ],
+                    ],
+                    'responses' => [
+                        '201' => [
+                            'description' => 'Participant created',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => [
+                                        '$ref' => '#/components/schemas/ParticipantResponse',
+                                    ],
+                                ],
+                            ],
+                        ],
+                        '403' => [
+                            '$ref' => '#/components/responses/Forbidden',
+                        ],
+                        '404' => [
+                            '$ref' => '#/components/responses/NotFound',
+                        ],
+                        '422' => [
+                            'description' => 'Validation error',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => [
+                                        '$ref' => '#/components/schemas/ErrorResponse',
+                                    ],
+                                ],
+                            ],
+                        ],
+                        '401' => [
+                            '$ref' => '#/components/responses/Unauthorized',
+                        ],
+                    ],
+                ],
+            ],
+            '/events/{id}/send-qr-emails' => [
+                'post' => [
+                    'tags' => ['Events'],
+                    'summary' => 'Send QR emails for event participants',
+                    'security' => [
+                        ['bearerAuth' => []],
+                    ],
+                    'parameters' => [
+                        [
+                            'name' => 'id',
+                            'in' => 'path',
+                            'required' => true,
+                            'schema' => [
+                                'type' => 'string',
+                            ],
+                        ],
+                    ],
+                    'requestBody' => [
+                        'required' => false,
+                        'content' => [
+                            'application/json' => [
+                                'schema' => [
+                                    '$ref' => '#/components/schemas/EventQrEmailRequest',
+                                ],
+                            ],
+                        ],
+                    ],
+                    'responses' => [
+                        '200' => [
+                            'description' => 'Email sending summary',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => [
+                                        '$ref' => '#/components/schemas/EventQrEmailResponse',
+                                    ],
+                                ],
+                            ],
+                        ],
+                        '403' => [
+                            '$ref' => '#/components/responses/Forbidden',
+                        ],
+                        '404' => [
+                            '$ref' => '#/components/responses/NotFound',
+                        ],
+                        '401' => [
+                            '$ref' => '#/components/responses/Unauthorized',
                         ],
                     ],
                 ],
@@ -846,7 +1478,61 @@ function openApiDocument(): array
                             ],
                         ],
                         '404' => [
-                            'description' => 'Organization not found',
+                            '$ref' => '#/components/responses/NotFound',
+                        ],
+                        '401' => [
+                            '$ref' => '#/components/responses/Unauthorized',
+                        ],
+                    ],
+                ],
+                'patch' => [
+                    'tags' => ['Organizations'],
+                    'summary' => 'Update organization',
+                    'security' => [
+                        ['bearerAuth' => []],
+                    ],
+                    'parameters' => [
+                        [
+                            'name' => 'id',
+                            'in' => 'path',
+                            'required' => true,
+                            'schema' => [
+                                'type' => 'string',
+                            ],
+                        ],
+                    ],
+                    'requestBody' => [
+                        'required' => true,
+                        'content' => [
+                            'application/json' => [
+                                'schema' => [
+                                    '$ref' => '#/components/schemas/UpdateOrganizationRequest',
+                                ],
+                            ],
+                        ],
+                    ],
+                    'responses' => [
+                        '200' => [
+                            'description' => 'Organization updated',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => [
+                                        '$ref' => '#/components/schemas/OrganizationResponse',
+                                    ],
+                                ],
+                            ],
+                        ],
+                        '403' => [
+                            '$ref' => '#/components/responses/Forbidden',
+                        ],
+                        '404' => [
+                            '$ref' => '#/components/responses/NotFound',
+                        ],
+                        '409' => [
+                            '$ref' => '#/components/responses/Conflict',
+                        ],
+                        '422' => [
+                            'description' => 'Validation error',
                             'content' => [
                                 'application/json' => [
                                     'schema' => [
@@ -854,6 +1540,57 @@ function openApiDocument(): array
                                     ],
                                 ],
                             ],
+                        ],
+                        '401' => [
+                            '$ref' => '#/components/responses/Unauthorized',
+                        ],
+                    ],
+                ],
+                'delete' => [
+                    'tags' => ['Organizations'],
+                    'summary' => 'Delete organization when it has no events or assigned users',
+                    'security' => [
+                        ['bearerAuth' => []],
+                    ],
+                    'parameters' => [
+                        [
+                            'name' => 'id',
+                            'in' => 'path',
+                            'required' => true,
+                            'schema' => [
+                                'type' => 'string',
+                            ],
+                        ],
+                    ],
+                    'responses' => [
+                        '200' => [
+                            'description' => 'Organization deleted',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => [
+                                        '$ref' => '#/components/schemas/SuccessResponse',
+                                    ],
+                                ],
+                            ],
+                        ],
+                        '403' => [
+                            '$ref' => '#/components/responses/Forbidden',
+                        ],
+                        '404' => [
+                            '$ref' => '#/components/responses/NotFound',
+                        ],
+                        '422' => [
+                            'description' => 'Organization cannot be deleted yet',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => [
+                                        '$ref' => '#/components/schemas/ErrorResponse',
+                                    ],
+                                ],
+                            ],
+                        ],
+                        '401' => [
+                            '$ref' => '#/components/responses/Unauthorized',
                         ],
                     ],
                 ],
@@ -885,6 +1622,9 @@ function openApiDocument(): array
                                     ],
                                 ],
                             ],
+                        ],
+                        '409' => [
+                            '$ref' => '#/components/responses/Conflict',
                         ],
                         '422' => [
                             'description' => 'Validation error',
@@ -1049,6 +1789,69 @@ function openApiDocument(): array
                                 ],
                             ],
                         ],
+                        '401' => [
+                            '$ref' => '#/components/responses/Unauthorized',
+                        ],
+                    ],
+                ],
+            ],
+            '/users/{id}/event-assignments' => [
+                'patch' => [
+                    'tags' => ['Users'],
+                    'summary' => 'Assign scanner to selected events',
+                    'security' => [
+                        ['bearerAuth' => []],
+                    ],
+                    'parameters' => [
+                        [
+                            'name' => 'id',
+                            'in' => 'path',
+                            'required' => true,
+                            'schema' => [
+                                'type' => 'string',
+                            ],
+                        ],
+                    ],
+                    'requestBody' => [
+                        'required' => true,
+                        'content' => [
+                            'application/json' => [
+                                'schema' => [
+                                    '$ref' => '#/components/schemas/AssignScannerEventsRequest',
+                                ],
+                            ],
+                        ],
+                    ],
+                    'responses' => [
+                        '200' => [
+                            'description' => 'Assignments updated',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => [
+                                        '$ref' => '#/components/schemas/UserResponse',
+                                    ],
+                                ],
+                            ],
+                        ],
+                        '403' => [
+                            '$ref' => '#/components/responses/Forbidden',
+                        ],
+                        '404' => [
+                            '$ref' => '#/components/responses/NotFound',
+                        ],
+                        '422' => [
+                            'description' => 'Validation error',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => [
+                                        '$ref' => '#/components/schemas/ErrorResponse',
+                                    ],
+                                ],
+                            ],
+                        ],
+                        '401' => [
+                            '$ref' => '#/components/responses/Unauthorized',
+                        ],
                     ],
                 ],
             ],
@@ -1099,6 +1902,19 @@ function openApiDocument(): array
                                     ],
                                 ],
                             ],
+                        ],
+                        '422' => [
+                            'description' => 'User cannot be deleted yet',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => [
+                                        '$ref' => '#/components/schemas/ErrorResponse',
+                                    ],
+                                ],
+                            ],
+                        ],
+                        '401' => [
+                            '$ref' => '#/components/responses/Unauthorized',
                         ],
                     ],
                 ],
@@ -1156,6 +1972,9 @@ function openApiDocument(): array
                                 ],
                             ],
                         ],
+                        '403' => [
+                            '$ref' => '#/components/responses/Forbidden',
+                        ],
                         '422' => [
                             'description' => 'Validation error',
                             'content' => [
@@ -1164,13 +1983,167 @@ function openApiDocument(): array
                                         '$ref' => '#/components/schemas/ErrorResponse',
                                     ],
                                     'example' => [
-                                        'error' => 'first_name, last_name and email are required',
+                                        'error' => 'event_id, display_name and email are required',
                                     ],
                                 ],
                             ],
                         ],
                         '500' => [
                             '$ref' => '#/components/responses/DatabaseError',
+                        ],
+                        '401' => [
+                            '$ref' => '#/components/responses/Unauthorized',
+                        ],
+                    ],
+                ],
+            ],
+            '/participants/scan' => [
+                'post' => [
+                    'tags' => ['Participants'],
+                    'summary' => 'Scan participant QR code',
+                    'security' => [
+                        ['bearerAuth' => []],
+                    ],
+                    'requestBody' => [
+                        'required' => true,
+                        'content' => [
+                            'application/json' => [
+                                'schema' => [
+                                    '$ref' => '#/components/schemas/ParticipantScanRequest',
+                                ],
+                            ],
+                        ],
+                    ],
+                    'responses' => [
+                        '200' => [
+                            'description' => 'Participant scan result',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => [
+                                        '$ref' => '#/components/schemas/ParticipantScanResponse',
+                                    ],
+                                ],
+                            ],
+                        ],
+                        '403' => [
+                            '$ref' => '#/components/responses/Forbidden',
+                        ],
+                        '404' => [
+                            '$ref' => '#/components/responses/NotFound',
+                        ],
+                        '422' => [
+                            'description' => 'Validation error',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => [
+                                        '$ref' => '#/components/schemas/ErrorResponse',
+                                    ],
+                                ],
+                            ],
+                        ],
+                        '401' => [
+                            '$ref' => '#/components/responses/Unauthorized',
+                        ],
+                    ],
+                ],
+            ],
+            '/participants/{id}/qr-preview' => [
+                'get' => [
+                    'tags' => ['Participants'],
+                    'summary' => 'Get QR preview data for participant',
+                    'security' => [
+                        ['bearerAuth' => []],
+                    ],
+                    'parameters' => [
+                        [
+                            'name' => 'id',
+                            'in' => 'path',
+                            'required' => true,
+                            'description' => 'Participant numeric ID',
+                            'schema' => [
+                                'type' => 'integer',
+                                'format' => 'int64',
+                            ],
+                        ],
+                    ],
+                    'responses' => [
+                        '200' => [
+                            'description' => 'QR preview payload',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => [
+                                        '$ref' => '#/components/schemas/ParticipantQrPreviewResponse',
+                                    ],
+                                ],
+                            ],
+                        ],
+                        '403' => [
+                            '$ref' => '#/components/responses/Forbidden',
+                        ],
+                        '404' => [
+                            '$ref' => '#/components/responses/NotFound',
+                        ],
+                        '422' => [
+                            'description' => 'Participant is not assigned to an accessible event',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => [
+                                        '$ref' => '#/components/schemas/ErrorResponse',
+                                    ],
+                                ],
+                            ],
+                        ],
+                        '401' => [
+                            '$ref' => '#/components/responses/Unauthorized',
+                        ],
+                    ],
+                ],
+            ],
+            '/participants/{id}/send-qr-email' => [
+                'post' => [
+                    'tags' => ['Participants'],
+                    'summary' => 'Send QR email to a single participant',
+                    'security' => [
+                        ['bearerAuth' => []],
+                    ],
+                    'parameters' => [
+                        [
+                            'name' => 'id',
+                            'in' => 'path',
+                            'required' => true,
+                            'description' => 'Participant numeric ID',
+                            'schema' => [
+                                'type' => 'integer',
+                                'format' => 'int64',
+                            ],
+                        ],
+                    ],
+                    'responses' => [
+                        '200' => [
+                            'description' => 'QR email sent',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => [
+                                        '$ref' => '#/components/schemas/ParticipantResponse',
+                                    ],
+                                ],
+                            ],
+                        ],
+                        '403' => [
+                            '$ref' => '#/components/responses/Forbidden',
+                        ],
+                        '404' => [
+                            '$ref' => '#/components/responses/NotFound',
+                        ],
+                        '422' => [
+                            'description' => 'Mail send failed or participant is invalid',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => [
+                                        '$ref' => '#/components/schemas/ErrorResponse',
+                                    ],
+                                ],
+                            ],
                         ],
                         '401' => [
                             '$ref' => '#/components/responses/Unauthorized',
@@ -1208,21 +2181,238 @@ function openApiDocument(): array
                                 ],
                             ],
                         ],
+                        '403' => [
+                            '$ref' => '#/components/responses/Forbidden',
+                        ],
                         '404' => [
-                            'description' => 'Participant not found',
+                            '$ref' => '#/components/responses/NotFound',
+                        ],
+                        '422' => [
+                            'description' => 'Participant is not assigned to an accessible event',
                             'content' => [
                                 'application/json' => [
                                     'schema' => [
                                         '$ref' => '#/components/schemas/ErrorResponse',
-                                    ],
-                                    'example' => [
-                                        'error' => 'Participant not found',
                                     ],
                                 ],
                             ],
                         ],
                         '500' => [
                             '$ref' => '#/components/responses/DatabaseError',
+                        ],
+                        '401' => [
+                            '$ref' => '#/components/responses/Unauthorized',
+                        ],
+                    ],
+                ],
+                'patch' => [
+                    'tags' => ['Participants'],
+                    'summary' => 'Update participant status or reassign package data',
+                    'security' => [
+                        ['bearerAuth' => []],
+                    ],
+                    'parameters' => [
+                        [
+                            'name' => 'id',
+                            'in' => 'path',
+                            'required' => true,
+                            'description' => 'Participant numeric ID',
+                            'schema' => [
+                                'type' => 'integer',
+                                'format' => 'int64',
+                            ],
+                        ],
+                    ],
+                    'requestBody' => [
+                        'required' => true,
+                        'content' => [
+                            'application/json' => [
+                                'schema' => [
+                                    '$ref' => '#/components/schemas/UpdateParticipantRequest',
+                                ],
+                            ],
+                        ],
+                    ],
+                    'responses' => [
+                        '200' => [
+                            'description' => 'Participant updated',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => [
+                                        '$ref' => '#/components/schemas/ParticipantResponse',
+                                    ],
+                                ],
+                            ],
+                        ],
+                        '403' => [
+                            '$ref' => '#/components/responses/Forbidden',
+                        ],
+                        '404' => [
+                            '$ref' => '#/components/responses/NotFound',
+                        ],
+                        '422' => [
+                            'description' => 'Validation error',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => [
+                                        '$ref' => '#/components/schemas/ErrorResponse',
+                                    ],
+                                ],
+                            ],
+                        ],
+                        '401' => [
+                            '$ref' => '#/components/responses/Unauthorized',
+                        ],
+                    ],
+                ],
+                'delete' => [
+                    'tags' => ['Participants'],
+                    'summary' => 'Delete participant',
+                    'security' => [
+                        ['bearerAuth' => []],
+                    ],
+                    'parameters' => [
+                        [
+                            'name' => 'id',
+                            'in' => 'path',
+                            'required' => true,
+                            'description' => 'Participant numeric ID',
+                            'schema' => [
+                                'type' => 'integer',
+                                'format' => 'int64',
+                            ],
+                        ],
+                    ],
+                    'responses' => [
+                        '200' => [
+                            'description' => 'Participant deleted',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => [
+                                        '$ref' => '#/components/schemas/SuccessResponse',
+                                    ],
+                                ],
+                            ],
+                        ],
+                        '403' => [
+                            '$ref' => '#/components/responses/Forbidden',
+                        ],
+                        '404' => [
+                            '$ref' => '#/components/responses/NotFound',
+                        ],
+                        '422' => [
+                            'description' => 'Participant is not assigned to an accessible event',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => [
+                                        '$ref' => '#/components/schemas/ErrorResponse',
+                                    ],
+                                ],
+                            ],
+                        ],
+                        '401' => [
+                            '$ref' => '#/components/responses/Unauthorized',
+                        ],
+                    ],
+                ],
+            ],
+            '/participants/{id}/check-in' => [
+                'post' => [
+                    'tags' => ['Participants'],
+                    'summary' => 'Check in participant',
+                    'security' => [
+                        ['bearerAuth' => []],
+                    ],
+                    'parameters' => [
+                        [
+                            'name' => 'id',
+                            'in' => 'path',
+                            'required' => true,
+                            'description' => 'Participant numeric ID',
+                            'schema' => [
+                                'type' => 'integer',
+                                'format' => 'int64',
+                            ],
+                        ],
+                    ],
+                    'responses' => [
+                        '200' => [
+                            'description' => 'Participant checked in',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => [
+                                        '$ref' => '#/components/schemas/ParticipantResponse',
+                                    ],
+                                ],
+                            ],
+                        ],
+                        '403' => [
+                            '$ref' => '#/components/responses/Forbidden',
+                        ],
+                        '404' => [
+                            '$ref' => '#/components/responses/NotFound',
+                        ],
+                        '422' => [
+                            'description' => 'Participant is not assigned to an accessible event',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => [
+                                        '$ref' => '#/components/schemas/ErrorResponse',
+                                    ],
+                                ],
+                            ],
+                        ],
+                        '401' => [
+                            '$ref' => '#/components/responses/Unauthorized',
+                        ],
+                    ],
+                ],
+            ],
+            '/participants/{id}/undo-check-in' => [
+                'post' => [
+                    'tags' => ['Participants'],
+                    'summary' => 'Undo participant check-in',
+                    'security' => [
+                        ['bearerAuth' => []],
+                    ],
+                    'parameters' => [
+                        [
+                            'name' => 'id',
+                            'in' => 'path',
+                            'required' => true,
+                            'description' => 'Participant numeric ID',
+                            'schema' => [
+                                'type' => 'integer',
+                                'format' => 'int64',
+                            ],
+                        ],
+                    ],
+                    'responses' => [
+                        '200' => [
+                            'description' => 'Participant check-in reverted',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => [
+                                        '$ref' => '#/components/schemas/ParticipantResponse',
+                                    ],
+                                ],
+                            ],
+                        ],
+                        '403' => [
+                            '$ref' => '#/components/responses/Forbidden',
+                        ],
+                        '404' => [
+                            '$ref' => '#/components/responses/NotFound',
+                        ],
+                        '422' => [
+                            'description' => 'Participant is not assigned to an accessible event',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => [
+                                        '$ref' => '#/components/schemas/ErrorResponse',
+                                    ],
+                                ],
+                            ],
                         ],
                         '401' => [
                             '$ref' => '#/components/responses/Unauthorized',
@@ -1259,6 +2449,69 @@ function openApiDocument(): array
                             ],
                             'example' => [
                                 'error' => 'Unauthorized',
+                            ],
+                        ],
+                    ],
+                ],
+                'Forbidden' => [
+                    'description' => 'Forbidden',
+                    'content' => [
+                        'application/json' => [
+                            'schema' => [
+                                '$ref' => '#/components/schemas/ErrorResponse',
+                            ],
+                            'example' => [
+                                'error' => 'Forbidden',
+                            ],
+                        ],
+                    ],
+                ],
+                'NotFound' => [
+                    'description' => 'Resource not found',
+                    'content' => [
+                        'application/json' => [
+                            'schema' => [
+                                '$ref' => '#/components/schemas/ErrorResponse',
+                            ],
+                        ],
+                    ],
+                ],
+                'BadRequest' => [
+                    'description' => 'Invalid JSON payload or malformed request',
+                    'content' => [
+                        'application/json' => [
+                            'schema' => [
+                                '$ref' => '#/components/schemas/ErrorResponse',
+                            ],
+                        ],
+                    ],
+                ],
+                'PayloadTooLarge' => [
+                    'description' => 'Request body too large',
+                    'content' => [
+                        'application/json' => [
+                            'schema' => [
+                                '$ref' => '#/components/schemas/ErrorResponse',
+                            ],
+                        ],
+                    ],
+                ],
+                'TooManyRequests' => [
+                    'description' => 'Rate limit exceeded',
+                    'content' => [
+                        'application/json' => [
+                            'schema' => [
+                                '$ref' => '#/components/schemas/ErrorResponse',
+                            ],
+                        ],
+                    ],
+                ],
+                'Conflict' => [
+                    'description' => 'Conflict',
+                    'content' => [
+                        'application/json' => [
+                            'schema' => [
+                                '$ref' => '#/components/schemas/ErrorResponse',
                             ],
                         ],
                     ],
@@ -1395,21 +2648,37 @@ function openApiDocument(): array
                     'required' => ['error'],
                     'properties' => [
                         'error' => ['type' => 'string'],
+                        'details' => ['type' => 'string', 'nullable' => true],
+                        'retry_after' => ['type' => 'integer', 'nullable' => true],
+                        'missing_fields' => [
+                            'type' => 'array',
+                            'items' => ['type' => 'string'],
+                            'nullable' => true,
+                        ],
+                        'missing_columns' => [
+                            'type' => 'array',
+                            'items' => ['type' => 'string'],
+                            'nullable' => true,
+                        ],
+                        'data' => [
+                            'type' => 'object',
+                            'nullable' => true,
+                            'additionalProperties' => true,
+                        ],
                     ],
                 ],
                 'CreateParticipantRequest' => [
                     'type' => 'object',
-                    'required' => ['first_name', 'last_name', 'email'],
+                    'required' => ['event_id', 'display_name', 'email'],
                     'properties' => [
-                        'event_id' => ['type' => 'string', 'nullable' => true, 'example' => 'evt-1'],
-                        'first_name' => ['type' => 'string', 'example' => 'Maria'],
-                        'last_name' => ['type' => 'string', 'example' => 'Wisniewska'],
+                        'event_id' => ['type' => 'string', 'example' => 'evt-1'],
+                        'first_name' => ['type' => 'string', 'nullable' => true, 'example' => 'Maria'],
+                        'last_name' => ['type' => 'string', 'nullable' => true, 'example' => 'Wisniewska'],
+                        'display_name' => ['type' => 'string', 'example' => 'Maria Wiśniewska'],
                         'email' => ['type' => 'string', 'format' => 'email', 'example' => 'maria.wisniewska@example.com'],
                         'organization' => ['type' => 'string', 'nullable' => true, 'example' => 'AGH'],
                         'bib_number' => ['type' => 'string', 'nullable' => true, 'example' => '101'],
                         'qr_code' => ['type' => 'string', 'nullable' => true, 'example' => 'QR-evt-1-101'],
-                        'status' => ['type' => 'string', 'enum' => ['not_checked_in', 'checked_in', 'checked_in_not_starting'], 'default' => 'not_checked_in'],
-                        'email_status' => ['type' => 'string', 'enum' => ['not_sent', 'sent'], 'default' => 'not_sent'],
                     ],
                 ],
                 'Organization' => [
@@ -1435,11 +2704,10 @@ function openApiDocument(): array
                 ],
                 'Event' => [
                     'type' => 'object',
-                    'required' => ['id', 'name', 'date', 'location', 'organization_id', 'office_open_at', 'office_close_at'],
+                    'required' => ['id', 'name', 'location', 'organization_id', 'office_open_at', 'office_close_at'],
                     'properties' => [
                         'id' => ['type' => 'string', 'example' => 'evt-1'],
                         'name' => ['type' => 'string', 'example' => 'Bieg Piastowski 10km'],
-                        'date' => ['type' => 'string', 'format' => 'date'],
                         'location' => ['type' => 'string', 'example' => 'Gniezno, Park Miejski'],
                         'organization_id' => ['type' => 'string', 'example' => 'org-1'],
                         'office_open_at' => ['type' => 'string', 'format' => 'date-time', 'example' => '2026-04-12T07:00:00'],
@@ -1457,10 +2725,9 @@ function openApiDocument(): array
                 ],
                 'CreateEventRequest' => [
                     'type' => 'object',
-                    'required' => ['name', 'date', 'location', 'organization_id', 'office_open_at', 'office_close_at'],
+                    'required' => ['name', 'location', 'organization_id', 'office_open_at', 'office_close_at'],
                     'properties' => [
                         'name' => ['type' => 'string', 'example' => 'Bieg Jesienny 5km'],
-                        'date' => ['type' => 'string', 'format' => 'date', 'example' => '2026-09-20'],
                         'location' => ['type' => 'string', 'example' => 'Krakow, Blonia'],
                         'organization_id' => ['type' => 'string', 'example' => 'org-1'],
                         'office_open_at' => ['type' => 'string', 'format' => 'date-time', 'example' => '2026-09-20T08:00:00'],
@@ -1487,7 +2754,7 @@ function openApiDocument(): array
                     'type' => 'object',
                     'required' => ['role'],
                     'properties' => [
-                        'role' => ['type' => 'string', 'enum' => ['admin', 'editor', 'scanner']],
+                        'role' => ['type' => 'string', 'enum' => ['editor', 'scanner']],
                     ],
                 ],
                 'User' => [
@@ -1538,16 +2805,21 @@ function openApiDocument(): array
                 ],
                 'Participant' => [
                     'type' => 'object',
-                    'required' => ['id', 'first_name', 'last_name', 'email', 'status', 'email_status', 'created_at', 'updated_at'],
+                    'required' => ['id', 'display_name', 'email', 'status', 'email_status', 'created_at', 'updated_at'],
                     'properties' => [
                         'id' => ['type' => 'integer', 'format' => 'int64', 'example' => 1],
                         'event_id' => ['type' => 'string', 'nullable' => true, 'example' => 'evt-1'],
-                        'first_name' => ['type' => 'string', 'example' => 'Anna'],
-                        'last_name' => ['type' => 'string', 'example' => 'Kowalska'],
+                        'first_name' => ['type' => 'string', 'nullable' => true, 'example' => 'Anna'],
+                        'last_name' => ['type' => 'string', 'nullable' => true, 'example' => 'Kowalska'],
+                        'display_name' => ['type' => 'string', 'example' => 'Anna Kowalska'],
                         'email' => ['type' => 'string', 'format' => 'email'],
                         'organization' => ['type' => 'string', 'nullable' => true],
                         'bib_number' => ['type' => 'string', 'nullable' => true],
                         'qr_code' => ['type' => 'string', 'nullable' => true],
+                        'custom_fields' => [
+                            'type' => 'object',
+                            'additionalProperties' => ['type' => 'string'],
+                        ],
                         'status' => ['type' => 'string', 'enum' => ['not_checked_in', 'checked_in', 'checked_in_not_starting']],
                         'email_status' => ['type' => 'string', 'enum' => ['not_sent', 'sent']],
                         'checked_in_at' => ['type' => 'string', 'format' => 'date-time', 'nullable' => true],
@@ -1560,10 +2832,290 @@ function openApiDocument(): array
                     'required' => ['id', 'timestamp', 'action'],
                     'properties' => [
                         'id' => ['type' => 'string', 'example' => 'log-1'],
+                        'event_id' => ['type' => 'string', 'nullable' => true, 'example' => 'evt-1'],
                         'timestamp' => ['type' => 'string', 'format' => 'date-time'],
                         'action' => ['type' => 'string', 'example' => 'Check-in'],
                         'participant_name' => ['type' => 'string', 'nullable' => true],
                         'user_name' => ['type' => 'string', 'nullable' => true],
+                    ],
+                ],
+                'ParticipantFieldMapping' => [
+                    'type' => 'object',
+                    'required' => ['source_column_name', 'alias', 'field_role', 'display_order', 'is_required', 'is_active'],
+                    'properties' => [
+                        'source_column_name' => ['type' => 'string', 'example' => 'Imię'],
+                        'alias' => ['type' => 'string', 'example' => 'Imię'],
+                        'field_role' => ['type' => 'string', 'enum' => ['email', 'display_name_part', 'bib_number', 'custom']],
+                        'display_order' => ['type' => 'integer', 'example' => 1],
+                        'is_required' => ['type' => 'boolean'],
+                        'is_active' => ['type' => 'boolean'],
+                    ],
+                ],
+                'UpdateEventRequest' => [
+                    'type' => 'object',
+                    'required' => ['name', 'location', 'office_open_at', 'office_close_at'],
+                    'properties' => [
+                        'name' => ['type' => 'string', 'example' => 'Bieg Jesienny 5km'],
+                        'location' => ['type' => 'string', 'example' => 'Krakow, Blonia'],
+                        'office_open_at' => ['type' => 'string', 'format' => 'date-time', 'example' => '2026-09-20T08:00:00'],
+                        'office_close_at' => ['type' => 'string', 'format' => 'date-time', 'example' => '2026-09-20T16:00:00'],
+                    ],
+                ],
+                'UpdateOrganizationRequest' => [
+                    'type' => 'object',
+                    'properties' => [
+                        'name' => ['type' => 'string', 'example' => 'SportEvents Pro Plus'],
+                        'event_limit' => ['type' => 'integer', 'minimum' => 0, 'example' => 6],
+                    ],
+                ],
+                'AssignScannerEventsRequest' => [
+                    'type' => 'object',
+                    'required' => ['assigned_events'],
+                    'properties' => [
+                        'assigned_events' => [
+                            'type' => 'array',
+                            'items' => ['type' => 'string', 'example' => 'evt-1'],
+                        ],
+                    ],
+                ],
+                'UpdateParticipantRequest' => [
+                    'type' => 'object',
+                    'properties' => [
+                        'status' => ['type' => 'string', 'enum' => ['not_checked_in', 'checked_in', 'checked_in_not_starting']],
+                        'email' => ['type' => 'string', 'format' => 'email'],
+                        'field_values' => [
+                            'type' => 'object',
+                            'additionalProperties' => ['type' => 'string'],
+                        ],
+                    ],
+                ],
+                'ParticipantQrPreviewResponse' => [
+                    'type' => 'object',
+                    'required' => ['data'],
+                    'properties' => [
+                        'data' => [
+                            'type' => 'object',
+                            'required' => ['participant', 'event', 'qr_code_svg_data_uri', 'qr_code_image_url'],
+                            'properties' => [
+                                'participant' => ['$ref' => '#/components/schemas/Participant'],
+                                'event' => ['$ref' => '#/components/schemas/Event'],
+                                'qr_code_svg_data_uri' => ['type' => 'string'],
+                                'qr_code_image_url' => ['type' => 'string'],
+                            ],
+                        ],
+                    ],
+                ],
+                'ParticipantScanRequest' => [
+                    'type' => 'object',
+                    'required' => ['qr_code'],
+                    'properties' => [
+                        'qr_code' => ['type' => 'string', 'example' => 'QR-evt-1-101'],
+                        'auto_check_in' => ['type' => 'boolean', 'default' => false],
+                    ],
+                ],
+                'ParticipantScanParticipant' => [
+                    'type' => 'object',
+                    'required' => ['id', 'event_id', 'display_name', 'email', 'bib_number', 'status', 'email_status', 'qr_code'],
+                    'properties' => [
+                        'id' => ['type' => 'integer', 'format' => 'int64'],
+                        'event_id' => ['type' => 'string'],
+                        'display_name' => ['type' => 'string'],
+                        'email' => ['type' => 'string', 'format' => 'email'],
+                        'bib_number' => ['type' => 'string', 'nullable' => true],
+                        'status' => ['type' => 'string', 'enum' => ['not_checked_in', 'checked_in', 'checked_in_not_starting']],
+                        'email_status' => ['type' => 'string', 'enum' => ['not_sent', 'sent']],
+                        'checked_in_at' => ['type' => 'string', 'format' => 'date-time', 'nullable' => true],
+                        'qr_code' => ['type' => 'string'],
+                    ],
+                ],
+                'ParticipantScanResponse' => [
+                    'type' => 'object',
+                    'required' => ['data'],
+                    'properties' => [
+                        'data' => [
+                            'type' => 'object',
+                            'required' => ['participant', 'event', 'access'],
+                            'properties' => [
+                                'participant' => ['$ref' => '#/components/schemas/ParticipantScanParticipant'],
+                                'event' => ['$ref' => '#/components/schemas/Event'],
+                                'access' => [
+                                    'type' => 'object',
+                                    'required' => ['allowed'],
+                                    'properties' => [
+                                        'allowed' => ['type' => 'boolean'],
+                                    ],
+                                ],
+                            ],
+                        ],
+                    ],
+                ],
+                'EventQrEmailRequest' => [
+                    'type' => 'object',
+                    'properties' => [
+                        'resend_all' => ['type' => 'boolean', 'default' => false],
+                    ],
+                ],
+                'EventQrEmailResponse' => [
+                    'type' => 'object',
+                    'required' => ['data'],
+                    'properties' => [
+                        'data' => [
+                            'type' => 'object',
+                            'required' => ['sent_count', 'error_count', 'errors'],
+                            'properties' => [
+                                'sent_count' => ['type' => 'integer'],
+                                'error_count' => ['type' => 'integer'],
+                                'errors' => [
+                                    'type' => 'array',
+                                    'items' => [
+                                        'type' => 'object',
+                                        'required' => ['participant_id', 'participant_name', 'error'],
+                                        'properties' => [
+                                            'participant_id' => ['type' => 'integer', 'format' => 'int64'],
+                                            'participant_name' => ['type' => 'string'],
+                                            'error' => ['type' => 'string'],
+                                        ],
+                                    ],
+                                ],
+                            ],
+                        ],
+                    ],
+                ],
+                'ParticipantImportAnalyzeRequest' => [
+                    'type' => 'object',
+                    'required' => ['csv_content'],
+                    'properties' => [
+                        'csv_content' => ['type' => 'string'],
+                    ],
+                ],
+                'ParticipantImportAnalyzeResponse' => [
+                    'type' => 'object',
+                    'required' => ['data'],
+                    'properties' => [
+                        'data' => [
+                            'type' => 'object',
+                            'required' => ['headers', 'sample_rows', 'email_candidates', 'has_mapping', 'mappings', 'missing_required_columns', 'row_count'],
+                            'properties' => [
+                                'headers' => [
+                                    'type' => 'array',
+                                    'items' => ['type' => 'string'],
+                                ],
+                                'sample_rows' => [
+                                    'type' => 'array',
+                                    'items' => [
+                                        'type' => 'object',
+                                        'additionalProperties' => ['type' => 'string'],
+                                    ],
+                                ],
+                                'email_candidates' => [
+                                    'type' => 'array',
+                                    'items' => [
+                                        'type' => 'object',
+                                        'required' => ['column', 'matched_count'],
+                                        'properties' => [
+                                            'column' => ['type' => 'string'],
+                                            'matched_count' => ['type' => 'integer'],
+                                        ],
+                                    ],
+                                ],
+                                'has_mapping' => ['type' => 'boolean'],
+                                'mappings' => [
+                                    'type' => 'array',
+                                    'items' => ['$ref' => '#/components/schemas/ParticipantFieldMapping'],
+                                ],
+                                'missing_required_columns' => [
+                                    'type' => 'array',
+                                    'items' => ['type' => 'string'],
+                                ],
+                                'row_count' => ['type' => 'integer'],
+                            ],
+                        ],
+                    ],
+                ],
+                'ParticipantImportConfirmFieldInput' => [
+                    'type' => 'object',
+                    'required' => ['source_column_name', 'alias', 'field_role', 'is_active'],
+                    'properties' => [
+                        'source_column_name' => ['type' => 'string'],
+                        'alias' => ['type' => 'string'],
+                        'field_role' => ['type' => 'string', 'enum' => ['display_name_part', 'bib_number', 'custom']],
+                        'is_active' => ['type' => 'boolean'],
+                    ],
+                ],
+                'ParticipantImportConfirmRequest' => [
+                    'type' => 'object',
+                    'required' => ['csv_columns', 'email_column', 'fields'],
+                    'properties' => [
+                        'csv_columns' => [
+                            'type' => 'array',
+                            'items' => ['type' => 'string'],
+                        ],
+                        'email_column' => ['type' => 'string'],
+                        'fields' => [
+                            'type' => 'array',
+                            'items' => ['$ref' => '#/components/schemas/ParticipantImportConfirmFieldInput'],
+                        ],
+                    ],
+                ],
+                'ParticipantImportConfirmResponse' => [
+                    'type' => 'object',
+                    'required' => ['data'],
+                    'properties' => [
+                        'data' => [
+                            'type' => 'array',
+                            'items' => ['$ref' => '#/components/schemas/ParticipantFieldMapping'],
+                        ],
+                    ],
+                ],
+                'ParticipantImportRunResponse' => [
+                    'type' => 'object',
+                    'required' => ['data'],
+                    'properties' => [
+                        'data' => [
+                            'type' => 'object',
+                            'required' => ['created_count', 'duplicate_count', 'invalid_count', 'invalid_rows', 'participants'],
+                            'properties' => [
+                                'created_count' => ['type' => 'integer'],
+                                'duplicate_count' => ['type' => 'integer'],
+                                'invalid_count' => ['type' => 'integer'],
+                                'invalid_rows' => [
+                                    'type' => 'array',
+                                    'items' => ['type' => 'integer'],
+                                ],
+                                'participants' => [
+                                    'type' => 'array',
+                                    'items' => ['$ref' => '#/components/schemas/Participant'],
+                                ],
+                            ],
+                        ],
+                    ],
+                ],
+                'ParticipantFieldMappingsResponse' => [
+                    'type' => 'object',
+                    'required' => ['data'],
+                    'properties' => [
+                        'data' => [
+                            'type' => 'object',
+                            'required' => ['has_mapping', 'mappings'],
+                            'properties' => [
+                                'has_mapping' => ['type' => 'boolean'],
+                                'mappings' => [
+                                    'type' => 'array',
+                                    'items' => ['$ref' => '#/components/schemas/ParticipantFieldMapping'],
+                                ],
+                            ],
+                        ],
+                    ],
+                ],
+                'ManualParticipantRequest' => [
+                    'type' => 'object',
+                    'required' => ['email', 'field_values'],
+                    'properties' => [
+                        'email' => ['type' => 'string', 'format' => 'email'],
+                        'field_values' => [
+                            'type' => 'object',
+                            'additionalProperties' => ['type' => 'string'],
+                        ],
                     ],
                 ],
                 'SuccessResponse' => [

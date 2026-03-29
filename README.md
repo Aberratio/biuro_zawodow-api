@@ -1,124 +1,78 @@
 # biuro_zawodow-api
 
-Small PHP API for the `biuro_zawodow` project. It serves local frontend development, reads data from MySQL, exposes bootstrap data for the app, and handles participant endpoints.
+PHP 8.2 API for the `biuro_zawodow` project. It serves the React frontend, exposes bootstrap data for the app, handles authentication, manages organizations, events, users and participants, and provides CSV import/export plus QR workflows.
 
-## Table of Contents
+## What is inside
 
-- [Quick Commands](#quick-commands)
-- [First Setup](#first-setup)
-- [Configuration](#configuration)
-- [Authentication](#authentication)
-- [Swagger Docs](#swagger-docs)
-- [Available Endpoints](#available-endpoints)
+- JWT based auth with password reset flow
+- Role aware access control for `superadmin`, `admin`, `editor`, `scanner`
+- Organization, event, user and participant CRUD
+- Participant CSV import with column mapping
+- QR preview, single send and bulk send for event participants
+- CSV export for event data and event activity logs
+- Swagger UI at `/docs` and OpenAPI JSON at `/openapi.json`
+- Basic API hardening:
+  - strict CORS configuration
+  - JSON body validation and size limits
+  - rate limiting for login and password reset endpoints
+  - server side filtering of bootstrap and participant data
 
-## Quick Commands
-
-If your local backend and database are already set up, run only this:
-
-```powershell
-cd biuro_zawodow-api
-php -S localhost:8080 router.php
-```
-
-Check that the API is up:
-
-```powershell
-Invoke-RestMethod http://localhost:8080/health
-```
-
-Open Swagger docs:
-
-```text
-http://localhost:8080/docs
-```
-
-Frontend base URL:
-
-```text
-http://localhost:8080
-```
-
-## First Setup
-
-### What you need
+## Requirements
 
 - PHP 8.2+
 - PHP extensions: `pdo`, `pdo_mysql`
 - MySQL 8+
 - Composer
-- Local access to create a database and import SQL
 
-### Setup steps
-
-1. Create the local env file:
+## Quick start
 
 ```powershell
+cd biuro_zawodow-api
 Copy-Item .env.example .env
-```
-
-2. Install PHP dependencies:
-
-```powershell
 composer install
-```
-
-3. Create the database:
-
-```powershell
 mysql -u root -p -e "CREATE DATABASE IF NOT EXISTS biuro_zawodow CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
-```
-
-4. Import schema and seed data:
-
-```powershell
 mysql -u root -p biuro_zawodow < database/init/001_init.sql
-```
-
-5. Create the default local API user:
-
-```powershell
 mysql -u root -p -e "CREATE USER IF NOT EXISTS 'biuro_user'@'localhost' IDENTIFIED BY 'biuro_pass';"
 mysql -u root -p -e "GRANT ALL PRIVILEGES ON biuro_zawodow.* TO 'biuro_user'@'localhost'; FLUSH PRIVILEGES;"
-```
-
-6. Start the API:
-
-```powershell
 php -S localhost:8080 router.php
 ```
 
-7. Verify it works:
+Health check:
 
 ```powershell
 Invoke-RestMethod http://localhost:8080/health
 ```
 
-If you already have old plaintext user passwords in the database, run:
+Swagger UI:
 
-```powershell
-php database/migrations/002_hash_user_passwords.php
+```text
+http://localhost:8080/docs
 ```
 
-If you already have the database but not the password reset table, run:
+OpenAPI JSON:
 
-```powershell
-php database/migrations/008_create_password_resets.php
+```text
+http://localhost:8080/openapi.json
 ```
 
-## Configuration
+## Local configuration
 
-Default local config in `.env.example`:
+Default local config from `.env.example`:
 
 ```env
+APP_ENV=local
+APP_DEBUG=true
 APP_URL=http://localhost:8080
 APP_FRONTEND_URL=http://localhost:5173
 APP_KEY=change-this-local-secret
 APP_CORS_ORIGIN=http://localhost:8080,http://localhost:5173
+
 DB_HOST=127.0.0.1
 DB_PORT=3306
 DB_DATABASE=biuro_zawodow
 DB_USERNAME=biuro_user
 DB_PASSWORD=biuro_pass
+
 MAIL_DRIVER=smtp
 MAIL_HOST=127.0.0.1
 MAIL_PORT=1025
@@ -126,14 +80,17 @@ MAIL_USERNAME=
 MAIL_PASSWORD=
 MAIL_ENCRYPTION=tls
 MAIL_FROM_ADDRESS=no-reply@biurozawodow.local
-MAIL_FROM_NAME=Biuro Zawodow
+MAIL_FROM_NAME=Biuro Zawodów
 ```
 
-If your frontend runs on a different origin, update `APP_CORS_ORIGIN`.
-Set a strong `APP_KEY` because it signs auth tokens.
-`APP_FRONTEND_URL` is used in password reset emails.
+Notes:
 
-For local SMTP testing you can use Mailpit or MailHog, for example:
+- `APP_URL` must match the backend origin.
+- `APP_FRONTEND_URL` is used in password reset emails.
+- `APP_KEY` signs auth tokens and must be strong outside local/dev/test.
+- `APP_CORS_ORIGIN` must contain the frontend origin. Wildcard CORS is rejected outside local/dev/test.
+
+For local mail testing you can use Mailpit:
 
 ```powershell
 docker run --rm -p 1025:1025 -p 8025:8025 axllent/mailpit
@@ -145,49 +102,141 @@ Then open:
 http://localhost:8025
 ```
 
-## Authentication
+## Seeded local accounts
 
-- Public: `GET /docs`, `GET /openapi.json`, `GET /health`, `POST /auth/login`, `POST /auth/forgot-password`, `POST /auth/reset-password`
-- Protected: `GET /auth/me`, `POST /auth/change-password`, `GET /bootstrap`, `GET /participants`, `GET /participants/{id}`, `POST /participants`
+The seed data from `database/init/001_init.sql` creates demo users. The default password is:
 
-Login example:
-
-```powershell
-Invoke-RestMethod http://localhost:8080/auth/login -Method Post -ContentType 'application/json' -Body '{"email":"super@biurozawodow.pl","password":"demo123"}'
+```text
+demo123
 ```
 
-Use the returned token as:
+Main seeded accounts:
+
+- `super@biurozawodow.pl` - superadmin
+- `admin@sportevents.pl` - admin for `org-1`
+- `admin@runpoland.pl` - admin for `org-2`
+- `org.gniezno@sportevents.pl` - editor
+- `skaner1@sportevents.pl` - scanner
+
+## Database setup notes
+
+For a fresh local setup, importing `database/init/001_init.sql` is enough.
+
+If you are upgrading an older local database, review the scripts in `database/migrations/` and run only the ones that your existing schema still needs. The directory currently contains:
+
+- `002_hash_user_passwords.php`
+- `003_add_admin_id_to_users.php`
+- `004_add_event_limit_to_organizations.php`
+- `005_create_admin_organization_assignments.php`
+- `006_align_user_organization_relations.php`
+- `007_add_event_participant_imports.php`
+- `008_create_password_resets.php`
+- `009_backfill_participant_qr_codes.php`
+- `010_unify_participant_status.php`
+
+## Auth and access model
+
+Public endpoints:
+
+- `GET /docs`
+- `GET /openapi.json`
+- `GET /health`
+- `GET /qr-images/{token}.svg`
+- `POST /auth/login`
+- `POST /auth/forgot-password`
+- `POST /auth/reset-password`
+
+Protected endpoints require:
 
 ```text
 Authorization: Bearer <access_token>
 ```
 
-Default seeded demo password remains `demo123`, but it is now stored as a hash.
+Role overview:
 
-Password reset flow:
+- `superadmin` can access all organizations, events, users and participants
+- `admin` can access only assigned organizations
+- `editor` can access only their own organization
+- `scanner` can access only assigned events while the race office is open
 
-- `POST /auth/forgot-password` always returns the same neutral message
-- the API stores only a hash of the reset token
-- reset links are valid for 60 minutes
-- if SMTP is not configured and `APP_DEBUG=true`, the endpoint returns a configuration error
-- newly created users also receive a setup email and choose their own password from the link instead of getting a password from an admin
+## Main endpoint groups
 
-## Swagger Docs
+The full and current contract lives in Swagger. The most important route groups are:
 
-- Swagger UI: `GET /docs`
-- OpenAPI JSON: `GET /openapi.json`
+- auth:
+  - `POST /auth/login`
+  - `POST /auth/forgot-password`
+  - `POST /auth/reset-password`
+  - `GET /auth/me`
+  - `POST /auth/change-password`
+- bootstrap and system:
+  - `GET /bootstrap`
+  - `GET /health`
+- organizations:
+  - `POST /organizations`
+  - `GET /organizations/{id}`
+  - `PATCH /organizations/{id}`
+  - `DELETE /organizations/{id}`
+  - `POST /organizations/{id}/event-limit`
+- events:
+  - `POST /events`
+  - `GET /events/{id}`
+  - `PATCH /events/{id}`
+  - `DELETE /events/{id}`
+  - `GET /events/{id}/export.csv`
+  - `GET /events/{id}/logs/export.csv`
+  - `POST /events/{id}/participant-imports/analyze`
+  - `POST /events/{id}/participant-imports/confirm`
+  - `POST /events/{id}/participant-imports/run`
+  - `GET /events/{id}/participant-field-mappings`
+  - `POST /events/{id}/participants/manual`
+  - `POST /events/{id}/send-qr-emails`
+- users:
+  - `POST /users`
+  - `PATCH /users/{id}/role`
+  - `PATCH /users/{id}/event-assignments`
+  - `DELETE /users/{id}`
+- participants:
+  - `GET /participants`
+  - `POST /participants`
+  - `GET /participants/{id}`
+  - `PATCH /participants/{id}`
+  - `DELETE /participants/{id}`
+  - `GET /participants/{id}/qr-preview`
+  - `POST /participants/{id}/send-qr-email`
+  - `POST /participants/{id}/check-in`
+  - `POST /participants/{id}/undo-check-in`
+  - `POST /participants/scan`
 
-## Available Endpoints
+## API behavior worth knowing
 
-- `POST /auth/login`
-- `POST /auth/forgot-password`
-- `POST /auth/reset-password`
-- `GET /auth/me`
-- `POST /auth/change-password`
-- `GET /docs`
-- `GET /openapi.json`
-- `GET /health`
-- `GET /bootstrap`
-- `GET /participants`
-- `GET /participants/{id}`
-- `POST /participants`
+- `/bootstrap` is filtered on the server side, not only in the frontend.
+- Login and password reset endpoints are rate limited.
+- JSON endpoints reject malformed bodies and oversize payloads.
+- CSV analyze/import endpoints accept larger payloads than standard JSON routes.
+- Event and participant exports are generated as downloadable CSV files.
+- Activity logs include user, participant and exact timestamp information where applicable.
+
+## Development workflow
+
+Start the backend:
+
+```powershell
+php -S localhost:8080 router.php
+```
+
+The router is defined in `router.php` and forwards dynamic requests to `public/index.php`.
+
+Useful checks:
+
+```powershell
+php -l src/bootstrap.php
+php -l public/index.php
+```
+
+## Swagger
+
+- UI: `GET /docs`
+- JSON: `GET /openapi.json`
+
+Use Swagger as the source of truth for request and response payloads.
