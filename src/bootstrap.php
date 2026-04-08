@@ -1858,7 +1858,7 @@ function openApiDocument(): array
             '/users/{id}' => [
                 'delete' => [
                     'tags' => ['Users'],
-                    'summary' => 'Delete user',
+                    'summary' => 'Archive user',
                     'security' => [
                         ['bearerAuth' => []],
                     ],
@@ -1874,7 +1874,7 @@ function openApiDocument(): array
                     ],
                     'responses' => [
                         '200' => [
-                            'description' => 'User deleted',
+                            'description' => 'User archived',
                             'content' => [
                                 'application/json' => [
                                     'schema' => [
@@ -1904,7 +1904,71 @@ function openApiDocument(): array
                             ],
                         ],
                         '422' => [
-                            'description' => 'User cannot be deleted yet',
+                            'description' => 'User cannot be archived',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => [
+                                        '$ref' => '#/components/schemas/ErrorResponse',
+                                    ],
+                                ],
+                            ],
+                        ],
+                        '401' => [
+                            '$ref' => '#/components/responses/Unauthorized',
+                        ],
+                    ],
+                ],
+            ],
+            '/users/{id}/password-reset' => [
+                'post' => [
+                    'tags' => ['Users'],
+                    'summary' => 'Send password reset email for user',
+                    'security' => [
+                        ['bearerAuth' => []],
+                    ],
+                    'parameters' => [
+                        [
+                            'name' => 'id',
+                            'in' => 'path',
+                            'required' => true,
+                            'schema' => [
+                                'type' => 'string',
+                            ],
+                        ],
+                    ],
+                    'responses' => [
+                        '200' => [
+                            'description' => 'Password reset email sent',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => [
+                                        '$ref' => '#/components/schemas/SuccessResponse',
+                                    ],
+                                ],
+                            ],
+                        ],
+                        '403' => [
+                            'description' => 'Forbidden',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => [
+                                        '$ref' => '#/components/schemas/ErrorResponse',
+                                    ],
+                                ],
+                            ],
+                        ],
+                        '404' => [
+                            'description' => 'User not found',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => [
+                                        '$ref' => '#/components/schemas/ErrorResponse',
+                                    ],
+                                ],
+                            ],
+                        ],
+                        '422' => [
+                            'description' => 'Password reset cannot be sent',
                             'content' => [
                                 'application/json' => [
                                     'schema' => [
@@ -2910,7 +2974,6 @@ function openApiDocument(): array
                     'required' => ['qr_code'],
                     'properties' => [
                         'qr_code' => ['type' => 'string', 'example' => 'QR-evt-1-101'],
-                        'auto_check_in' => ['type' => 'boolean', 'default' => false],
                     ],
                 ],
                 'ParticipantScanParticipant' => [

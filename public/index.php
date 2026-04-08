@@ -72,6 +72,37 @@ try {
         ");
     }
 
+    $usersArchivedAtColumnExistsStmt = $pdo->query("
+        SELECT COUNT(*) AS total
+        FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = 'users'
+          AND COLUMN_NAME = 'archived_at'
+    ");
+    $usersArchivedAtColumnExists = (int)($usersArchivedAtColumnExistsStmt->fetch()['total'] ?? 0) > 0;
+    if (!$usersArchivedAtColumnExists) {
+        $pdo->exec("
+            ALTER TABLE users
+            ADD COLUMN archived_at DATETIME NULL AFTER organization_id,
+            ADD KEY idx_users_archived_at (archived_at)
+        ");
+    }
+
+    $usersArchivedEmailColumnExistsStmt = $pdo->query("
+        SELECT COUNT(*) AS total
+        FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = 'users'
+          AND COLUMN_NAME = 'archived_email'
+    ");
+    $usersArchivedEmailColumnExists = (int)($usersArchivedEmailColumnExistsStmt->fetch()['total'] ?? 0) > 0;
+    if (!$usersArchivedEmailColumnExists) {
+        $pdo->exec("
+            ALTER TABLE users
+            ADD COLUMN archived_email VARCHAR(190) NULL AFTER archived_at
+        ");
+    }
+
     $loadAdminOrganizationIds = static function (PDO $pdo, string $userId): array {
         $stmt = $pdo->prepare('
             SELECT organization_id
@@ -193,6 +224,7 @@ try {
             SELECT id, name, email, role, organization_id
             FROM users
             WHERE id = :id
+              AND archived_at IS NULL
             LIMIT 1
         ');
         $stmt->execute(['id' => $userId]);
@@ -216,6 +248,7 @@ try {
         $users = $pdo->query('
             SELECT id, name, email, role, organization_id
             FROM users
+            WHERE archived_at IS NULL
             ORDER BY name ASC
         ')->fetchAll();
 
@@ -237,6 +270,7 @@ try {
             SELECT id, name, email, password, role, organization_id
             FROM users
             WHERE email = :email
+              AND archived_at IS NULL
             LIMIT 1
         ');
         $stmt->execute(['email' => $email]);
@@ -1735,7 +1769,7 @@ try {
             exit;
         }
 
-        $memberCountStmt = $pdo->prepare('SELECT COUNT(*) AS total FROM users WHERE organization_id = :organization_id');
+        $memberCountStmt = $pdo->prepare('SELECT COUNT(*) AS total FROM users WHERE organization_id = :organization_id AND archived_at IS NULL');
         $memberCountStmt->execute(['organization_id' => $organizationId]);
         $memberCount = (int)($memberCountStmt->fetch()['total'] ?? 0);
         if ($memberCount > 0) {
@@ -3102,8 +3136,8 @@ try {
         exit;
     }
 
-    if (preg_match('#^/users/([^/]+)$#', $path, $matches) === 1 && $method === 'DELETE') {
-        $authUser = requireAnyRole(['superadmin', 'admin', 'editor'], $resolveAuthenticatedUser);
+    if (preg_match('#^/users/([^/]+)/password-reset$#', $path, $matches) === 1 && $method === 'POST') {
+        $authUser = requireAnyRole(['superadmin', 'admin'], $resolveAuthenticatedUser);
         $userId = (string)$matches[1];
 
         $targetUser = $loadUserById($pdo, $userId);
@@ -3117,16 +3151,108 @@ try {
             exit;
         }
 
-        if (($targetUser['role'] ?? '') === 'admin') {
-            $adminOrganizationIds = $loadAdminOrganizationIds($pdo, $userId);
-            if ($adminOrganizationIds !== []) {
-                jsonResponse(422, ['error' => 'Admin assigned to organizations cannot be deleted']);
-                exit;
-            }
+        if (!in_array((string)($targetUser['role'] ?? ''), ['editor', 'scanner'], true)) {
+            jsonResponse(422, ['error' => 'Only organizer and scanner accounts can receive an admin-triggered password reset']);
+            exit;
         }
 
-        $deleteStmt = $pdo->prepare('DELETE FROM users WHERE id = :id');
-        $deleteStmt->execute(['id' => $userId]);
+        try {
+            $token = $createPasswordResetToken($pdo, (string)$targetUser['id']);
+            $resetUrl = appFrontendUrl() . '/reset-password?token=' . urlencode($token);
+            MailService::sendPasswordResetEmail((string)$targetUser['email'], (string)$targetUser['name'], $resetUrl);
+
+            $addActivityLog(
+                $pdo,
+                sprintf('Wyslano reset hasla dla uzytkownika: %s', (string)$targetUser['name']),
+                null,
+                null,
+                null,
+                (string)$authUser['id'],
+                (string)$authUser['name']
+            );
+        } catch (Throwable $exception) {
+            if ((getenv('APP_DEBUG') ?: 'false') === 'true') {
+                jsonResponse(500, ['error' => $exception->getMessage()]);
+                exit;
+            }
+
+            jsonResponse(500, ['error' => 'Could not send password reset email']);
+            exit;
+        }
+
+        jsonResponse(200, ['success' => true]);
+        exit;
+    }
+
+    if (preg_match('#^/users/([^/]+)$#', $path, $matches) === 1 && $method === 'DELETE') {
+        $authUser = requireAnyRole(['superadmin', 'admin'], $resolveAuthenticatedUser);
+        $userId = (string)$matches[1];
+
+        $targetUser = $loadUserById($pdo, $userId);
+        if ($targetUser === false) {
+            jsonResponse(404, ['error' => 'User not found']);
+            exit;
+        }
+
+        if (!$canManageTargetUser($authUser, $targetUser)) {
+            jsonResponse(403, ['error' => 'Forbidden']);
+            exit;
+        }
+
+        if (!in_array((string)($targetUser['role'] ?? ''), ['editor', 'scanner'], true)) {
+            jsonResponse(422, ['error' => 'Only organizer and scanner accounts can be archived']);
+            exit;
+        }
+
+        $archivedEmail = (string)$targetUser['email'];
+        $archivedAlias = sprintf(
+            'archived+%s+%s@biurozawodow.local',
+            preg_replace('/[^a-zA-Z0-9_-]+/', '-', $userId) ?: 'user',
+            bin2hex(random_bytes(6))
+        );
+
+        $pdo->beginTransaction();
+
+        try {
+            $archiveStmt = $pdo->prepare('
+                UPDATE users
+                SET email = :email,
+                    archived_email = :archived_email,
+                    archived_at = UTC_TIMESTAMP()
+                WHERE id = :id
+            ');
+            $archiveStmt->execute([
+                'email' => $archivedAlias,
+                'archived_email' => $archivedEmail,
+                'id' => $userId,
+            ]);
+
+            $deleteAssignmentsStmt = $pdo->prepare('DELETE FROM user_event_assignments WHERE user_id = :user_id');
+            $deleteAssignmentsStmt->execute(['user_id' => $userId]);
+
+            $deleteAdminAssignmentsStmt = $pdo->prepare('DELETE FROM admin_organization_assignments WHERE user_id = :user_id');
+            $deleteAdminAssignmentsStmt->execute(['user_id' => $userId]);
+
+            $invalidatePasswordResetTokensForUser($pdo, $userId);
+
+            $addActivityLog(
+                $pdo,
+                sprintf('Zarchiwizowano konto uzytkownika: %s', (string)$targetUser['name']),
+                null,
+                null,
+                null,
+                (string)$authUser['id'],
+                (string)$authUser['name']
+            );
+
+            $pdo->commit();
+        } catch (Throwable $exception) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+
+            throw $exception;
+        }
 
         jsonResponse(200, ['success' => true]);
         exit;
@@ -3316,7 +3442,6 @@ try {
         $authUser = requireAuth($resolveAuthenticatedUser);
         $input = readJsonBody();
         $qrCode = trim((string)($input['qr_code'] ?? ''));
-        $autoCheckIn = (bool)($input['auto_check_in'] ?? false);
 
         if ($qrCode === '') {
             jsonResponse(422, ['error' => 'qr_code is required']);
@@ -3349,28 +3474,15 @@ try {
             exit;
         }
 
-        if ($autoCheckIn && (string)$participant['status'] !== 'checked_in') {
-            $participant = $updateParticipantStatus($pdo, $participant, 'checked_in');
-            $addActivityLog(
-                $pdo,
-                'Check-in przez skaner QR',
-                (string)$event['id'],
-                (int)$participant['id'],
-                (string)$participant['display_name'],
-                (string)$authUser['id'],
-                (string)$authUser['name']
-            );
-        } else {
-            $addActivityLog(
-                $pdo,
-                'Skan QR',
-                (string)$event['id'],
-                (int)$participant['id'],
-                (string)$participant['display_name'],
-                (string)$authUser['id'],
-                (string)$authUser['name']
-            );
-        }
+        $addActivityLog(
+            $pdo,
+            'Skan QR',
+            (string)$event['id'],
+            (int)$participant['id'],
+            (string)$participant['display_name'],
+            (string)$authUser['id'],
+            (string)$authUser['name']
+        );
 
         jsonResponse(200, ['data' => $serializeParticipantScanResponse($participant, $event, true)]);
         exit;
