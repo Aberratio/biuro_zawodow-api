@@ -49,11 +49,14 @@ CREATE TABLE users (
     password VARCHAR(255) NOT NULL,
     role ENUM('superadmin', 'admin', 'editor', 'scanner') NOT NULL,
     organization_id VARCHAR(64) NULL,
+    archived_at DATETIME NULL,
+    archived_email VARCHAR(190) NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     PRIMARY KEY (id),
     UNIQUE KEY uq_users_email (email),
     KEY idx_users_organization_id (organization_id),
+    KEY idx_users_archived_at (archived_at),
     CONSTRAINT fk_users_organization
         FOREIGN KEY (organization_id) REFERENCES organizations(id)
         ON DELETE SET NULL
