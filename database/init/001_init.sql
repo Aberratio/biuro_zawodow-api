@@ -32,10 +32,12 @@ CREATE TABLE events (
     organization_id VARCHAR(64) NOT NULL,
     office_open_at DATETIME NOT NULL,
     office_close_at DATETIME NOT NULL,
+    archived_at DATETIME NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     PRIMARY KEY (id),
     KEY idx_events_organization_id (organization_id),
+    KEY idx_events_archived_at (archived_at),
     CONSTRAINT fk_events_organization
         FOREIGN KEY (organization_id) REFERENCES organizations(id)
         ON DELETE CASCADE
@@ -47,7 +49,7 @@ CREATE TABLE users (
     name VARCHAR(190) NOT NULL,
     email VARCHAR(190) NOT NULL,
     password VARCHAR(255) NOT NULL,
-    role ENUM('superadmin', 'admin', 'editor', 'scanner') NOT NULL,
+    role ENUM('superadmin', 'admin', 'editor', 'scanner', 'scanner_plus') NOT NULL,
     organization_id VARCHAR(64) NULL,
     archived_at DATETIME NULL,
     archived_email VARCHAR(190) NULL,

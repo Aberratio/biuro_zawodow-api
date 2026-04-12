@@ -2818,7 +2818,7 @@ function openApiDocument(): array
                     'type' => 'object',
                     'required' => ['role'],
                     'properties' => [
-                        'role' => ['type' => 'string', 'enum' => ['editor', 'scanner']],
+                        'role' => ['type' => 'string', 'enum' => ['editor', 'scanner', 'scanner_plus']],
                     ],
                 ],
                 'User' => [
@@ -2828,7 +2828,7 @@ function openApiDocument(): array
                         'id' => ['type' => 'string', 'example' => 'u-0'],
                         'name' => ['type' => 'string', 'example' => 'Super Admin'],
                         'email' => ['type' => 'string', 'format' => 'email'],
-                        'role' => ['type' => 'string', 'enum' => ['superadmin', 'admin', 'editor', 'scanner']],
+                        'role' => ['type' => 'string', 'enum' => ['superadmin', 'admin', 'editor', 'scanner', 'scanner_plus']],
                         'organization_id' => ['type' => 'string', 'nullable' => true],
                         'organization_ids' => [
                             'type' => 'array',
@@ -2855,7 +2855,7 @@ function openApiDocument(): array
                     'properties' => [
                         'name' => ['type' => 'string', 'example' => 'Admin New Org'],
                         'email' => ['type' => 'string', 'format' => 'email', 'example' => 'admin.new@example.com'],
-                        'role' => ['type' => 'string', 'enum' => ['admin', 'editor', 'scanner']],
+                        'role' => ['type' => 'string', 'enum' => ['admin', 'editor', 'scanner', 'scanner_plus']],
                         'organization_id' => ['type' => 'string', 'nullable' => true, 'example' => 'org-1'],
                         'organization_ids' => [
                             'type' => 'array',
