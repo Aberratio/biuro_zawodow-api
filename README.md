@@ -5,7 +5,7 @@ PHP 8.2 API for the `biuro_zawodow` project. It serves the React frontend, expos
 ## What is inside
 
 - JWT based auth with password reset flow
-- Role aware access control for `superadmin`, `admin`, `editor`, `scanner`
+- Role aware access control for `superadmin`, `admin`, `editor`, `scanner`, `scanner_plus`
 - Organization, event, user and participant CRUD
 - Participant CSV import with column mapping
 - QR preview, single send and bulk send for event participants
@@ -158,6 +158,7 @@ Role overview:
 - `admin` can access only assigned organizations
 - `editor` can access only their own organization
 - `scanner` can access only assigned events while the race office is open
+- `scanner_plus` can access assigned open events like `scanner`, plus update participant data and reassign packages
 
 ## Main endpoint groups
 

@@ -103,6 +103,22 @@ try {
         ");
     }
 
+    $eventsArchivedAtColumnExistsStmt = $pdo->query("
+        SELECT COUNT(*) AS total
+        FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = 'events'
+          AND COLUMN_NAME = 'archived_at'
+    ");
+    $eventsArchivedAtColumnExists = (int)($eventsArchivedAtColumnExistsStmt->fetch()['total'] ?? 0) > 0;
+    if (!$eventsArchivedAtColumnExists) {
+        $pdo->exec("
+            ALTER TABLE events
+            ADD COLUMN archived_at DATETIME NULL AFTER office_close_at,
+            ADD KEY idx_events_archived_at (archived_at)
+        ");
+    }
+
     $loadAdminOrganizationIds = static function (PDO $pdo, string $userId): array {
         $stmt = $pdo->prepare('
             SELECT organization_id
@@ -120,10 +136,12 @@ try {
 
     $loadAssignedEvents = static function (PDO $pdo, string $userId): array {
         $stmt = $pdo->prepare('
-            SELECT event_id
-            FROM user_event_assignments
-            WHERE user_id = :user_id
-            ORDER BY event_id ASC
+            SELECT uea.event_id
+            FROM user_event_assignments uea
+            INNER JOIN events e ON e.id = uea.event_id
+            WHERE uea.user_id = :user_id
+              AND e.archived_at IS NULL
+            ORDER BY uea.event_id ASC
         ');
         $stmt->execute(['user_id' => $userId]);
 
@@ -177,7 +195,8 @@ try {
                 location,
                 organization_id,
                 DATE_FORMAT(office_open_at, "%Y-%m-%dT%H:%i:%s") AS office_open_at,
-                DATE_FORMAT(office_close_at, "%Y-%m-%dT%H:%i:%s") AS office_close_at
+                DATE_FORMAT(office_close_at, "%Y-%m-%dT%H:%i:%s") AS office_close_at,
+                DATE_FORMAT(archived_at, "%Y-%m-%dT%H:%i:%s") AS archived_at
             FROM events
             WHERE id = :id
             LIMIT 1
@@ -195,9 +214,27 @@ try {
                 location,
                 organization_id,
                 DATE_FORMAT(office_open_at, "%Y-%m-%dT%H:%i:%s") AS office_open_at,
-                DATE_FORMAT(office_close_at, "%Y-%m-%dT%H:%i:%s") AS office_close_at
+                DATE_FORMAT(office_close_at, "%Y-%m-%dT%H:%i:%s") AS office_close_at,
+                DATE_FORMAT(archived_at, "%Y-%m-%dT%H:%i:%s") AS archived_at
             FROM events
+            WHERE archived_at IS NULL
             ORDER BY event_date ASC
+        ')->fetchAll();
+    };
+
+    $loadAllArchivedEvents = static function (PDO $pdo): array {
+        return $pdo->query('
+            SELECT
+                id,
+                name,
+                location,
+                organization_id,
+                DATE_FORMAT(office_open_at, "%Y-%m-%dT%H:%i:%s") AS office_open_at,
+                DATE_FORMAT(office_close_at, "%Y-%m-%dT%H:%i:%s") AS office_close_at,
+                DATE_FORMAT(archived_at, "%Y-%m-%dT%H:%i:%s") AS archived_at
+            FROM events
+            WHERE archived_at IS NOT NULL
+            ORDER BY archived_at DESC, event_date DESC
         ')->fetchAll();
     };
 
@@ -218,8 +255,10 @@ try {
 
     $isValidParticipantStatus = static fn(string $status): bool => isset($participantStatuses[$status]);
     $participantStatusCountsAsCheckedIn = static fn(string $status): bool => (bool)($participantStatuses[$status]['counts_as_checked_in'] ?? false);
+    $scannerRoles = ['scanner', 'scanner_plus'];
+    $isScannerRole = static fn(string $role): bool => in_array($role, $scannerRoles, true);
 
-    $loadUserById = static function (PDO $pdo, string $userId) use ($loadAdminOrganizationIds, $loadAssignedEvents): array|false {
+    $loadUserById = static function (PDO $pdo, string $userId) use ($loadAdminOrganizationIds, $loadAssignedEvents, $isScannerRole): array|false {
         $stmt = $pdo->prepare('
             SELECT id, name, email, role, organization_id
             FROM users
@@ -237,14 +276,14 @@ try {
         $user['organization_ids'] = $user['role'] === 'admin'
             ? $loadAdminOrganizationIds($pdo, (string)$user['id'])
             : [];
-        $user['assigned_events'] = $user['role'] === 'scanner'
+        $user['assigned_events'] = $isScannerRole((string)$user['role'])
             ? $loadAssignedEvents($pdo, (string)$user['id'])
             : [];
 
         return $user;
     };
 
-    $loadAllUsers = static function (PDO $pdo) use ($loadAdminOrganizationIds, $loadAssignedEvents): array {
+    $loadAllUsers = static function (PDO $pdo) use ($loadAdminOrganizationIds, $loadAssignedEvents, $isScannerRole): array {
         $users = $pdo->query('
             SELECT id, name, email, role, organization_id
             FROM users
@@ -256,7 +295,7 @@ try {
             $user['organization_ids'] = $user['role'] === 'admin'
                 ? $loadAdminOrganizationIds($pdo, (string)$user['id'])
                 : [];
-            $user['assigned_events'] = $user['role'] === 'scanner'
+            $user['assigned_events'] = $isScannerRole((string)$user['role'])
                 ? $loadAssignedEvents($pdo, (string)$user['id'])
                 : [];
         }
@@ -353,7 +392,7 @@ try {
         return (string)($authUser['organization_id'] ?? '') === $organizationId;
     };
 
-    $canManageTargetUser = static function (array $authUser, array $targetUser): bool {
+    $canManageTargetUser = static function (array $authUser, array $targetUser) use ($isScannerRole): bool {
         if ((string)$authUser['id'] === (string)$targetUser['id']) {
             return false;
         }
@@ -371,7 +410,7 @@ try {
         }
 
         if ($authUser['role'] === 'editor') {
-            return ($targetUser['role'] ?? '') === 'scanner'
+            return $isScannerRole((string)($targetUser['role'] ?? ''))
                 && (string)($targetUser['organization_id'] ?? '') === (string)($authUser['organization_id'] ?? '');
         }
 
@@ -386,7 +425,9 @@ try {
         $eventStmt = $pdo->prepare('
             SELECT id
             FROM events
-            WHERE id = :id AND organization_id = :organization_id
+            WHERE id = :id
+              AND organization_id = :organization_id
+              AND archived_at IS NULL
             LIMIT 1
         ');
 
@@ -404,13 +445,7 @@ try {
         return null;
     };
 
-    $canManageEventParticipants = static function (array $authUser, array $event) use ($canAccessOrganization): bool {
-        if (in_array($authUser['role'], ['superadmin', 'admin', 'editor'], true) === false) {
-            return false;
-        }
-
-        return $canAccessOrganization($authUser, (string)$event['organization_id']);
-    };
+    $isArchivedEvent = static fn(array $event): bool => trim((string)($event['archived_at'] ?? '')) !== '';
 
     $isEventOfficeOpenNow = static function (array $event): bool {
         $openAt = parseLocalDateTimeString((string)($event['office_open_at'] ?? ''));
@@ -421,6 +456,23 @@ try {
 
         $now = new DateTimeImmutable();
         return $now >= $openAt && $now <= $closeAt;
+    };
+
+    $canManageEventParticipants = static function (array $authUser, array $event) use ($canAccessOrganization, $isArchivedEvent, $isEventOfficeOpenNow): bool {
+        if (in_array($authUser['role'], ['superadmin', 'admin', 'editor', 'scanner_plus'], true) === false) {
+            return false;
+        }
+
+        if ($isArchivedEvent($event) && $authUser['role'] !== 'superadmin') {
+            return false;
+        }
+
+        if ($authUser['role'] === 'scanner_plus') {
+            return in_array((string)$event['id'], $authUser['assigned_events'] ?? [], true)
+                && $isEventOfficeOpenNow($event);
+        }
+
+        return $canAccessOrganization($authUser, (string)$event['organization_id']);
     };
 
     $formatEventOfficeWindow = static function (array $event): string {
@@ -438,17 +490,34 @@ try {
         );
     };
 
-    $canAccessEvent = static function (array $authUser, array $event) use ($canAccessOrganization, $isEventOfficeOpenNow): bool {
+    $canAccessEvent = static function (array $authUser, array $event) use ($canAccessOrganization, $isEventOfficeOpenNow, $isArchivedEvent, $isScannerRole): bool {
+        if ($isArchivedEvent($event)) {
+            return $authUser['role'] === 'superadmin'
+                && $canAccessOrganization($authUser, (string)$event['organization_id']);
+        }
+
+        if ($isScannerRole((string)$authUser['role'])) {
+            return in_array((string)$event['id'], $authUser['assigned_events'] ?? [], true)
+                && $isEventOfficeOpenNow($event);
+        }
+
         if ($canAccessOrganization($authUser, (string)$event['organization_id'])) {
             return true;
         }
 
-        if ($authUser['role'] !== 'scanner') {
+        return false;
+    };
+
+    $canViewArchivedEvent = static function (array $authUser, array $event) use ($canAccessOrganization, $isArchivedEvent): bool {
+        if (!$isArchivedEvent($event)) {
             return false;
         }
 
-        return in_array((string)$event['id'], $authUser['assigned_events'] ?? [], true)
-            && $isEventOfficeOpenNow($event);
+        if (in_array($authUser['role'], ['superadmin', 'admin', 'editor'], true) === false) {
+            return false;
+        }
+
+        return $canAccessOrganization($authUser, (string)$event['organization_id']);
     };
 
     $filterAccessibleEvents = static function (array $authUser, array $events) use ($canAccessEvent, $canManageEventParticipants): array {
@@ -462,6 +531,17 @@ try {
 
     $loadAccessibleEvents = static function (PDO $pdo, array $authUser) use ($loadAllEvents, $filterAccessibleEvents): array {
         return $filterAccessibleEvents($authUser, $loadAllEvents($pdo));
+    };
+
+    $filterAccessibleArchivedEvents = static function (array $authUser, array $events) use ($canViewArchivedEvent): array {
+        return array_values(array_filter(
+            $events,
+            static fn(array $event): bool => $canViewArchivedEvent($authUser, $event)
+        ));
+    };
+
+    $loadAccessibleArchivedEvents = static function (PDO $pdo, array $authUser) use ($loadAllArchivedEvents, $filterAccessibleArchivedEvents): array {
+        return $filterAccessibleArchivedEvents($authUser, $loadAllArchivedEvents($pdo));
     };
 
     $filterAccessibleOrganizations = static function (array $authUser, array $organizations, array $accessibleEvents): array {
@@ -491,12 +571,12 @@ try {
         ));
     };
 
-    $filterAccessibleUsers = static function (array $authUser, array $users, array $accessibleOrganizations): array {
+    $filterAccessibleUsers = static function (array $authUser, array $users, array $accessibleOrganizations) use ($isScannerRole): array {
         if ($authUser['role'] === 'superadmin') {
             return array_values($users);
         }
 
-        if ($authUser['role'] === 'scanner') {
+        if ($isScannerRole((string)$authUser['role'])) {
             return array_values(array_filter(
                 $users,
                 static fn(array $user): bool => (string)$user['id'] === (string)$authUser['id']
@@ -715,6 +795,54 @@ try {
             'user_name_snapshot' => $userName,
         ]);
     };
+
+    $archiveExpiredEvents = static function (PDO $pdo) use ($addActivityLog): void {
+        $eventsToArchiveStmt = $pdo->query('
+            SELECT id, name
+            FROM events
+            WHERE archived_at IS NULL
+              AND office_close_at <= DATE_SUB(NOW(), INTERVAL 1 MONTH)
+        ');
+        $eventsToArchive = $eventsToArchiveStmt->fetchAll();
+
+        if ($eventsToArchive === []) {
+            return;
+        }
+
+        $pdo->beginTransaction();
+
+        try {
+            $archiveEventStmt = $pdo->prepare('
+                UPDATE events
+                SET archived_at = UTC_TIMESTAMP()
+                WHERE id = :id
+                  AND archived_at IS NULL
+            ');
+
+            foreach ($eventsToArchive as $event) {
+                $archiveEventStmt->execute(['id' => (string)$event['id']]);
+                if ($archiveEventStmt->rowCount() === 0) {
+                    continue;
+                }
+
+                $addActivityLog(
+                    $pdo,
+                    sprintf('Automatycznie zarchiwizowano wydarzenie: %s', (string)$event['name']),
+                    (string)$event['id']
+                );
+            }
+
+            $pdo->commit();
+        } catch (Throwable $exception) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+
+            throw $exception;
+        }
+    };
+
+    $archiveExpiredEvents($pdo);
 
     $loadParticipantFieldMappings = static function (PDO $pdo, string $eventId): array {
         $stmt = $pdo->prepare('
@@ -996,6 +1124,7 @@ try {
                 'organization_id' => (string)$event['organization_id'],
                 'office_open_at' => (string)$event['office_open_at'],
                 'office_close_at' => (string)$event['office_close_at'],
+                'archived_at' => $event['archived_at'] ?? null,
             ],
             'access' => [
                 'allowed' => $canAccess,
@@ -1339,7 +1468,7 @@ try {
         $user['organization_ids'] = $user['role'] === 'admin'
             ? $loadAdminOrganizationIds($pdo, (string)$user['id'])
             : [];
-        $user['assigned_events'] = $user['role'] === 'scanner'
+        $user['assigned_events'] = $isScannerRole((string)$user['role'])
             ? $loadAssignedEvents($pdo, (string)$user['id'])
             : [];
         unset($user['password']);
@@ -1522,20 +1651,27 @@ try {
     if ($path === '/bootstrap' && $method === 'GET') {
         $authUser = requireAuth($resolveAuthenticatedUser);
         $events = $loadAccessibleEvents($pdo, $authUser);
+        $archivedEvents = $loadAccessibleArchivedEvents($pdo, $authUser);
         $organizations = $filterAccessibleOrganizations($authUser, $loadAllOrganizations($pdo), $events);
         $users = $filterAccessibleUsers($authUser, $loadAllUsers($pdo), $organizations);
         $accessibleEventIds = array_map(
             static fn(array $event): string => (string)$event['id'],
             $events
         );
+        $accessibleArchivedEventIds = array_map(
+            static fn(array $event): string => (string)$event['id'],
+            $archivedEvents
+        );
         $participants = $loadParticipantsByEventIds($pdo, $accessibleEventIds);
+        $archivedParticipants = $loadParticipantsByEventIds($pdo, $accessibleArchivedEventIds);
+        $participants = array_merge($participants, $archivedParticipants);
         $accessibleParticipantIds = array_map(
             static fn(array $participant): string => (string)$participant['id'],
             $participants
         );
         $activityLogs = $filterAccessibleActivityLogs(
             $loadAllActivityLogs($pdo),
-            $accessibleEventIds,
+            array_merge($accessibleEventIds, $accessibleArchivedEventIds),
             $accessibleParticipantIds
         );
 
@@ -1543,6 +1679,7 @@ try {
             'data' => [
                 'organizations' => $organizations,
                 'events' => $events,
+                'archivedEvents' => $archivedEvents,
                 'users' => $users,
                 'participants' => $participants,
                 'activityLog' => $activityLogs,
@@ -1689,7 +1826,7 @@ try {
             $eventLimitValue = (int)$eventLimit;
         }
 
-        $eventCountStmt = $pdo->prepare('SELECT COUNT(*) AS total FROM events WHERE organization_id = :organization_id');
+        $eventCountStmt = $pdo->prepare('SELECT COUNT(*) AS total FROM events WHERE organization_id = :organization_id AND archived_at IS NULL');
         $eventCountStmt->execute(['organization_id' => $organizationId]);
         $eventCount = (int)($eventCountStmt->fetch()['total'] ?? 0);
         if ($eventLimitValue < $eventCount) {
@@ -1839,7 +1976,7 @@ try {
             exit;
         }
 
-        $eventCountStmt = $pdo->prepare('SELECT COUNT(*) AS total FROM events WHERE organization_id = :organization_id');
+        $eventCountStmt = $pdo->prepare('SELECT COUNT(*) AS total FROM events WHERE organization_id = :organization_id AND archived_at IS NULL');
         $eventCountStmt->execute(['organization_id' => $organizationId]);
         $eventCount = (int)($eventCountStmt->fetch()['total'] ?? 0);
 
@@ -1925,7 +2062,7 @@ try {
             exit;
         }
 
-        if (!$canAccessEvent($authUser, $event)) {
+        if (!$canAccessEvent($authUser, $event) && !$canViewArchivedEvent($authUser, $event)) {
             jsonResponse(403, ['error' => 'Forbidden']);
             exit;
         }
@@ -1944,7 +2081,7 @@ try {
             exit;
         }
 
-        if (!$canAccessOrganization($authUser, (string)$event['organization_id'])) {
+        if (!$canManageEventParticipants($authUser, $event)) {
             jsonResponse(403, ['error' => 'Forbidden']);
             exit;
         }
@@ -2024,8 +2161,19 @@ try {
             exit;
         }
 
-        if (!$canAccessOrganization($authUser, (string)$event['organization_id'])) {
+        if (!$canManageEventParticipants($authUser, $event)) {
             jsonResponse(403, ['error' => 'Forbidden']);
+            exit;
+        }
+
+        if (trim((string)($event['archived_at'] ?? '')) !== '') {
+            jsonResponse(422, ['error' => 'Event is already archived']);
+            exit;
+        }
+
+        $officeCloseAt = parseLocalDateTimeString((string)($event['office_close_at'] ?? ''));
+        if ($officeCloseAt === null || new DateTimeImmutable() <= $officeCloseAt) {
+            jsonResponse(422, ['error' => 'Only finished events can be archived']);
             exit;
         }
 
@@ -2038,7 +2186,7 @@ try {
         try {
             $addActivityLog(
                 $pdo,
-                sprintf('Usunięto wydarzenie: %s (%d uczestników)', (string)$event['name'], $participantCount),
+                sprintf('Zarchiwizowano wydarzenie: %s (%d uczestnikow)', (string)$event['name'], $participantCount),
                 $eventId,
                 null,
                 null,
@@ -2046,11 +2194,8 @@ try {
                 (string)$authUser['name']
             );
 
-            $deleteParticipantsStmt = $pdo->prepare('DELETE FROM participants WHERE event_id = :event_id');
-            $deleteParticipantsStmt->execute(['event_id' => $eventId]);
-
-            $deleteEventStmt = $pdo->prepare('DELETE FROM events WHERE id = :id');
-            $deleteEventStmt->execute(['id' => $eventId]);
+            $archiveEventStmt = $pdo->prepare('UPDATE events SET archived_at = UTC_TIMESTAMP() WHERE id = :id');
+            $archiveEventStmt->execute(['id' => $eventId]);
 
             $pdo->commit();
         } catch (Throwable $exception) {
@@ -2642,7 +2787,7 @@ try {
     }
 
     if (preg_match('#^/events/([^/]+)/participant-field-mappings$#', $path, $matches) === 1 && $method === 'GET') {
-        $authUser = requireAnyRole(['superadmin', 'admin', 'editor'], $resolveAuthenticatedUser);
+        $authUser = requireAnyRole(['superadmin', 'admin', 'editor', 'scanner_plus'], $resolveAuthenticatedUser);
         $eventId = (string)$matches[1];
         $event = $loadEventById($pdo, $eventId);
 
@@ -2750,10 +2895,11 @@ try {
             exit;
         }
 
-        $eventCountStmt = $pdo->prepare('SELECT COUNT(*) AS total FROM events WHERE organization_id = :organization_id');
+        $eventCountStmt = $pdo->prepare('SELECT COUNT(*) AS total FROM events WHERE organization_id = :organization_id AND archived_at IS NULL');
         $eventCountStmt->execute(['organization_id' => $organizationId]);
         $eventCount = (int)($eventCountStmt->fetch()['total'] ?? 0);
         $eventLimitValue = (int)$eventLimit;
+        $previousEventLimitValue = (int)$organization['event_limit'];
 
         if ($eventLimitValue < $eventCount) {
             jsonResponse(422, ['error' => 'event_limit cannot be lower than the current number of events']);
@@ -2768,7 +2914,9 @@ try {
 
         $addActivityLog(
             $pdo,
-            sprintf('Zmieniono limit wydarzeń organizacji %s na %d', (string)$organization['name'], $eventLimitValue),
+            $eventLimitValue > $previousEventLimitValue
+                ? sprintf('Zwiększono limit wydarzeń organizacji %s z %d do %d', (string)$organization['name'], $previousEventLimitValue, $eventLimitValue)
+                : sprintf('Zmieniono limit wydarzeń organizacji %s z %d do %d', (string)$organization['name'], $previousEventLimitValue, $eventLimitValue),
             null,
             null,
             null,
@@ -2804,9 +2952,9 @@ try {
         }
 
         $allowedRolesByCreator = [
-            'superadmin' => ['admin', 'editor', 'scanner'],
-            'admin' => ['editor', 'scanner'],
-            'editor' => ['scanner'],
+            'superadmin' => ['admin', 'editor', 'scanner', 'scanner_plus'],
+            'admin' => ['editor', 'scanner', 'scanner_plus'],
+            'editor' => ['scanner', 'scanner_plus'],
         ];
 
         if (!in_array($role, $allowedRolesByCreator[(string)$authUser['role']] ?? [], true)) {
@@ -2899,7 +3047,7 @@ try {
                 ]);
             }
 
-            if ($role === 'scanner' && $assignedEvents !== []) {
+            if ($isScannerRole($role) && $assignedEvents !== []) {
                 $assignmentStmt = $pdo->prepare('
                     INSERT INTO user_event_assignments (user_id, event_id)
                     VALUES (:user_id, :event_id)
@@ -2980,7 +3128,7 @@ try {
             exit;
         }
 
-        if (($targetUser['role'] ?? '') !== 'scanner') {
+        if (!$isScannerRole((string)($targetUser['role'] ?? ''))) {
             jsonResponse(422, ['error' => 'Only scanners can have event assignments']);
             exit;
         }
@@ -3084,9 +3232,9 @@ try {
         }
 
         $allowedRolesByCreator = [
-            'superadmin' => ['admin', 'editor', 'scanner'],
-            'admin' => ['editor', 'scanner'],
-            'editor' => ['scanner'],
+            'superadmin' => ['admin', 'editor', 'scanner', 'scanner_plus'],
+            'admin' => ['editor', 'scanner', 'scanner_plus'],
+            'editor' => ['scanner', 'scanner_plus'],
         ];
 
         if (!in_array($role, $allowedRolesByCreator[(string)$authUser['role']] ?? [], true)) {
@@ -3151,7 +3299,7 @@ try {
             exit;
         }
 
-        if (!in_array((string)($targetUser['role'] ?? ''), ['editor', 'scanner'], true)) {
+        if (!in_array((string)($targetUser['role'] ?? ''), ['editor', 'scanner', 'scanner_plus'], true)) {
             jsonResponse(422, ['error' => 'Only organizer and scanner accounts can receive an admin-triggered password reset']);
             exit;
         }
@@ -3199,7 +3347,7 @@ try {
             exit;
         }
 
-        if (!in_array((string)($targetUser['role'] ?? ''), ['editor', 'scanner'], true)) {
+        if (!in_array((string)($targetUser['role'] ?? ''), ['editor', 'scanner', 'scanner_plus'], true)) {
             jsonResponse(422, ['error' => 'Only organizer and scanner accounts can be archived']);
             exit;
         }
@@ -3489,7 +3637,7 @@ try {
     }
 
     if (preg_match('#^/participants/(\d+)$#', $path, $matches) === 1 && $method === 'PATCH') {
-        $authUser = requireAnyRole(['superadmin', 'admin', 'editor'], $resolveAuthenticatedUser);
+        $authUser = requireAnyRole(['superadmin', 'admin', 'editor', 'scanner_plus'], $resolveAuthenticatedUser);
         $participant = $loadParticipantById($pdo, (int)$matches[1]);
 
         if ($participant === false) {
