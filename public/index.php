@@ -119,6 +119,88 @@ try {
         ");
     }
 
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS event_sync_state (
+            event_id VARCHAR(64) NOT NULL,
+            sync_mode ENUM('cloud', 'local_authoritative') NOT NULL DEFAULT 'cloud',
+            source_node_id VARCHAR(128) NULL,
+            sync_status ENUM('idle', 'pending', 'syncing', 'conflict') NOT NULL DEFAULT 'idle',
+            conflicts_count INT UNSIGNED NOT NULL DEFAULT 0,
+            last_exported_at DATETIME NULL,
+            last_synced_at DATETIME NULL,
+            last_report_json LONGTEXT NULL,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (event_id),
+            KEY idx_event_sync_state_sync_mode (sync_mode),
+            CONSTRAINT fk_event_sync_state_event
+                FOREIGN KEY (event_id) REFERENCES events(id)
+                ON DELETE CASCADE
+                ON UPDATE CASCADE
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    ");
+
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS client_mutations (
+            id VARCHAR(64) NOT NULL,
+            mutation_type VARCHAR(64) NOT NULL DEFAULT 'participant_status',
+            participant_id BIGINT UNSIGNED NOT NULL,
+            event_id VARCHAR(64) NOT NULL,
+            device_id VARCHAR(128) NULL,
+            source_node_id VARCHAR(128) NULL,
+            user_id VARCHAR(64) NULL,
+            base_status ENUM('not_checked_in', 'checked_in', 'checked_in_not_starting') NOT NULL,
+            requested_status ENUM('not_checked_in', 'checked_in', 'checked_in_not_starting') NOT NULL,
+            applied_status ENUM('not_checked_in', 'checked_in', 'checked_in_not_starting') NOT NULL,
+            response_json LONGTEXT NULL,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (id),
+            KEY idx_client_mutations_event_id (event_id),
+            KEY idx_client_mutations_participant_id (participant_id),
+            KEY idx_client_mutations_user_id (user_id),
+            CONSTRAINT fk_client_mutations_event
+                FOREIGN KEY (event_id) REFERENCES events(id)
+                ON DELETE CASCADE
+                ON UPDATE CASCADE,
+            CONSTRAINT fk_client_mutations_participant
+                FOREIGN KEY (participant_id) REFERENCES participants(id)
+                ON DELETE CASCADE
+                ON UPDATE CASCADE,
+            CONSTRAINT fk_client_mutations_user
+                FOREIGN KEY (user_id) REFERENCES users(id)
+                ON DELETE SET NULL
+                ON UPDATE CASCADE
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    ");
+
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS sync_outbox (
+            id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+            client_mutation_id VARCHAR(64) NULL,
+            event_id VARCHAR(64) NOT NULL,
+            source_node_id VARCHAR(128) NULL,
+            entity_type VARCHAR(64) NOT NULL,
+            entity_id VARCHAR(64) NOT NULL,
+            action VARCHAR(64) NOT NULL,
+            payload_json LONGTEXT NOT NULL,
+            status ENUM('pending', 'sent', 'applied', 'conflict') NOT NULL DEFAULT 'pending',
+            attempts INT UNSIGNED NOT NULL DEFAULT 0,
+            last_error VARCHAR(255) NULL,
+            sent_at DATETIME NULL,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (id),
+            KEY idx_sync_outbox_event_id (event_id),
+            KEY idx_sync_outbox_status (status),
+            KEY idx_sync_outbox_client_mutation_id (client_mutation_id),
+            CONSTRAINT fk_sync_outbox_event
+                FOREIGN KEY (event_id) REFERENCES events(id)
+                ON DELETE CASCADE
+                ON UPDATE CASCADE
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    ");
+
     $loadAdminOrganizationIds = static function (PDO $pdo, string $userId): array {
         $stmt = $pdo->prepare('
             SELECT organization_id
@@ -134,16 +216,22 @@ try {
         );
     };
 
-    $loadAssignedEvents = static function (PDO $pdo, string $userId): array {
+    $currentLocalDateTime = static fn(): string => (new DateTimeImmutable())->format('Y-m-d H:i:s');
+
+    $loadAssignedEvents = static function (PDO $pdo, string $userId) use ($currentLocalDateTime): array {
         $stmt = $pdo->prepare('
             SELECT uea.event_id
             FROM user_event_assignments uea
             INNER JOIN events e ON e.id = uea.event_id
             WHERE uea.user_id = :user_id
               AND e.archived_at IS NULL
+              AND e.office_close_at > :current_time
             ORDER BY uea.event_id ASC
         ');
-        $stmt->execute(['user_id' => $userId]);
+        $stmt->execute([
+            'user_id' => $userId,
+            'current_time' => $currentLocalDateTime(),
+        ]);
 
         return array_map(
             static fn(array $row): string => (string)$row['event_id'],
@@ -417,7 +505,7 @@ try {
         return false;
     };
 
-    $validateScannerAssignments = static function (PDO $pdo, string $organizationId, array $assignedEvents): ?string {
+    $validateScannerAssignments = static function (PDO $pdo, string $organizationId, array $assignedEvents) use ($currentLocalDateTime): ?string {
         if ($assignedEvents === []) {
             return null;
         }
@@ -428,6 +516,7 @@ try {
             WHERE id = :id
               AND organization_id = :organization_id
               AND archived_at IS NULL
+              AND office_close_at > :current_time
             LIMIT 1
         ');
 
@@ -435,10 +524,11 @@ try {
             $eventStmt->execute([
                 'id' => $eventId,
                 'organization_id' => $organizationId,
+                'current_time' => $currentLocalDateTime(),
             ]);
 
             if ($eventStmt->fetch() === false) {
-                return 'All assigned_events must belong to the same organization as the scanner';
+                return 'All assigned_events must belong to the same organization as the scanner and refer to current or upcoming events';
             }
         }
 
@@ -794,6 +884,240 @@ try {
             'user_id' => $userId,
             'user_name_snapshot' => $userName,
         ]);
+    };
+
+    $buildBootstrapSnapshotVersion = static function (array $payload): string {
+        $encoded = json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+
+        return 'snapshot-' . hash('sha256', $encoded === false ? serialize($payload) : $encoded);
+    };
+
+    $loadEventSyncState = static function (PDO $pdo, string $eventId): array|false {
+        $stmt = $pdo->prepare('
+            SELECT
+                event_id,
+                sync_mode,
+                source_node_id,
+                sync_status,
+                conflicts_count,
+                DATE_FORMAT(last_exported_at, "%Y-%m-%dT%H:%i:%s") AS last_exported_at,
+                DATE_FORMAT(last_synced_at, "%Y-%m-%dT%H:%i:%s") AS last_synced_at,
+                last_report_json
+            FROM event_sync_state
+            WHERE event_id = :event_id
+            LIMIT 1
+        ');
+        $stmt->execute(['event_id' => $eventId]);
+
+        $state = $stmt->fetch();
+        if ($state === false) {
+            return false;
+        }
+
+        $state['last_report'] = $state['last_report_json']
+            ? json_decode((string)$state['last_report_json'], true)
+            : null;
+        unset($state['last_report_json']);
+
+        return $state;
+    };
+
+    $saveEventSyncState = static function (
+        PDO $pdo,
+        string $eventId,
+        array $patch
+    ) use ($loadEventSyncState): array {
+        $currentState = $loadEventSyncState($pdo, $eventId);
+        $nextState = [
+            'sync_mode' => (string)($patch['sync_mode'] ?? ($currentState['sync_mode'] ?? 'cloud')),
+            'source_node_id' => $patch['source_node_id'] ?? ($currentState['source_node_id'] ?? null),
+            'sync_status' => (string)($patch['sync_status'] ?? ($currentState['sync_status'] ?? 'idle')),
+            'conflicts_count' => (int)($patch['conflicts_count'] ?? ($currentState['conflicts_count'] ?? 0)),
+            'last_exported_at' => $patch['last_exported_at'] ?? ($currentState['last_exported_at'] ?? null),
+            'last_synced_at' => $patch['last_synced_at'] ?? ($currentState['last_synced_at'] ?? null),
+            'last_report_json' => array_key_exists('last_report', $patch)
+                ? json_encode($patch['last_report'], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)
+                : (($currentState['last_report'] ?? null) !== null
+                    ? json_encode($currentState['last_report'], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)
+                    : null),
+        ];
+
+        $stmt = $pdo->prepare('
+            INSERT INTO event_sync_state (
+                event_id,
+                sync_mode,
+                source_node_id,
+                sync_status,
+                conflicts_count,
+                last_exported_at,
+                last_synced_at,
+                last_report_json
+            ) VALUES (
+                :event_id,
+                :sync_mode,
+                :source_node_id,
+                :sync_status,
+                :conflicts_count,
+                :last_exported_at,
+                :last_synced_at,
+                :last_report_json
+            )
+            ON DUPLICATE KEY UPDATE
+                sync_mode = VALUES(sync_mode),
+                source_node_id = VALUES(source_node_id),
+                sync_status = VALUES(sync_status),
+                conflicts_count = VALUES(conflicts_count),
+                last_exported_at = VALUES(last_exported_at),
+                last_synced_at = VALUES(last_synced_at),
+                last_report_json = VALUES(last_report_json)
+        ');
+        $stmt->bindValue(':event_id', $eventId, PDO::PARAM_STR);
+        $stmt->bindValue(':sync_mode', $nextState['sync_mode'], PDO::PARAM_STR);
+        $stmt->bindValue(':source_node_id', $nextState['source_node_id'], $nextState['source_node_id'] === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
+        $stmt->bindValue(':sync_status', $nextState['sync_status'], PDO::PARAM_STR);
+        $stmt->bindValue(':conflicts_count', $nextState['conflicts_count'], PDO::PARAM_INT);
+        $stmt->bindValue(':last_exported_at', $nextState['last_exported_at'], $nextState['last_exported_at'] === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
+        $stmt->bindValue(':last_synced_at', $nextState['last_synced_at'], $nextState['last_synced_at'] === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
+        $stmt->bindValue(':last_report_json', $nextState['last_report_json'], $nextState['last_report_json'] === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
+        $stmt->execute();
+
+        return $loadEventSyncState($pdo, $eventId) ?: [];
+    };
+
+    $loadClientMutationById = static function (PDO $pdo, string $mutationId): array|false {
+        $stmt = $pdo->prepare('
+            SELECT id, mutation_type, participant_id, event_id, device_id, source_node_id, user_id, base_status, requested_status, applied_status, response_json
+            FROM client_mutations
+            WHERE id = :id
+            LIMIT 1
+        ');
+        $stmt->execute(['id' => $mutationId]);
+
+        $mutation = $stmt->fetch();
+        if ($mutation === false) {
+            return false;
+        }
+
+        $mutation['response'] = $mutation['response_json']
+            ? json_decode((string)$mutation['response_json'], true)
+            : null;
+        unset($mutation['response_json']);
+
+        return $mutation;
+    };
+
+    $recordClientMutation = static function (
+        PDO $pdo,
+        string $mutationId,
+        int $participantId,
+        string $eventId,
+        ?string $deviceId,
+        ?string $sourceNodeId,
+        ?string $userId,
+        string $baseStatus,
+        string $requestedStatus,
+        string $appliedStatus,
+        array $response
+    ): void {
+        $stmt = $pdo->prepare('
+            INSERT INTO client_mutations (
+                id,
+                participant_id,
+                event_id,
+                device_id,
+                source_node_id,
+                user_id,
+                base_status,
+                requested_status,
+                applied_status,
+                response_json
+            ) VALUES (
+                :id,
+                :participant_id,
+                :event_id,
+                :device_id,
+                :source_node_id,
+                :user_id,
+                :base_status,
+                :requested_status,
+                :applied_status,
+                :response_json
+            )
+            ON DUPLICATE KEY UPDATE
+                device_id = VALUES(device_id),
+                source_node_id = VALUES(source_node_id),
+                user_id = VALUES(user_id),
+                base_status = VALUES(base_status),
+                requested_status = VALUES(requested_status),
+                applied_status = VALUES(applied_status),
+                response_json = VALUES(response_json)
+        ');
+        $responseJson = json_encode($response, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        $stmt->bindValue(':id', $mutationId, PDO::PARAM_STR);
+        $stmt->bindValue(':participant_id', $participantId, PDO::PARAM_INT);
+        $stmt->bindValue(':event_id', $eventId, PDO::PARAM_STR);
+        $stmt->bindValue(':device_id', $deviceId, $deviceId === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
+        $stmt->bindValue(':source_node_id', $sourceNodeId, $sourceNodeId === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
+        $stmt->bindValue(':user_id', $userId, $userId === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
+        $stmt->bindValue(':base_status', $baseStatus, PDO::PARAM_STR);
+        $stmt->bindValue(':requested_status', $requestedStatus, PDO::PARAM_STR);
+        $stmt->bindValue(':applied_status', $appliedStatus, PDO::PARAM_STR);
+        $stmt->bindValue(':response_json', $responseJson === false ? null : $responseJson, $responseJson === false ? PDO::PARAM_NULL : PDO::PARAM_STR);
+        $stmt->execute();
+    };
+
+    $enqueueSyncOutbox = static function (
+        PDO $pdo,
+        string $eventId,
+        string $entityType,
+        string $entityId,
+        string $action,
+        array $payload,
+        ?string $clientMutationId = null,
+        ?string $sourceNodeId = null
+    ): void {
+        $stmt = $pdo->prepare('
+            INSERT INTO sync_outbox (
+                client_mutation_id,
+                event_id,
+                source_node_id,
+                entity_type,
+                entity_id,
+                action,
+                payload_json
+            ) VALUES (
+                :client_mutation_id,
+                :event_id,
+                :source_node_id,
+                :entity_type,
+                :entity_id,
+                :action,
+                :payload_json
+            )
+        ');
+        $payloadJson = json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        $stmt->bindValue(':client_mutation_id', $clientMutationId, $clientMutationId === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
+        $stmt->bindValue(':event_id', $eventId, PDO::PARAM_STR);
+        $stmt->bindValue(':source_node_id', $sourceNodeId, $sourceNodeId === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
+        $stmt->bindValue(':entity_type', $entityType, PDO::PARAM_STR);
+        $stmt->bindValue(':entity_id', $entityId, PDO::PARAM_STR);
+        $stmt->bindValue(':action', $action, PDO::PARAM_STR);
+        $stmt->bindValue(':payload_json', $payloadJson === false ? '{}' : $payloadJson, PDO::PARAM_STR);
+        $stmt->execute();
+    };
+
+    $loadAssignedUsersForEvent = static function (PDO $pdo, string $eventId): array {
+        $stmt = $pdo->prepare('
+            SELECT u.id, u.name, u.email, u.role, u.organization_id
+            FROM users u
+            INNER JOIN user_event_assignments uea ON uea.user_id = u.id
+            WHERE uea.event_id = :event_id
+              AND u.archived_at IS NULL
+            ORDER BY u.name ASC
+        ');
+        $stmt->execute(['event_id' => $eventId]);
+
+        return $stmt->fetchAll();
     };
 
     $archiveExpiredEvents = static function (PDO $pdo) use ($addActivityLog): void {
@@ -1674,16 +1998,20 @@ try {
             array_merge($accessibleEventIds, $accessibleArchivedEventIds),
             $accessibleParticipantIds
         );
+        $bootstrapData = [
+            'organizations' => $organizations,
+            'events' => $events,
+            'archivedEvents' => $archivedEvents,
+            'users' => $users,
+            'participants' => $participants,
+            'activityLog' => $activityLogs,
+        ];
+        $generatedAt = gmdate(DATE_ATOM);
 
         jsonResponse(200, [
-            'data' => [
-                'organizations' => $organizations,
-                'events' => $events,
-                'archivedEvents' => $archivedEvents,
-                'users' => $users,
-                'participants' => $participants,
-                'activityLog' => $activityLogs,
-            ],
+            'generated_at' => $generatedAt,
+            'snapshot_version' => $buildBootstrapSnapshotVersion($bootstrapData),
+            'data' => $bootstrapData,
         ]);
         exit;
     }
@@ -2068,6 +2396,43 @@ try {
         }
 
         jsonResponse(200, ['data' => $event]);
+        exit;
+    }
+
+    if (preg_match('#^/events/([^/]+)/export-package$#', $path, $matches) === 1 && $method === 'GET') {
+        $authUser = requireAnyRole(['superadmin', 'admin', 'editor'], $resolveAuthenticatedUser);
+        $eventId = (string)$matches[1];
+        $event = $loadEventById($pdo, $eventId);
+
+        if ($event === false) {
+            jsonResponse(404, ['error' => 'Event not found']);
+            exit;
+        }
+
+        if (!$canManageEventParticipants($authUser, $event)) {
+            jsonResponse(403, ['error' => 'Forbidden']);
+            exit;
+        }
+
+        $participants = $loadParticipantsByEventIds($pdo, [$eventId]);
+        $mappings = $loadParticipantFieldMappings($pdo, $eventId);
+        $assignedUsers = $loadAssignedUsersForEvent($pdo, $eventId);
+        $exportedAt = gmdate(DATE_ATOM);
+        $syncState = $saveEventSyncState($pdo, $eventId, [
+            'sync_status' => 'pending',
+            'last_exported_at' => gmdate('Y-m-d H:i:s'),
+        ]);
+
+        jsonResponse(200, [
+            'exported_at' => $exportedAt,
+            'data' => [
+                'event' => $event,
+                'participants' => $participants,
+                'mappings' => $mappings,
+                'assigned_users' => $assignedUsers,
+                'sync_state' => $syncState,
+            ],
+        ]);
         exit;
     }
 
@@ -3060,7 +3425,7 @@ try {
                     ]);
                     $addActivityLog(
                         $pdo,
-                        sprintf('Przypisano skanera %s do wydarzenia', $name),
+                        sprintf('Przypisano operatora %s do wydarzenia', $name),
                         $eventId,
                         null,
                         null,
@@ -3180,7 +3545,7 @@ try {
             foreach ($addedEventIds as $eventId) {
                 $addActivityLog(
                     $pdo,
-                    sprintf('Przypisano skanera %s do wydarzenia', (string)$targetUser['name']),
+                    sprintf('Przypisano operatora %s do wydarzenia', (string)$targetUser['name']),
                     $eventId,
                     null,
                     null,
@@ -3192,7 +3557,7 @@ try {
             foreach ($removedEventIds as $eventId) {
                 $addActivityLog(
                     $pdo,
-                    sprintf('Usunieto skanera %s z wydarzenia', (string)$targetUser['name']),
+                    sprintf('Usunieto operatora %s z wydarzenia', (string)$targetUser['name']),
                     $eventId,
                     null,
                     null,
@@ -3269,6 +3634,97 @@ try {
             if ($role === 'editor') {
                 $deleteAssignmentsStmt = $pdo->prepare('DELETE FROM user_event_assignments WHERE user_id = :user_id');
                 $deleteAssignmentsStmt->execute(['user_id' => $userId]);
+            }
+
+            $pdo->commit();
+        } catch (Throwable $exception) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+
+            throw $exception;
+        }
+
+        jsonResponse(200, ['data' => $loadUserById($pdo, $userId)]);
+        exit;
+    }
+
+    if (preg_match('#^/users/([^/]+)$#', $path, $matches) === 1 && $method === 'PATCH') {
+        $authUser = requireAnyRole(['superadmin', 'admin', 'editor'], $resolveAuthenticatedUser);
+        $userId = (string)$matches[1];
+        $input = readJsonBody();
+        $name = trim((string)($input['name'] ?? ''));
+        $email = normalizeEmailAddress((string)($input['email'] ?? ''));
+
+        if ($name === '' || $email === '') {
+            jsonResponse(422, ['error' => 'name and email are required']);
+            exit;
+        }
+
+        if (!isValidEmailAddress($email)) {
+            jsonResponse(422, ['error' => 'email must be a valid email address']);
+            exit;
+        }
+
+        $targetUser = $loadUserById($pdo, $userId);
+        if ($targetUser === false) {
+            jsonResponse(404, ['error' => 'User not found']);
+            exit;
+        }
+
+        if (!$canManageTargetUser($authUser, $targetUser)) {
+            jsonResponse(403, ['error' => 'Forbidden']);
+            exit;
+        }
+
+        if (in_array((string)($targetUser['role'] ?? ''), ['admin', 'superadmin'], true)) {
+            jsonResponse(422, ['error' => 'Only organizer and scanner accounts can be updated']);
+            exit;
+        }
+
+        $emailOwnerStmt = $pdo->prepare('
+            SELECT id
+            FROM users
+            WHERE email = :email
+              AND archived_at IS NULL
+              AND id <> :id
+            LIMIT 1
+        ');
+        $emailOwnerStmt->execute([
+            'email' => $email,
+            'id' => $userId,
+        ]);
+
+        if ($emailOwnerStmt->fetch() !== false) {
+            jsonResponse(409, ['error' => 'User with this email already exists']);
+            exit;
+        }
+
+        $pdo->beginTransaction();
+
+        try {
+            $updateStmt = $pdo->prepare('
+                UPDATE users
+                SET name = :name,
+                    email = :email
+                WHERE id = :id
+            ');
+            $updateStmt->execute([
+                'name' => $name,
+                'email' => $email,
+                'id' => $userId,
+            ]);
+
+            if ($name !== (string)$targetUser['name'] || $email !== (string)$targetUser['email']) {
+                $addActivityLog(
+                    $pdo,
+                    sprintf('Zaktualizowano dane uzytkownika: %s', $name),
+                    null,
+                    null,
+                    null,
+                    (string)$authUser['id'],
+                    (string)$authUser['name']
+                );
             }
 
             $pdo->commit();
@@ -3586,6 +4042,144 @@ try {
         exit;
     }
 
+    if ($path === '/sync/ingest' && $method === 'POST') {
+        $authUser = requireAnyRole(['superadmin', 'admin', 'editor'], $resolveAuthenticatedUser);
+        $input = readJsonBody();
+        $eventId = trim((string)($input['event_id'] ?? ''));
+        $sourceNodeId = trim((string)($input['source_node_id'] ?? ''));
+        $mutations = is_array($input['mutations'] ?? null) ? $input['mutations'] : [];
+
+        if ($eventId === '') {
+            jsonResponse(422, ['error' => 'event_id is required']);
+            exit;
+        }
+
+        if ($mutations === []) {
+            jsonResponse(422, ['error' => 'mutations are required']);
+            exit;
+        }
+
+        $event = $loadEventById($pdo, $eventId);
+        if ($event === false) {
+            jsonResponse(404, ['error' => 'Event not found']);
+            exit;
+        }
+
+        if (!$canManageEventParticipants($authUser, $event)) {
+            jsonResponse(403, ['error' => 'Forbidden']);
+            exit;
+        }
+
+        $report = [
+            'sent' => count($mutations),
+            'applied' => 0,
+            'conflicts' => 0,
+            'duplicates' => 0,
+            'errors' => [],
+        ];
+
+        foreach ($mutations as $index => $mutation) {
+            if (!is_array($mutation)) {
+                $report['errors'][] = ['index' => $index, 'error' => 'Invalid mutation payload'];
+                continue;
+            }
+
+            $clientMutationId = trim((string)($mutation['client_mutation_id'] ?? ''));
+            $participantId = (int)($mutation['participant_id'] ?? 0);
+            $requestedStatus = trim((string)($mutation['requested_status'] ?? $mutation['next_status'] ?? ''));
+            $baseStatus = trim((string)($mutation['base_status'] ?? ''));
+            $deviceId = trim((string)($mutation['device_id'] ?? ''));
+
+            if ($clientMutationId === '' || !$isValidParticipantStatus($requestedStatus) || !$isValidParticipantStatus($baseStatus)) {
+                $report['errors'][] = ['index' => $index, 'error' => 'Mutation must include client_mutation_id, requested_status and base_status'];
+                continue;
+            }
+
+            $participant = $loadParticipantById($pdo, $participantId);
+            if ($participant === false || (string)($participant['event_id'] ?? '') !== $eventId) {
+                $report['errors'][] = ['index' => $index, 'error' => 'Participant not found in the target event'];
+                continue;
+            }
+
+            $existingMutation = $loadClientMutationById($pdo, $clientMutationId);
+            if ($existingMutation !== false) {
+                $report['duplicates']++;
+                continue;
+            }
+
+            if ((string)$participant['status'] !== $baseStatus) {
+                $report['conflicts']++;
+                $report['errors'][] = [
+                    'index' => $index,
+                    'error' => 'state_conflict',
+                    'participant_id' => (int)$participant['id'],
+                    'current_status' => (string)$participant['status'],
+                ];
+                continue;
+            }
+
+            $pdo->beginTransaction();
+
+            try {
+                if ($requestedStatus !== (string)$participant['status']) {
+                    $participant = $updateParticipantStatus($pdo, $participant, $requestedStatus);
+                    $addActivityLog(
+                        $pdo,
+                        sprintf('Zsynchronizowano status uczestnika z wezla lokalnego na %s', $requestedStatus),
+                        (string)$participant['event_id'],
+                        (int)$participant['id'],
+                        (string)$participant['display_name'],
+                        (string)$authUser['id'],
+                        (string)$authUser['name']
+                    );
+                } else {
+                    $participant = $loadParticipantById($pdo, (int)$participant['id']) ?: $participant;
+                }
+
+                $recordClientMutation(
+                    $pdo,
+                    $clientMutationId,
+                    (int)$participant['id'],
+                    (string)$participant['event_id'],
+                    $deviceId !== '' ? $deviceId : null,
+                    $sourceNodeId !== '' ? $sourceNodeId : null,
+                    (string)$authUser['id'],
+                    $baseStatus,
+                    $requestedStatus,
+                    (string)$participant['status'],
+                    ['data' => $participant]
+                );
+
+                $pdo->commit();
+                $report['applied']++;
+            } catch (Throwable $exception) {
+                if ($pdo->inTransaction()) {
+                    $pdo->rollBack();
+                }
+
+                $report['errors'][] = [
+                    'index' => $index,
+                    'error' => $exception->getMessage(),
+                ];
+            }
+        }
+
+        $syncState = $saveEventSyncState($pdo, $eventId, [
+            'sync_mode' => $sourceNodeId !== '' ? 'local_authoritative' : 'cloud',
+            'source_node_id' => $sourceNodeId !== '' ? $sourceNodeId : null,
+            'sync_status' => $report['conflicts'] > 0 ? 'conflict' : 'idle',
+            'conflicts_count' => $report['conflicts'],
+            'last_synced_at' => gmdate('Y-m-d H:i:s'),
+            'last_report' => $report,
+        ]);
+
+        jsonResponse(200, [
+            'data' => $report,
+            'event_sync_state' => $syncState,
+        ]);
+        exit;
+    }
+
     if ($path === '/participants/scan' && $method === 'POST') {
         $authUser = requireAuth($resolveAuthenticatedUser);
         $input = readJsonBody();
@@ -3655,9 +4249,29 @@ try {
         $nextStatus = trim((string)($input['status'] ?? ''));
         $email = array_key_exists('email', $input) ? normalizeEmailAddress((string)$input['email']) : null;
         $fieldValues = is_array($input['field_values'] ?? null) ? $input['field_values'] : null;
+        $clientMutationId = trim((string)($input['client_mutation_id'] ?? ''));
+        $deviceId = trim((string)($input['device_id'] ?? ''));
+        $sourceNodeId = trim((string)($input['source_node_id'] ?? ''));
+        $eventIdFromClient = trim((string)($input['event_id'] ?? ''));
+        $baseStatus = trim((string)($input['base_status'] ?? ''));
 
         if ($nextStatus === '' && $email === null && $fieldValues === null) {
             jsonResponse(422, ['error' => 'At least one participant field must be provided']);
+            exit;
+        }
+
+        if ($clientMutationId !== '' && strlen($clientMutationId) > 64) {
+            jsonResponse(422, ['error' => 'client_mutation_id is too long']);
+            exit;
+        }
+
+        if ($eventIdFromClient !== '' && $eventIdFromClient !== (string)$participant['event_id']) {
+            jsonResponse(409, ['error' => 'Participant event does not match requested event', 'code' => 'event_mismatch', 'data' => $participant]);
+            exit;
+        }
+
+        if ($baseStatus !== '' && !$isValidParticipantStatus($baseStatus)) {
+            jsonResponse(422, ['error' => 'Unsupported base participant status']);
             exit;
         }
 
@@ -3667,17 +4281,104 @@ try {
                 exit;
             }
 
-            if ($nextStatus !== (string)$participant['status']) {
-                $participant = $updateParticipantStatus($pdo, $participant, $nextStatus);
-                $addActivityLog(
-                    $pdo,
-                    sprintf('Zmieniono status uczestnika na %s', $nextStatus),
-                    (string)$participant['event_id'],
-                    (int)$participant['id'],
-                    (string)$participant['display_name'],
-                    (string)$authUser['id'],
-                    (string)$authUser['name']
-                );
+            if ($clientMutationId !== '') {
+                $existingMutation = $loadClientMutationById($pdo, $clientMutationId);
+                if ($existingMutation !== false) {
+                    if ((int)$existingMutation['participant_id'] !== (int)$participant['id']) {
+                        jsonResponse(409, ['error' => 'client_mutation_id is already bound to another participant', 'code' => 'mutation_id_conflict']);
+                        exit;
+                    }
+
+                    $storedParticipant = $loadParticipantById($pdo, (int)$participant['id']);
+                    jsonResponse(200, [
+                        'data' => $storedParticipant ?: $participant,
+                        'client_mutation_id' => $clientMutationId,
+                        'idempotent' => true,
+                    ]);
+                    exit;
+                }
+            }
+
+            if ($baseStatus !== '' && $baseStatus !== (string)$participant['status']) {
+                jsonResponse(409, [
+                    'error' => 'Participant status changed on the server. Review required.',
+                    'code' => 'state_conflict',
+                    'data' => $participant,
+                ]);
+                exit;
+            }
+
+            if ($nextStatus !== (string)$participant['status'] || $clientMutationId !== '') {
+                $statusBeforeUpdate = (string)$participant['status'];
+                $pdo->beginTransaction();
+
+                try {
+                    if ($nextStatus !== $statusBeforeUpdate) {
+                        $participant = $updateParticipantStatus($pdo, $participant, $nextStatus);
+                        $addActivityLog(
+                            $pdo,
+                            sprintf('Zmieniono status uczestnika na %s', $nextStatus),
+                            (string)$participant['event_id'],
+                            (int)$participant['id'],
+                            (string)$participant['display_name'],
+                            (string)$authUser['id'],
+                            (string)$authUser['name']
+                        );
+                    } else {
+                        $participant = $loadParticipantById($pdo, (int)$participant['id']) ?: $participant;
+                    }
+
+                    if ($clientMutationId !== '') {
+                        $responsePayload = ['data' => $participant];
+                        $resolvedBaseStatus = $baseStatus !== '' ? $baseStatus : $statusBeforeUpdate;
+                        $resolvedSourceNodeId = $sourceNodeId !== '' ? $sourceNodeId : null;
+                        $resolvedDeviceId = $deviceId !== '' ? $deviceId : null;
+
+                        $recordClientMutation(
+                            $pdo,
+                            $clientMutationId,
+                            (int)$participant['id'],
+                            (string)$participant['event_id'],
+                            $resolvedDeviceId,
+                            $resolvedSourceNodeId,
+                            (string)$authUser['id'],
+                            $resolvedBaseStatus,
+                            $nextStatus,
+                            (string)$participant['status'],
+                            $responsePayload
+                        );
+
+                        $enqueueSyncOutbox(
+                            $pdo,
+                            (string)$participant['event_id'],
+                            'participant',
+                            (string)$participant['id'],
+                            'participant_status_updated',
+                            [
+                                'client_mutation_id' => $clientMutationId,
+                                'participant' => $participant,
+                                'base_status' => $resolvedBaseStatus,
+                                'requested_status' => $nextStatus,
+                                'applied_status' => (string)$participant['status'],
+                                'device_id' => $resolvedDeviceId,
+                                'source_node_id' => $resolvedSourceNodeId,
+                                'user_id' => (string)$authUser['id'],
+                                'user_name' => (string)$authUser['name'],
+                                'event_id' => (string)$participant['event_id'],
+                            ],
+                            $clientMutationId,
+                            $resolvedSourceNodeId
+                        );
+                    }
+
+                    $pdo->commit();
+                } catch (Throwable $exception) {
+                    if ($pdo->inTransaction()) {
+                        $pdo->rollBack();
+                    }
+
+                    throw $exception;
+                }
             }
         }
 
