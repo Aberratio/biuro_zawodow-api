@@ -57,7 +57,7 @@ function jsonResponse(int $statusCode, array $payload): void
     $encoded = json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
     if ($encoded === false) {
         http_response_code(500);
-        echo '{"error":"Response encoding failed"}';
+        echo '{"error":"Nie udało się zakodować odpowiedzi"}';
         return;
     }
 
@@ -75,7 +75,7 @@ function readJsonBody(int $maxBytes = 262144): array
 {
     $contentLength = isset($_SERVER['CONTENT_LENGTH']) ? (int)$_SERVER['CONTENT_LENGTH'] : 0;
     if ($contentLength > $maxBytes) {
-        jsonResponse(413, ['error' => 'Request body too large']);
+        jsonResponse(413, ['error' => 'Treść żądania jest zbyt duża']);
         exit;
     }
 
@@ -85,19 +85,19 @@ function readJsonBody(int $maxBytes = 262144): array
     }
 
     if (strlen($rawBody) > $maxBytes) {
-        jsonResponse(413, ['error' => 'Request body too large']);
+        jsonResponse(413, ['error' => 'Treść żądania jest zbyt duża']);
         exit;
     }
 
     try {
         $decoded = json_decode($rawBody, true, 512, JSON_THROW_ON_ERROR);
     } catch (JsonException) {
-        jsonResponse(400, ['error' => 'Invalid JSON body']);
+        jsonResponse(400, ['error' => 'Nieprawidłowa treść JSON']);
         exit;
     }
 
     if (!is_array($decoded) || array_is_list($decoded)) {
-        jsonResponse(400, ['error' => 'JSON body must be an object']);
+        jsonResponse(400, ['error' => 'Treść JSON musi być obiektem']);
         exit;
     }
 
@@ -189,12 +189,12 @@ function validateServerSecurityConfiguration(): void
 
     $isWeakAppKey = strlen($appKey) < 32 || in_array(strtolower($appKey), $placeholderKeys, true);
     if (!isLocalEnvironment() && $isWeakAppKey) {
-        jsonResponse(500, ['error' => 'Server configuration error']);
+        jsonResponse(500, ['error' => 'Błąd konfiguracji serwera']);
         exit;
     }
 
     if (!isLocalEnvironment() && $allowedOrigins === '*') {
-        jsonResponse(500, ['error' => 'Server configuration error']);
+        jsonResponse(500, ['error' => 'Błąd konfiguracji serwera']);
         exit;
     }
 }
@@ -275,23 +275,23 @@ function decodeJsonObject(?string $json): array
 function validatePasswordRules(string $password): ?string
 {
     if (strlen($password) < 10) {
-        return 'Password must be at least 10 characters long';
+        return 'Hasło musi mieć co najmniej 10 znaków';
     }
 
     if (!preg_match('/[A-Z]/', $password)) {
-        return 'Password must contain at least one uppercase letter';
+        return 'Hasło musi zawierać co najmniej jedną wielką literę';
     }
 
     if (!preg_match('/[a-z]/', $password)) {
-        return 'Password must contain at least one lowercase letter';
+        return 'Hasło musi zawierać co najmniej jedną małą literę';
     }
 
     if (!preg_match('/\d/', $password)) {
-        return 'Password must contain at least one digit';
+        return 'Hasło musi zawierać co najmniej jedną cyfrę';
     }
 
     if (!preg_match('/[^a-zA-Z0-9]/', $password)) {
-        return 'Password must contain at least one special character';
+        return 'Hasło musi zawierać co najmniej jeden znak specjalny';
     }
 
     return null;
@@ -422,7 +422,7 @@ function requireAuth(?callable $resolver = null): array
 {
     $user = authenticatedUserFromRequest($resolver);
     if ($user === null) {
-        jsonResponse(401, ['error' => 'Unauthorized']);
+        jsonResponse(401, ['error' => 'Brak autoryzacji']);
         exit;
     }
 
@@ -433,7 +433,7 @@ function requireAnyRole(array $allowedRoles, ?callable $resolver = null): array
 {
     $user = requireAuth($resolver);
     if (!in_array($user['role'], $allowedRoles, true)) {
-        jsonResponse(403, ['error' => 'Forbidden']);
+        jsonResponse(403, ['error' => 'Brak uprawnień']);
         exit;
     }
 
@@ -492,7 +492,7 @@ function openApiDocument(): array
                             ],
                         ],
                         '401' => [
-                            '$ref' => '#/components/responses/Unauthorized',
+                            '$ref' => '#/components/responses/Brak autoryzacji',
                         ],
                         '429' => [
                             '$ref' => '#/components/responses/TooManyRequests',
@@ -607,7 +607,7 @@ function openApiDocument(): array
                             ],
                         ],
                         '401' => [
-                            '$ref' => '#/components/responses/Unauthorized',
+                            '$ref' => '#/components/responses/Brak autoryzacji',
                         ],
                     ],
                 ],
@@ -641,7 +641,7 @@ function openApiDocument(): array
                             ],
                         ],
                         '401' => [
-                            '$ref' => '#/components/responses/Unauthorized',
+                            '$ref' => '#/components/responses/Brak autoryzacji',
                         ],
                         '422' => [
                             'description' => 'Validation error',
@@ -731,7 +731,7 @@ function openApiDocument(): array
                             '$ref' => '#/components/responses/DatabaseError',
                         ],
                         '401' => [
-                            '$ref' => '#/components/responses/Unauthorized',
+                            '$ref' => '#/components/responses/Brak autoryzacji',
                         ],
                     ],
                 ],
@@ -775,7 +775,7 @@ function openApiDocument(): array
                             ],
                         ],
                         '403' => [
-                            'description' => 'Forbidden',
+                            'description' => 'Brak uprawnień',
                             'content' => [
                                 'application/json' => [
                                     'schema' => [
@@ -788,7 +788,7 @@ function openApiDocument(): array
                             '$ref' => '#/components/responses/DatabaseError',
                         ],
                         '401' => [
-                            '$ref' => '#/components/responses/Unauthorized',
+                            '$ref' => '#/components/responses/Brak autoryzacji',
                         ],
                     ],
                 ],
@@ -822,7 +822,7 @@ function openApiDocument(): array
                             ],
                         ],
                         '403' => [
-                            'description' => 'Forbidden',
+                            'description' => 'Brak uprawnień',
                             'content' => [
                                 'application/json' => [
                                     'schema' => [
@@ -835,7 +835,7 @@ function openApiDocument(): array
                             '$ref' => '#/components/responses/NotFound',
                         ],
                         '401' => [
-                            '$ref' => '#/components/responses/Unauthorized',
+                            '$ref' => '#/components/responses/Brak autoryzacji',
                         ],
                     ],
                 ],
@@ -877,7 +877,7 @@ function openApiDocument(): array
                             ],
                         ],
                         '403' => [
-                            '$ref' => '#/components/responses/Forbidden',
+                            '$ref' => '#/components/responses/Brak uprawnień',
                         ],
                         '404' => [
                             '$ref' => '#/components/responses/NotFound',
@@ -893,7 +893,7 @@ function openApiDocument(): array
                             ],
                         ],
                         '401' => [
-                            '$ref' => '#/components/responses/Unauthorized',
+                            '$ref' => '#/components/responses/Brak autoryzacji',
                         ],
                     ],
                 ],
@@ -925,13 +925,13 @@ function openApiDocument(): array
                             ],
                         ],
                         '403' => [
-                            '$ref' => '#/components/responses/Forbidden',
+                            '$ref' => '#/components/responses/Brak uprawnień',
                         ],
                         '404' => [
                             '$ref' => '#/components/responses/NotFound',
                         ],
                         '401' => [
-                            '$ref' => '#/components/responses/Unauthorized',
+                            '$ref' => '#/components/responses/Brak autoryzacji',
                         ],
                     ],
                 ],
@@ -966,7 +966,7 @@ function openApiDocument(): array
                             ],
                         ],
                         '403' => [
-                            '$ref' => '#/components/responses/Forbidden',
+                            '$ref' => '#/components/responses/Brak uprawnień',
                         ],
                         '404' => [
                             '$ref' => '#/components/responses/NotFound',
@@ -975,7 +975,7 @@ function openApiDocument(): array
                             '$ref' => '#/components/responses/DatabaseError',
                         ],
                         '401' => [
-                            '$ref' => '#/components/responses/Unauthorized',
+                            '$ref' => '#/components/responses/Brak autoryzacji',
                         ],
                     ],
                 ],
@@ -1010,7 +1010,7 @@ function openApiDocument(): array
                             ],
                         ],
                         '403' => [
-                            '$ref' => '#/components/responses/Forbidden',
+                            '$ref' => '#/components/responses/Brak uprawnień',
                         ],
                         '404' => [
                             '$ref' => '#/components/responses/NotFound',
@@ -1019,7 +1019,7 @@ function openApiDocument(): array
                             '$ref' => '#/components/responses/DatabaseError',
                         ],
                         '401' => [
-                            '$ref' => '#/components/responses/Unauthorized',
+                            '$ref' => '#/components/responses/Brak autoryzacji',
                         ],
                     ],
                 ],
@@ -1066,7 +1066,7 @@ function openApiDocument(): array
                             '$ref' => '#/components/responses/BadRequest',
                         ],
                         '403' => [
-                            '$ref' => '#/components/responses/Forbidden',
+                            '$ref' => '#/components/responses/Brak uprawnień',
                         ],
                         '404' => [
                             '$ref' => '#/components/responses/NotFound',
@@ -1085,7 +1085,7 @@ function openApiDocument(): array
                             ],
                         ],
                         '401' => [
-                            '$ref' => '#/components/responses/Unauthorized',
+                            '$ref' => '#/components/responses/Brak autoryzacji',
                         ],
                     ],
                 ],
@@ -1129,7 +1129,7 @@ function openApiDocument(): array
                             ],
                         ],
                         '403' => [
-                            '$ref' => '#/components/responses/Forbidden',
+                            '$ref' => '#/components/responses/Brak uprawnień',
                         ],
                         '404' => [
                             '$ref' => '#/components/responses/NotFound',
@@ -1148,7 +1148,7 @@ function openApiDocument(): array
                             ],
                         ],
                         '401' => [
-                            '$ref' => '#/components/responses/Unauthorized',
+                            '$ref' => '#/components/responses/Brak autoryzacji',
                         ],
                     ],
                 ],
@@ -1195,7 +1195,7 @@ function openApiDocument(): array
                             '$ref' => '#/components/responses/BadRequest',
                         ],
                         '403' => [
-                            '$ref' => '#/components/responses/Forbidden',
+                            '$ref' => '#/components/responses/Brak uprawnień',
                         ],
                         '404' => [
                             '$ref' => '#/components/responses/NotFound',
@@ -1217,7 +1217,7 @@ function openApiDocument(): array
                             '$ref' => '#/components/responses/DatabaseError',
                         ],
                         '401' => [
-                            '$ref' => '#/components/responses/Unauthorized',
+                            '$ref' => '#/components/responses/Brak autoryzacji',
                         ],
                     ],
                 ],
@@ -1251,13 +1251,13 @@ function openApiDocument(): array
                             ],
                         ],
                         '403' => [
-                            '$ref' => '#/components/responses/Forbidden',
+                            '$ref' => '#/components/responses/Brak uprawnień',
                         ],
                         '404' => [
                             '$ref' => '#/components/responses/NotFound',
                         ],
                         '401' => [
-                            '$ref' => '#/components/responses/Unauthorized',
+                            '$ref' => '#/components/responses/Brak autoryzacji',
                         ],
                     ],
                 ],
@@ -1301,7 +1301,7 @@ function openApiDocument(): array
                             ],
                         ],
                         '403' => [
-                            '$ref' => '#/components/responses/Forbidden',
+                            '$ref' => '#/components/responses/Brak uprawnień',
                         ],
                         '404' => [
                             '$ref' => '#/components/responses/NotFound',
@@ -1317,7 +1317,7 @@ function openApiDocument(): array
                             ],
                         ],
                         '401' => [
-                            '$ref' => '#/components/responses/Unauthorized',
+                            '$ref' => '#/components/responses/Brak autoryzacji',
                         ],
                     ],
                 ],
@@ -1361,13 +1361,13 @@ function openApiDocument(): array
                             ],
                         ],
                         '403' => [
-                            '$ref' => '#/components/responses/Forbidden',
+                            '$ref' => '#/components/responses/Brak uprawnień',
                         ],
                         '404' => [
                             '$ref' => '#/components/responses/NotFound',
                         ],
                         '401' => [
-                            '$ref' => '#/components/responses/Unauthorized',
+                            '$ref' => '#/components/responses/Brak autoryzacji',
                         ],
                     ],
                 ],
@@ -1434,7 +1434,7 @@ function openApiDocument(): array
                             '$ref' => '#/components/responses/DatabaseError',
                         ],
                         '401' => [
-                            '$ref' => '#/components/responses/Unauthorized',
+                            '$ref' => '#/components/responses/Brak autoryzacji',
                         ],
                     ],
                 ],
@@ -1468,7 +1468,7 @@ function openApiDocument(): array
                             ],
                         ],
                         '403' => [
-                            'description' => 'Forbidden',
+                            'description' => 'Brak uprawnień',
                             'content' => [
                                 'application/json' => [
                                     'schema' => [
@@ -1481,7 +1481,7 @@ function openApiDocument(): array
                             '$ref' => '#/components/responses/NotFound',
                         ],
                         '401' => [
-                            '$ref' => '#/components/responses/Unauthorized',
+                            '$ref' => '#/components/responses/Brak autoryzacji',
                         ],
                     ],
                 ],
@@ -1523,7 +1523,7 @@ function openApiDocument(): array
                             ],
                         ],
                         '403' => [
-                            '$ref' => '#/components/responses/Forbidden',
+                            '$ref' => '#/components/responses/Brak uprawnień',
                         ],
                         '404' => [
                             '$ref' => '#/components/responses/NotFound',
@@ -1542,7 +1542,7 @@ function openApiDocument(): array
                             ],
                         ],
                         '401' => [
-                            '$ref' => '#/components/responses/Unauthorized',
+                            '$ref' => '#/components/responses/Brak autoryzacji',
                         ],
                     ],
                 ],
@@ -1574,7 +1574,7 @@ function openApiDocument(): array
                             ],
                         ],
                         '403' => [
-                            '$ref' => '#/components/responses/Forbidden',
+                            '$ref' => '#/components/responses/Brak uprawnień',
                         ],
                         '404' => [
                             '$ref' => '#/components/responses/NotFound',
@@ -1590,7 +1590,67 @@ function openApiDocument(): array
                             ],
                         ],
                         '401' => [
-                            '$ref' => '#/components/responses/Unauthorized',
+                            '$ref' => '#/components/responses/Brak autoryzacji',
+                        ],
+                    ],
+                ],
+            ],
+            '/organizations/{id}/admin-assignments' => [
+                'patch' => [
+                    'tags' => ['Organizations'],
+                    'summary' => 'Replace organization admin assignments',
+                    'security' => [
+                        ['bearerAuth' => []],
+                    ],
+                    'parameters' => [
+                        [
+                            'name' => 'id',
+                            'in' => 'path',
+                            'required' => true,
+                            'schema' => [
+                                'type' => 'string',
+                            ],
+                        ],
+                    ],
+                    'requestBody' => [
+                        'required' => true,
+                        'content' => [
+                            'application/json' => [
+                                'schema' => [
+                                    '$ref' => '#/components/schemas/AdminAssignmentUpdateRequest',
+                                ],
+                            ],
+                        ],
+                    ],
+                    'responses' => [
+                        '200' => [
+                            'description' => 'Organization admin assignments updated',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => [
+                                        '$ref' => '#/components/schemas/OrganizationResponse',
+                                    ],
+                                ],
+                            ],
+                        ],
+                        '401' => [
+                            '$ref' => '#/components/responses/Brak autoryzacji',
+                        ],
+                        '403' => [
+                            '$ref' => '#/components/responses/Brak uprawnień',
+                        ],
+                        '404' => [
+                            '$ref' => '#/components/responses/NotFound',
+                        ],
+                        '422' => [
+                            'description' => 'Validation error',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => [
+                                        '$ref' => '#/components/schemas/ErrorResponse',
+                                    ],
+                                ],
+                            ],
                         ],
                     ],
                 ],
@@ -1640,7 +1700,7 @@ function openApiDocument(): array
                             '$ref' => '#/components/responses/DatabaseError',
                         ],
                         '401' => [
-                            '$ref' => '#/components/responses/Unauthorized',
+                            '$ref' => '#/components/responses/Brak autoryzacji',
                         ],
                     ],
                 ],
@@ -1674,14 +1734,14 @@ function openApiDocument(): array
                             ],
                         ],
                         '403' => [
-                            'description' => 'Forbidden',
+                            'description' => 'Brak uprawnień',
                             'content' => [
                                 'application/json' => [
                                     'schema' => [
                                         '$ref' => '#/components/schemas/ErrorResponse',
                                     ],
                                     'example' => [
-                                        'error' => 'Forbidden',
+                                        'error' => 'Brak uprawnień',
                                     ],
                                 ],
                             ],
@@ -1716,7 +1776,7 @@ function openApiDocument(): array
                             '$ref' => '#/components/responses/DatabaseError',
                         ],
                         '401' => [
-                            '$ref' => '#/components/responses/Unauthorized',
+                            '$ref' => '#/components/responses/Brak autoryzacji',
                         ],
                     ],
                 ],
@@ -1760,7 +1820,7 @@ function openApiDocument(): array
                             ],
                         ],
                         '403' => [
-                            'description' => 'Forbidden',
+                            'description' => 'Brak uprawnień',
                             'content' => [
                                 'application/json' => [
                                     'schema' => [
@@ -1790,7 +1850,7 @@ function openApiDocument(): array
                             ],
                         ],
                         '401' => [
-                            '$ref' => '#/components/responses/Unauthorized',
+                            '$ref' => '#/components/responses/Brak autoryzacji',
                         ],
                     ],
                 ],
@@ -1834,7 +1894,7 @@ function openApiDocument(): array
                             ],
                         ],
                         '403' => [
-                            '$ref' => '#/components/responses/Forbidden',
+                            '$ref' => '#/components/responses/Brak uprawnień',
                         ],
                         '404' => [
                             '$ref' => '#/components/responses/NotFound',
@@ -1850,7 +1910,7 @@ function openApiDocument(): array
                             ],
                         ],
                         '401' => [
-                            '$ref' => '#/components/responses/Unauthorized',
+                            '$ref' => '#/components/responses/Brak autoryzacji',
                         ],
                     ],
                 ],
@@ -1884,7 +1944,7 @@ function openApiDocument(): array
                             ],
                         ],
                         '403' => [
-                            'description' => 'Forbidden',
+                            'description' => 'Brak uprawnień',
                             'content' => [
                                 'application/json' => [
                                     'schema' => [
@@ -1914,7 +1974,7 @@ function openApiDocument(): array
                             ],
                         ],
                         '401' => [
-                            '$ref' => '#/components/responses/Unauthorized',
+                            '$ref' => '#/components/responses/Brak autoryzacji',
                         ],
                     ],
                 ],
@@ -1948,7 +2008,7 @@ function openApiDocument(): array
                             ],
                         ],
                         '403' => [
-                            'description' => 'Forbidden',
+                            'description' => 'Brak uprawnień',
                             'content' => [
                                 'application/json' => [
                                     'schema' => [
@@ -1978,7 +2038,7 @@ function openApiDocument(): array
                             ],
                         ],
                         '401' => [
-                            '$ref' => '#/components/responses/Unauthorized',
+                            '$ref' => '#/components/responses/Brak autoryzacji',
                         ],
                     ],
                 ],
@@ -2005,7 +2065,7 @@ function openApiDocument(): array
                             '$ref' => '#/components/responses/DatabaseError',
                         ],
                         '401' => [
-                            '$ref' => '#/components/responses/Unauthorized',
+                            '$ref' => '#/components/responses/Brak autoryzacji',
                         ],
                     ],
                 ],
@@ -2037,7 +2097,7 @@ function openApiDocument(): array
                             ],
                         ],
                         '403' => [
-                            '$ref' => '#/components/responses/Forbidden',
+                            '$ref' => '#/components/responses/Brak uprawnień',
                         ],
                         '422' => [
                             'description' => 'Validation error',
@@ -2056,7 +2116,7 @@ function openApiDocument(): array
                             '$ref' => '#/components/responses/DatabaseError',
                         ],
                         '401' => [
-                            '$ref' => '#/components/responses/Unauthorized',
+                            '$ref' => '#/components/responses/Brak autoryzacji',
                         ],
                     ],
                 ],
@@ -2090,7 +2150,7 @@ function openApiDocument(): array
                             ],
                         ],
                         '403' => [
-                            '$ref' => '#/components/responses/Forbidden',
+                            '$ref' => '#/components/responses/Brak uprawnień',
                         ],
                         '404' => [
                             '$ref' => '#/components/responses/NotFound',
@@ -2106,7 +2166,7 @@ function openApiDocument(): array
                             ],
                         ],
                         '401' => [
-                            '$ref' => '#/components/responses/Unauthorized',
+                            '$ref' => '#/components/responses/Brak autoryzacji',
                         ],
                     ],
                 ],
@@ -2142,7 +2202,7 @@ function openApiDocument(): array
                             ],
                         ],
                         '403' => [
-                            '$ref' => '#/components/responses/Forbidden',
+                            '$ref' => '#/components/responses/Brak uprawnień',
                         ],
                         '404' => [
                             '$ref' => '#/components/responses/NotFound',
@@ -2158,7 +2218,7 @@ function openApiDocument(): array
                             ],
                         ],
                         '401' => [
-                            '$ref' => '#/components/responses/Unauthorized',
+                            '$ref' => '#/components/responses/Brak autoryzacji',
                         ],
                     ],
                 ],
@@ -2194,7 +2254,7 @@ function openApiDocument(): array
                             ],
                         ],
                         '403' => [
-                            '$ref' => '#/components/responses/Forbidden',
+                            '$ref' => '#/components/responses/Brak uprawnień',
                         ],
                         '404' => [
                             '$ref' => '#/components/responses/NotFound',
@@ -2210,7 +2270,7 @@ function openApiDocument(): array
                             ],
                         ],
                         '401' => [
-                            '$ref' => '#/components/responses/Unauthorized',
+                            '$ref' => '#/components/responses/Brak autoryzacji',
                         ],
                     ],
                 ],
@@ -2246,7 +2306,7 @@ function openApiDocument(): array
                             ],
                         ],
                         '403' => [
-                            '$ref' => '#/components/responses/Forbidden',
+                            '$ref' => '#/components/responses/Brak uprawnień',
                         ],
                         '404' => [
                             '$ref' => '#/components/responses/NotFound',
@@ -2265,7 +2325,7 @@ function openApiDocument(): array
                             '$ref' => '#/components/responses/DatabaseError',
                         ],
                         '401' => [
-                            '$ref' => '#/components/responses/Unauthorized',
+                            '$ref' => '#/components/responses/Brak autoryzacji',
                         ],
                     ],
                 ],
@@ -2309,7 +2369,7 @@ function openApiDocument(): array
                             ],
                         ],
                         '403' => [
-                            '$ref' => '#/components/responses/Forbidden',
+                            '$ref' => '#/components/responses/Brak uprawnień',
                         ],
                         '404' => [
                             '$ref' => '#/components/responses/NotFound',
@@ -2325,7 +2385,7 @@ function openApiDocument(): array
                             ],
                         ],
                         '401' => [
-                            '$ref' => '#/components/responses/Unauthorized',
+                            '$ref' => '#/components/responses/Brak autoryzacji',
                         ],
                     ],
                 ],
@@ -2359,7 +2419,7 @@ function openApiDocument(): array
                             ],
                         ],
                         '403' => [
-                            '$ref' => '#/components/responses/Forbidden',
+                            '$ref' => '#/components/responses/Brak uprawnień',
                         ],
                         '404' => [
                             '$ref' => '#/components/responses/NotFound',
@@ -2375,7 +2435,7 @@ function openApiDocument(): array
                             ],
                         ],
                         '401' => [
-                            '$ref' => '#/components/responses/Unauthorized',
+                            '$ref' => '#/components/responses/Brak autoryzacji',
                         ],
                     ],
                 ],
@@ -2411,7 +2471,7 @@ function openApiDocument(): array
                             ],
                         ],
                         '403' => [
-                            '$ref' => '#/components/responses/Forbidden',
+                            '$ref' => '#/components/responses/Brak uprawnień',
                         ],
                         '404' => [
                             '$ref' => '#/components/responses/NotFound',
@@ -2427,7 +2487,7 @@ function openApiDocument(): array
                             ],
                         ],
                         '401' => [
-                            '$ref' => '#/components/responses/Unauthorized',
+                            '$ref' => '#/components/responses/Brak autoryzacji',
                         ],
                     ],
                 ],
@@ -2463,7 +2523,7 @@ function openApiDocument(): array
                             ],
                         ],
                         '403' => [
-                            '$ref' => '#/components/responses/Forbidden',
+                            '$ref' => '#/components/responses/Brak uprawnień',
                         ],
                         '404' => [
                             '$ref' => '#/components/responses/NotFound',
@@ -2479,7 +2539,7 @@ function openApiDocument(): array
                             ],
                         ],
                         '401' => [
-                            '$ref' => '#/components/responses/Unauthorized',
+                            '$ref' => '#/components/responses/Brak autoryzacji',
                         ],
                     ],
                 ],
@@ -2504,28 +2564,28 @@ function openApiDocument(): array
                         ],
                     ],
                 ],
-                'Unauthorized' => [
-                    'description' => 'Unauthorized',
+                'Brak autoryzacji' => [
+                    'description' => 'Brak autoryzacji',
                     'content' => [
                         'application/json' => [
                             'schema' => [
                                 '$ref' => '#/components/schemas/ErrorResponse',
                             ],
                             'example' => [
-                                'error' => 'Unauthorized',
+                                'error' => 'Brak autoryzacji',
                             ],
                         ],
                     ],
                 ],
-                'Forbidden' => [
-                    'description' => 'Forbidden',
+                'Brak uprawnień' => [
+                    'description' => 'Brak uprawnień',
                     'content' => [
                         'application/json' => [
                             'schema' => [
                                 '$ref' => '#/components/schemas/ErrorResponse',
                             ],
                             'example' => [
-                                'error' => 'Forbidden',
+                                'error' => 'Brak uprawnień',
                             ],
                         ],
                     ],
@@ -2551,7 +2611,7 @@ function openApiDocument(): array
                     ],
                 ],
                 'PayloadTooLarge' => [
-                    'description' => 'Request body too large',
+                    'description' => 'Treść żądania jest zbyt duża',
                     'content' => [
                         'application/json' => [
                             'schema' => [
@@ -2745,16 +2805,27 @@ function openApiDocument(): array
                         'qr_code' => ['type' => 'string', 'nullable' => true, 'example' => 'QR-evt-1-101'],
                     ],
                 ],
+                'AdminUser' => [
+                    'type' => 'object',
+                    'required' => ['id', 'name', 'email'],
+                    'properties' => [
+                        'id' => ['type' => 'string', 'example' => 'u-1'],
+                        'name' => ['type' => 'string', 'example' => 'Admin SportEvents'],
+                        'email' => ['type' => 'string', 'format' => 'email', 'example' => 'admin@sportevents.pl'],
+                    ],
+                ],
                 'Organization' => [
                     'type' => 'object',
-                    'required' => ['id', 'name', 'event_limit'],
+                    'required' => ['id', 'name', 'event_limit', 'admin_users'],
                     'properties' => [
                         'id' => ['type' => 'string', 'example' => 'org-1'],
                         'name' => ['type' => 'string', 'example' => 'SportEvents Pro'],
                         'logo' => ['type' => 'string', 'nullable' => true],
                         'event_limit' => ['type' => 'integer', 'example' => 4],
-                        'admin_user_id' => ['type' => 'string', 'nullable' => true, 'example' => 'u-1'],
-                        'admin_user_name' => ['type' => 'string', 'nullable' => true, 'example' => 'Admin SportEvents'],
+                        'admin_users' => [
+                            'type' => 'array',
+                            'items' => ['$ref' => '#/components/schemas/AdminUser'],
+                        ],
                     ],
                 ],
                 'OrganizationResponse' => [
@@ -2811,7 +2882,20 @@ function openApiDocument(): array
                     'properties' => [
                         'name' => ['type' => 'string', 'example' => 'City Runners'],
                         'event_limit' => ['type' => 'integer', 'minimum' => 0, 'example' => 3],
-                        'admin_user_id' => ['type' => 'string', 'nullable' => true, 'example' => 'u-1'],
+                        'admin_user_ids' => [
+                            'type' => 'array',
+                            'items' => ['type' => 'string', 'example' => 'u-1'],
+                        ],
+                    ],
+                ],
+                'AdminAssignmentUpdateRequest' => [
+                    'type' => 'object',
+                    'required' => ['admin_user_ids'],
+                    'properties' => [
+                        'admin_user_ids' => [
+                            'type' => 'array',
+                            'items' => ['type' => 'string', 'example' => 'u-1'],
+                        ],
                     ],
                 ],
                 'ChangeUserRoleRequest' => [

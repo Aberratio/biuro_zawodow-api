@@ -239,40 +239,133 @@ try {
         );
     };
 
-    $loadOrganizationById = static function (PDO $pdo, string $organizationId): array|false {
+    $normalizeStringIdList = static function (array $values): array {
+        $normalizedValues = [];
+
+        foreach ($values as $value) {
+            if (!is_string($value)) {
+                continue;
+            }
+
+            $trimmedValue = trim($value);
+            if ($trimmedValue === '') {
+                continue;
+            }
+
+            $normalizedValues[] = $trimmedValue;
+        }
+
+        return array_values(array_unique($normalizedValues));
+    };
+
+    $loadActiveAdminUsersByIds = static function (PDO $pdo, array $userIds) use ($normalizeStringIdList): array {
+        $normalizedUserIds = $normalizeStringIdList($userIds);
+        if ($normalizedUserIds === []) {
+            return [];
+        }
+
+        $placeholders = implode(',', array_fill(0, count($normalizedUserIds), '?'));
+        $stmt = $pdo->prepare("
+            SELECT id, name, email
+            FROM users
+            WHERE id IN ({$placeholders})
+              AND role = 'admin'
+              AND archived_at IS NULL
+            ORDER BY name ASC, id ASC
+        ");
+        $stmt->execute($normalizedUserIds);
+
+        return array_map(
+            static fn(array $row): array => [
+                'id' => (string)$row['id'],
+                'name' => (string)$row['name'],
+                'email' => (string)$row['email'],
+            ],
+            $stmt->fetchAll()
+        );
+    };
+
+    $loadAdminUsersByOrganizationIds = static function (PDO $pdo, array $organizationIds) use ($normalizeStringIdList): array {
+        $normalizedOrganizationIds = $normalizeStringIdList($organizationIds);
+        if ($normalizedOrganizationIds === []) {
+            return [];
+        }
+
+        $placeholders = implode(',', array_fill(0, count($normalizedOrganizationIds), '?'));
+        $stmt = $pdo->prepare("
+            SELECT aoa.organization_id, u.id, u.name, u.email
+            FROM admin_organization_assignments aoa
+            INNER JOIN users u ON u.id = aoa.user_id
+            WHERE aoa.organization_id IN ({$placeholders})
+              AND u.role = 'admin'
+              AND u.archived_at IS NULL
+            ORDER BY aoa.organization_id ASC, u.name ASC, u.id ASC
+        ");
+        $stmt->execute($normalizedOrganizationIds);
+
+        $adminUsersByOrganizationId = array_fill_keys($normalizedOrganizationIds, []);
+        foreach ($stmt->fetchAll() as $row) {
+            $organizationId = (string)$row['organization_id'];
+            $adminUsersByOrganizationId[$organizationId][] = [
+                'id' => (string)$row['id'],
+                'name' => (string)$row['name'],
+                'email' => (string)$row['email'],
+            ];
+        }
+
+        return $adminUsersByOrganizationId;
+    };
+
+    $attachAdminUsersToOrganizations = static function (array $organizations, array $adminUsersByOrganizationId): array {
+        foreach ($organizations as &$organization) {
+            $organization['admin_users'] = $adminUsersByOrganizationId[(string)$organization['id']] ?? [];
+        }
+        unset($organization);
+
+        return $organizations;
+    };
+
+    $loadOrganizationById = static function (PDO $pdo, string $organizationId) use ($loadAdminUsersByOrganizationIds, $attachAdminUsersToOrganizations): array|false {
         $stmt = $pdo->prepare('
             SELECT
                 o.id,
                 o.name,
                 o.logo,
-                o.event_limit,
-                aoa.user_id AS admin_user_id,
-                admin_user.name AS admin_user_name
+                o.event_limit
             FROM organizations o
-            LEFT JOIN admin_organization_assignments aoa ON aoa.organization_id = o.id
-            LEFT JOIN users admin_user ON admin_user.id = aoa.user_id
             WHERE o.id = :id
             LIMIT 1
         ');
         $stmt->execute(['id' => $organizationId]);
+        $organization = $stmt->fetch();
+        if ($organization === false) {
+            return false;
+        }
 
-        return $stmt->fetch();
+        $adminUsersByOrganizationId = $loadAdminUsersByOrganizationIds($pdo, [$organizationId]);
+        $organizations = $attachAdminUsersToOrganizations([$organization], $adminUsersByOrganizationId);
+
+        return $organizations[0] ?? false;
     };
 
-    $loadAllOrganizations = static function (PDO $pdo): array {
-        return $pdo->query('
+    $loadAllOrganizations = static function (PDO $pdo) use ($loadAdminUsersByOrganizationIds, $attachAdminUsersToOrganizations): array {
+        $organizations = $pdo->query('
             SELECT
                 o.id,
                 o.name,
                 o.logo,
-                o.event_limit,
-                aoa.user_id AS admin_user_id,
-                admin_user.name AS admin_user_name
+                o.event_limit
             FROM organizations o
-            LEFT JOIN admin_organization_assignments aoa ON aoa.organization_id = o.id
-            LEFT JOIN users admin_user ON admin_user.id = aoa.user_id
             ORDER BY o.name ASC
         ')->fetchAll();
+
+        $organizationIds = array_map(
+            static fn(array $organization): string => (string)$organization['id'],
+            $organizations
+        );
+        $adminUsersByOrganizationId = $loadAdminUsersByOrganizationIds($pdo, $organizationIds);
+
+        return $attachAdminUsersToOrganizations($organizations, $adminUsersByOrganizationId);
     };
 
     $loadEventById = static function (PDO $pdo, string $eventId): array|false {
@@ -677,13 +770,16 @@ try {
             static fn(array $organization): string => (string)$organization['id'],
             $accessibleOrganizations
         );
-        $accessibleAdminIds = array_values(array_filter(
-            array_map(
-                static fn(array $organization): string => trim((string)($organization['admin_user_id'] ?? '')),
-                $accessibleOrganizations
-            ),
-            static fn(string $userId): bool => $userId !== ''
-        ));
+        $accessibleAdminIds = [];
+        foreach ($accessibleOrganizations as $organization) {
+            foreach (($organization['admin_users'] ?? []) as $adminUser) {
+                $adminUserId = trim((string)($adminUser['id'] ?? ''));
+                if ($adminUserId !== '') {
+                    $accessibleAdminIds[] = $adminUserId;
+                }
+            }
+        }
+        $accessibleAdminIds = array_values(array_unique($accessibleAdminIds));
 
         return array_values(array_filter(
             $users,
@@ -1459,16 +1555,16 @@ try {
     $assertParticipantEventAccess = static function (PDO $pdo, array $authUser, array $participant) use ($loadEventById, $canAccessEvent, $canManageEventParticipants): array {
         $eventId = trim((string)($participant['event_id'] ?? ''));
         if ($eventId === '') {
-            return [null, 'Participant is not assigned to an event'];
+            return [null, 'Uczestnik nie jest przypisany do wydarzenia'];
         }
 
         $event = $loadEventById($pdo, $eventId);
         if ($event === false) {
-            return [null, 'Event not found'];
+            return [null, 'Nie znaleziono wydarzenia'];
         }
 
         if (!$canAccessEvent($authUser, $event) && !$canManageEventParticipants($authUser, $event)) {
-            return [null, 'Forbidden'];
+            return [null, 'Brak uprawnień'];
         }
 
         return [$event, null];
@@ -1480,7 +1576,7 @@ try {
         string $status
     ) use ($loadParticipantById, $isValidParticipantStatus, $participantStatusCountsAsCheckedIn): array {
         if (!$isValidParticipantStatus($status)) {
-            throw new InvalidArgumentException('Unsupported participant status');
+            throw new InvalidArgumentException('Nieobsługiwany status uczestnika');
         }
 
         $checkedInAt = $participantStatusCountsAsCheckedIn($status)
@@ -1744,7 +1840,7 @@ try {
         if ($participant === false) {
             http_response_code(404);
             header('Content-Type: text/plain; charset=utf-8');
-            echo 'QR image not found';
+            echo 'Nie znaleziono obrazu kodu QR';
             exit;
         }
 
@@ -1769,14 +1865,14 @@ try {
         }
 
         if ($email === '' || $password === '') {
-            jsonResponse(422, ['error' => 'email and password are required']);
+            jsonResponse(422, ['error' => 'Adres e-mail i hasło są wymagane']);
             exit;
         }
 
         $user = $loadUserWithPasswordByEmail($pdo, $email);
 
         if ($user === false || !passwordMatches($password, (string)$user['password'])) {
-            jsonResponse(401, ['error' => 'Invalid credentials']);
+            jsonResponse(401, ['error' => 'Nieprawidłowy adres e-mail lub hasło']);
             exit;
         }
 
@@ -1857,12 +1953,12 @@ try {
         }
 
         if ($token === '' || $password === '' || $passwordConfirmation === '') {
-            jsonResponse(422, ['error' => 'token, password and password_confirmation are required']);
+            jsonResponse(422, ['error' => 'Token, hasło i potwierdzenie hasła są wymagane']);
             exit;
         }
 
         if ($password !== $passwordConfirmation) {
-            jsonResponse(422, ['error' => 'Password confirmation does not match']);
+            jsonResponse(422, ['error' => 'Potwierdzenie hasła nie jest zgodne']);
             exit;
         }
 
@@ -1910,12 +2006,12 @@ try {
         $newPasswordConfirmation = (string)($input['new_password_confirmation'] ?? '');
 
         if ($currentPassword === '' || $newPassword === '' || $newPasswordConfirmation === '') {
-            jsonResponse(422, ['error' => 'current_password, new_password and new_password_confirmation are required']);
+            jsonResponse(422, ['error' => 'Aktualne hasło, nowe hasło i potwierdzenie nowego hasła są wymagane']);
             exit;
         }
 
         if ($newPassword !== $newPasswordConfirmation) {
-            jsonResponse(422, ['error' => 'Password confirmation does not match']);
+            jsonResponse(422, ['error' => 'Potwierdzenie hasła nie jest zgodne']);
             exit;
         }
 
@@ -2021,13 +2117,13 @@ try {
         $organizationId = (string)$matches[1];
 
         if (!$canAccessOrganization($authUser, $organizationId)) {
-            jsonResponse(403, ['error' => 'Forbidden']);
+            jsonResponse(403, ['error' => 'Brak uprawnień']);
             exit;
         }
 
         $organization = $loadOrganizationById($pdo, $organizationId);
         if ($organization === false) {
-            jsonResponse(404, ['error' => 'Organization not found']);
+            jsonResponse(404, ['error' => 'Nie znaleziono organizacji']);
             exit;
         }
 
@@ -2041,38 +2137,51 @@ try {
 
         $name = trim((string)($input['name'] ?? ''));
         $eventLimit = $input['event_limit'] ?? null;
-        $adminUserId = $authUser['role'] === 'admin'
-            ? (string)$authUser['id']
-            : trim((string)($input['admin_user_id'] ?? ''));
+        $adminUserIds = $authUser['role'] === 'admin'
+            ? [(string)$authUser['id']]
+            : [];
 
         if ($name === '') {
-            jsonResponse(422, ['error' => 'name is required']);
+            jsonResponse(422, ['error' => 'Nazwa jest wymagana']);
             exit;
         }
 
         if (!is_int($eventLimit) && !(is_string($eventLimit) && ctype_digit($eventLimit))) {
-            jsonResponse(422, ['error' => 'event_limit must be a non-negative integer']);
+            jsonResponse(422, ['error' => 'Limit wydarzeń musi być liczbą całkowitą nie mniejszą niż 0']);
             exit;
         }
 
-        if ($adminUserId === '') {
-            jsonResponse(422, ['error' => 'admin_user_id is required']);
-            exit;
+        if ($authUser['role'] === 'superadmin' && array_key_exists('admin_user_ids', $input)) {
+            if (!is_array($input['admin_user_ids'])) {
+                jsonResponse(422, ['error' => 'Pole admin_user_ids musi być tablicą identyfikatorów użytkowników']);
+                exit;
+            }
+
+            foreach ($input['admin_user_ids'] as $adminUserId) {
+                if (!is_string($adminUserId) || trim($adminUserId) === '') {
+                    jsonResponse(422, ['error' => 'Pole admin_user_ids może zawierać tylko niepuste ciągi znaków']);
+                    exit;
+                }
+            }
+
+            $adminUserIds = $normalizeStringIdList($input['admin_user_ids']);
+        } elseif ($authUser['role'] === 'superadmin') {
+            $legacyAdminUserId = trim((string)($input['admin_user_id'] ?? ''));
+            if ($legacyAdminUserId !== '') {
+                $adminUserIds = [$legacyAdminUserId];
+            }
         }
 
-        $adminStmt = $pdo->prepare('SELECT id, role FROM users WHERE id = :id LIMIT 1');
-        $adminStmt->execute(['id' => $adminUserId]);
-        $adminUser = $adminStmt->fetch();
-
-        if ($adminUser === false || (string)$adminUser['role'] !== 'admin') {
-            jsonResponse(422, ['error' => 'Assigned admin not found']);
+        $resolvedAdminUsers = $loadActiveAdminUsersByIds($pdo, $adminUserIds);
+        if (count($resolvedAdminUsers) !== count($adminUserIds)) {
+            jsonResponse(422, ['error' => 'Nie znaleziono co najmniej jednego przypisanego administratora']);
             exit;
         }
 
         $existingOrganizationStmt = $pdo->prepare('SELECT id FROM organizations WHERE name = :name LIMIT 1');
         $existingOrganizationStmt->execute(['name' => $name]);
         if ($existingOrganizationStmt->fetch() !== false) {
-            jsonResponse(409, ['error' => 'Organization with this name already exists']);
+            jsonResponse(409, ['error' => 'Organizacja o tej nazwie już istnieje']);
             exit;
         }
 
@@ -2092,14 +2201,19 @@ try {
                 'event_limit' => $eventLimitValue,
             ]);
 
-            $assignmentStmt = $pdo->prepare('
-                INSERT INTO admin_organization_assignments (user_id, organization_id)
-                VALUES (:user_id, :organization_id)
-            ');
-            $assignmentStmt->execute([
-                'user_id' => $adminUserId,
-                'organization_id' => $organizationId,
-            ]);
+            if ($adminUserIds !== []) {
+                $assignmentStmt = $pdo->prepare('
+                    INSERT INTO admin_organization_assignments (user_id, organization_id)
+                    VALUES (:user_id, :organization_id)
+                ');
+
+                foreach ($adminUserIds as $adminUserId) {
+                    $assignmentStmt->execute([
+                        'user_id' => $adminUserId,
+                        'organization_id' => $organizationId,
+                    ]);
+                }
+            }
 
             $pdo->commit();
         } catch (Throwable $exception) {
@@ -2114,18 +2228,101 @@ try {
         exit;
     }
 
+    if (preg_match('#^/organizations/([^/]+)/admin-assignments$#', $path, $matches) === 1 && $method === 'PATCH') {
+        $authUser = requireAnyRole(['superadmin'], $resolveAuthenticatedUser);
+        $organizationId = (string)$matches[1];
+        $organization = $loadOrganizationById($pdo, $organizationId);
+
+        if ($organization === false) {
+            jsonResponse(404, ['error' => 'Nie znaleziono organizacji']);
+            exit;
+        }
+
+        $input = readJsonBody();
+        if (!array_key_exists('admin_user_ids', $input) || !is_array($input['admin_user_ids'])) {
+            jsonResponse(422, ['error' => 'Pole admin_user_ids jest wymagane i musi być tablicą']);
+            exit;
+        }
+
+        foreach ($input['admin_user_ids'] as $adminUserId) {
+            if (!is_string($adminUserId) || trim($adminUserId) === '') {
+                jsonResponse(422, ['error' => 'Pole admin_user_ids może zawierać tylko niepuste ciągi znaków']);
+                exit;
+            }
+        }
+
+        $adminUserIds = $normalizeStringIdList($input['admin_user_ids']);
+        $resolvedAdminUsers = $loadActiveAdminUsersByIds($pdo, $adminUserIds);
+        if (count($resolvedAdminUsers) !== count($adminUserIds)) {
+            jsonResponse(422, ['error' => 'Nie znaleziono co najmniej jednego przypisanego administratora']);
+            exit;
+        }
+
+        $pdo->beginTransaction();
+
+        try {
+            $deleteAssignmentsStmt = $pdo->prepare('DELETE FROM admin_organization_assignments WHERE organization_id = :organization_id');
+            $deleteAssignmentsStmt->execute(['organization_id' => $organizationId]);
+
+            if ($adminUserIds !== []) {
+                $insertAssignmentStmt = $pdo->prepare('
+                    INSERT INTO admin_organization_assignments (user_id, organization_id)
+                    VALUES (:user_id, :organization_id)
+                ');
+
+                foreach ($adminUserIds as $adminUserId) {
+                    $insertAssignmentStmt->execute([
+                        'user_id' => $adminUserId,
+                        'organization_id' => $organizationId,
+                    ]);
+                }
+            }
+
+            $assignedAdminNames = array_map(
+                static fn(array $adminUser): string => (string)$adminUser['name'],
+                $resolvedAdminUsers
+            );
+            $addActivityLog(
+                $pdo,
+                $assignedAdminNames === []
+                    ? sprintf('Usunieto wszystkich administratorow z organizacji %s', (string)$organization['name'])
+                    : sprintf(
+                        'Zaktualizowano administratorow organizacji %s: %s',
+                        (string)$organization['name'],
+                        implode(', ', $assignedAdminNames)
+                    ),
+                null,
+                null,
+                null,
+                (string)$authUser['id'],
+                (string)$authUser['name']
+            );
+
+            $pdo->commit();
+        } catch (Throwable $exception) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+
+            throw $exception;
+        }
+
+        jsonResponse(200, ['data' => $loadOrganizationById($pdo, $organizationId)]);
+        exit;
+    }
+
     if (preg_match('#^/organizations/([^/]+)$#', $path, $matches) === 1 && $method === 'PATCH') {
         $authUser = requireAnyRole(['superadmin', 'admin'], $resolveAuthenticatedUser);
         $organizationId = (string)$matches[1];
 
         if (!$canAccessOrganization($authUser, $organizationId)) {
-            jsonResponse(403, ['error' => 'Forbidden']);
+            jsonResponse(403, ['error' => 'Brak uprawnień']);
             exit;
         }
 
         $organization = $loadOrganizationById($pdo, $organizationId);
         if ($organization === false) {
-            jsonResponse(404, ['error' => 'Organization not found']);
+            jsonResponse(404, ['error' => 'Nie znaleziono organizacji']);
             exit;
         }
 
@@ -2133,13 +2330,13 @@ try {
         $hasName = array_key_exists('name', $input);
         $hasEventLimit = array_key_exists('event_limit', $input);
         if (!$hasName && !$hasEventLimit) {
-            jsonResponse(422, ['error' => 'At least one organization field must be provided']);
+            jsonResponse(422, ['error' => 'Podaj co najmniej jedno pole organizacji']);
             exit;
         }
 
         $name = $hasName ? trim((string)$input['name']) : (string)$organization['name'];
         if ($name === '') {
-            jsonResponse(422, ['error' => 'name is required']);
+            jsonResponse(422, ['error' => 'Nazwa jest wymagana']);
             exit;
         }
 
@@ -2147,7 +2344,7 @@ try {
         if ($hasEventLimit) {
             $eventLimit = $input['event_limit'];
             if (!is_int($eventLimit) && !(is_string($eventLimit) && ctype_digit($eventLimit))) {
-                jsonResponse(422, ['error' => 'event_limit must be a non-negative integer']);
+                jsonResponse(422, ['error' => 'Limit wydarzeń musi być liczbą całkowitą nie mniejszą niż 0']);
                 exit;
             }
 
@@ -2158,7 +2355,7 @@ try {
         $eventCountStmt->execute(['organization_id' => $organizationId]);
         $eventCount = (int)($eventCountStmt->fetch()['total'] ?? 0);
         if ($eventLimitValue < $eventCount) {
-            jsonResponse(422, ['error' => 'event_limit cannot be lower than the current number of events']);
+            jsonResponse(422, ['error' => 'Limit wydarzeń nie może być mniejszy niż bieżąca liczba wydarzeń']);
             exit;
         }
 
@@ -2168,7 +2365,7 @@ try {
             'id' => $organizationId,
         ]);
         if ($existingOrganizationStmt->fetch() !== false) {
-            jsonResponse(409, ['error' => 'Organization with this name already exists']);
+            jsonResponse(409, ['error' => 'Organizacja o tej nazwie już istnieje']);
             exit;
         }
 
@@ -2216,13 +2413,13 @@ try {
         $organizationId = (string)$matches[1];
 
         if (!$canAccessOrganization($authUser, $organizationId)) {
-            jsonResponse(403, ['error' => 'Forbidden']);
+            jsonResponse(403, ['error' => 'Brak uprawnień']);
             exit;
         }
 
         $organization = $loadOrganizationById($pdo, $organizationId);
         if ($organization === false) {
-            jsonResponse(404, ['error' => 'Organization not found']);
+            jsonResponse(404, ['error' => 'Nie znaleziono organizacji']);
             exit;
         }
 
@@ -2230,15 +2427,18 @@ try {
         $eventCountStmt->execute(['organization_id' => $organizationId]);
         $eventCount = (int)($eventCountStmt->fetch()['total'] ?? 0);
         if ($eventCount > 0) {
-            jsonResponse(422, ['error' => 'Organization with events cannot be deleted']);
+            jsonResponse(422, ['error' => 'Nie można usunąć organizacji, która ma przypisane wydarzenia']);
             exit;
         }
 
         $memberCountStmt = $pdo->prepare('SELECT COUNT(*) AS total FROM users WHERE organization_id = :organization_id AND archived_at IS NULL');
         $memberCountStmt->execute(['organization_id' => $organizationId]);
         $memberCount = (int)($memberCountStmt->fetch()['total'] ?? 0);
+        $adminAssignmentCountStmt = $pdo->prepare('SELECT COUNT(*) AS total FROM admin_organization_assignments WHERE organization_id = :organization_id');
+        $adminAssignmentCountStmt->execute(['organization_id' => $organizationId]);
+        $memberCount += (int)($adminAssignmentCountStmt->fetch()['total'] ?? 0);
         if ($memberCount > 0) {
-            jsonResponse(422, ['error' => 'Organization with assigned users cannot be deleted']);
+            jsonResponse(422, ['error' => 'Nie można usunąć organizacji z przypisanymi użytkownikami']);
             exit;
         }
 
@@ -2270,37 +2470,37 @@ try {
         $officeCloseAt = trim((string)($input['office_close_at'] ?? ''));
 
         if ($name === '' || $location === '' || $organizationId === '' || $officeOpenAt === '' || $officeCloseAt === '') {
-            jsonResponse(422, ['error' => 'name, location, organization_id, office_open_at and office_close_at are required']);
+            jsonResponse(422, ['error' => 'Nazwa, lokalizacja, organization_id, office_open_at i office_close_at są wymagane']);
             exit;
         }
 
         if (!isValidLocalDateTimeString($officeOpenAt) || !isValidLocalDateTimeString($officeCloseAt)) {
-            jsonResponse(422, ['error' => 'office_open_at and office_close_at must be valid local date-time values']);
+            jsonResponse(422, ['error' => 'office_open_at i office_close_at muszą być prawidłowymi lokalnymi datami i godzinami']);
             exit;
         }
 
         $normalizedOfficeOpenAt = normalizeLocalDateTimeString($officeOpenAt);
         $normalizedOfficeCloseAt = normalizeLocalDateTimeString($officeCloseAt);
         if ($normalizedOfficeOpenAt === null || $normalizedOfficeCloseAt === null) {
-            jsonResponse(422, ['error' => 'office_open_at and office_close_at must be valid local date-time values']);
+            jsonResponse(422, ['error' => 'office_open_at i office_close_at muszą być prawidłowymi lokalnymi datami i godzinami']);
             exit;
         }
 
         if ($normalizedOfficeOpenAt >= $normalizedOfficeCloseAt) {
-            jsonResponse(422, ['error' => 'office_open_at must be earlier than office_close_at']);
+            jsonResponse(422, ['error' => 'Godzina otwarcia biura musi być wcześniejsza niż godzina zamknięcia']);
             exit;
         }
 
         $eventDate = substr($normalizedOfficeOpenAt, 0, 10);
 
         if (!$canAccessOrganization($authUser, $organizationId)) {
-            jsonResponse(403, ['error' => 'Forbidden']);
+            jsonResponse(403, ['error' => 'Brak uprawnień']);
             exit;
         }
 
         $organization = $loadOrganizationById($pdo, $organizationId);
         if ($organization === false) {
-            jsonResponse(422, ['error' => 'Organization not found']);
+            jsonResponse(422, ['error' => 'Nie znaleziono organizacji']);
             exit;
         }
 
@@ -2309,7 +2509,7 @@ try {
         $eventCount = (int)($eventCountStmt->fetch()['total'] ?? 0);
 
         if ($eventCount >= (int)$organization['event_limit']) {
-            jsonResponse(422, ['error' => 'Organization event limit has been reached']);
+            jsonResponse(422, ['error' => 'Organizacja osiągnęła limit wydarzeń']);
             exit;
         }
 
@@ -2386,12 +2586,12 @@ try {
         $event = $loadEventById($pdo, (string)$matches[1]);
 
         if ($event === false) {
-            jsonResponse(404, ['error' => 'Event not found']);
+            jsonResponse(404, ['error' => 'Nie znaleziono wydarzenia']);
             exit;
         }
 
         if (!$canAccessEvent($authUser, $event) && !$canViewArchivedEvent($authUser, $event)) {
-            jsonResponse(403, ['error' => 'Forbidden']);
+            jsonResponse(403, ['error' => 'Brak uprawnień']);
             exit;
         }
 
@@ -2405,12 +2605,12 @@ try {
         $event = $loadEventById($pdo, $eventId);
 
         if ($event === false) {
-            jsonResponse(404, ['error' => 'Event not found']);
+            jsonResponse(404, ['error' => 'Nie znaleziono wydarzenia']);
             exit;
         }
 
         if (!$canManageEventParticipants($authUser, $event)) {
-            jsonResponse(403, ['error' => 'Forbidden']);
+            jsonResponse(403, ['error' => 'Brak uprawnień']);
             exit;
         }
 
@@ -2442,12 +2642,12 @@ try {
         $event = $loadEventById($pdo, $eventId);
 
         if ($event === false) {
-            jsonResponse(404, ['error' => 'Event not found']);
+            jsonResponse(404, ['error' => 'Nie znaleziono wydarzenia']);
             exit;
         }
 
         if (!$canManageEventParticipants($authUser, $event)) {
-            jsonResponse(403, ['error' => 'Forbidden']);
+            jsonResponse(403, ['error' => 'Brak uprawnień']);
             exit;
         }
 
@@ -2459,24 +2659,24 @@ try {
         $officeCloseAt = trim((string)($input['office_close_at'] ?? ''));
 
         if ($name === '' || $location === '' || $officeOpenAt === '' || $officeCloseAt === '') {
-            jsonResponse(422, ['error' => 'name, location, office_open_at and office_close_at are required']);
+            jsonResponse(422, ['error' => 'Nazwa, lokalizacja, office_open_at i office_close_at są wymagane']);
             exit;
         }
 
         if (!isValidLocalDateTimeString($officeOpenAt) || !isValidLocalDateTimeString($officeCloseAt)) {
-            jsonResponse(422, ['error' => 'office_open_at and office_close_at must be valid local date-time values']);
+            jsonResponse(422, ['error' => 'office_open_at i office_close_at muszą być prawidłowymi lokalnymi datami i godzinami']);
             exit;
         }
 
         $normalizedOfficeOpenAt = normalizeLocalDateTimeString($officeOpenAt);
         $normalizedOfficeCloseAt = normalizeLocalDateTimeString($officeCloseAt);
         if ($normalizedOfficeOpenAt === null || $normalizedOfficeCloseAt === null) {
-            jsonResponse(422, ['error' => 'office_open_at and office_close_at must be valid local date-time values']);
+            jsonResponse(422, ['error' => 'office_open_at i office_close_at muszą być prawidłowymi lokalnymi datami i godzinami']);
             exit;
         }
 
         if ($normalizedOfficeOpenAt >= $normalizedOfficeCloseAt) {
-            jsonResponse(422, ['error' => 'office_open_at must be earlier than office_close_at']);
+            jsonResponse(422, ['error' => 'Godzina otwarcia biura musi być wcześniejsza niż godzina zamknięcia']);
             exit;
         }
 
@@ -2522,23 +2722,23 @@ try {
         $event = $loadEventById($pdo, $eventId);
 
         if ($event === false) {
-            jsonResponse(404, ['error' => 'Event not found']);
+            jsonResponse(404, ['error' => 'Nie znaleziono wydarzenia']);
             exit;
         }
 
         if (!$canManageEventParticipants($authUser, $event)) {
-            jsonResponse(403, ['error' => 'Forbidden']);
+            jsonResponse(403, ['error' => 'Brak uprawnień']);
             exit;
         }
 
         if (trim((string)($event['archived_at'] ?? '')) !== '') {
-            jsonResponse(422, ['error' => 'Event is already archived']);
+            jsonResponse(422, ['error' => 'Wydarzenie jest już zarchiwizowane']);
             exit;
         }
 
         $officeCloseAt = parseLocalDateTimeString((string)($event['office_close_at'] ?? ''));
         if ($officeCloseAt === null || new DateTimeImmutable() <= $officeCloseAt) {
-            jsonResponse(422, ['error' => 'Only finished events can be archived']);
+            jsonResponse(422, ['error' => 'Archiwizować można tylko zakończone wydarzenia']);
             exit;
         }
 
@@ -2581,12 +2781,12 @@ try {
         $event = $loadEventById($pdo, $eventId);
 
         if ($event === false) {
-            jsonResponse(404, ['error' => 'Event not found']);
+            jsonResponse(404, ['error' => 'Nie znaleziono wydarzenia']);
             exit;
         }
 
         if (!$canManageEventParticipants($authUser, $event)) {
-            jsonResponse(403, ['error' => 'Forbidden']);
+            jsonResponse(403, ['error' => 'Brak uprawnień']);
             exit;
         }
 
@@ -2638,7 +2838,7 @@ try {
 
         $stream = fopen('php://temp', 'r+');
         if ($stream === false) {
-            jsonResponse(500, ['error' => 'Failed to initialize CSV export']);
+            jsonResponse(500, ['error' => 'Nie udało się rozpocząć eksportu CSV']);
             exit;
         }
 
@@ -2692,7 +2892,7 @@ try {
         );
 
         if ($csvContent === false) {
-            jsonResponse(500, ['error' => 'Failed to build CSV export']);
+            jsonResponse(500, ['error' => 'Nie udało się przygotować eksportu CSV']);
             exit;
         }
 
@@ -2710,12 +2910,12 @@ try {
         $event = $loadEventById($pdo, $eventId);
 
         if ($event === false) {
-            jsonResponse(404, ['error' => 'Event not found']);
+            jsonResponse(404, ['error' => 'Nie znaleziono wydarzenia']);
             exit;
         }
 
         if (!$canManageEventParticipants($authUser, $event)) {
-            jsonResponse(403, ['error' => 'Forbidden']);
+            jsonResponse(403, ['error' => 'Brak uprawnień']);
             exit;
         }
 
@@ -2739,7 +2939,7 @@ try {
 
         $stream = fopen('php://temp', 'r+');
         if ($stream === false) {
-            jsonResponse(500, ['error' => 'Failed to initialize CSV export']);
+            jsonResponse(500, ['error' => 'Nie udało się rozpocząć eksportu CSV']);
             exit;
         }
 
@@ -2773,7 +2973,7 @@ try {
         );
 
         if ($csvContent === false) {
-            jsonResponse(500, ['error' => 'Failed to build CSV export']);
+            jsonResponse(500, ['error' => 'Nie udało się przygotować eksportu CSV']);
             exit;
         }
 
@@ -2791,32 +2991,32 @@ try {
         $event = $loadEventById($pdo, $eventId);
 
         if ($event === false) {
-            jsonResponse(404, ['error' => 'Event not found']);
+            jsonResponse(404, ['error' => 'Nie znaleziono wydarzenia']);
             exit;
         }
 
         if (!$canManageEventParticipants($authUser, $event)) {
-            jsonResponse(403, ['error' => 'Forbidden']);
+            jsonResponse(403, ['error' => 'Brak uprawnień']);
             exit;
         }
 
         $input = readJsonBody(10485760);
         $csvContent = (string)($input['csv_content'] ?? '');
         if (trim($csvContent) === '') {
-            jsonResponse(422, ['error' => 'csv_content is required']);
+            jsonResponse(422, ['error' => 'Pole csv_content jest wymagane']);
             exit;
         }
 
         $parsed = $parseCsvContent($csvContent);
         $cleaned = $cleanupCsvDataset($parsed['headers'], $parsed['rows']);
         if ($cleaned['headers'] === []) {
-            jsonResponse(422, ['error' => 'CSV does not contain any non-empty data columns']);
+            jsonResponse(422, ['error' => 'Plik CSV nie zawiera żadnych niepustych kolumn danych']);
             exit;
         }
 
         $emailCandidates = $findEmailCandidateColumns($cleaned['headers'], $cleaned['rows']);
         if ($emailCandidates === []) {
-            jsonResponse(422, ['error' => 'CSV is invalid: no email address column detected. Each participant must have an email address.']);
+            jsonResponse(422, ['error' => 'Plik CSV jest nieprawidłowy: nie wykryto kolumny z adresem e-mail. Każdy uczestnik musi mieć adres e-mail.']);
             exit;
         }
 
@@ -2847,17 +3047,17 @@ try {
         $event = $loadEventById($pdo, $eventId);
 
         if ($event === false) {
-            jsonResponse(404, ['error' => 'Event not found']);
+            jsonResponse(404, ['error' => 'Nie znaleziono wydarzenia']);
             exit;
         }
 
         if (!$canManageEventParticipants($authUser, $event)) {
-            jsonResponse(403, ['error' => 'Forbidden']);
+            jsonResponse(403, ['error' => 'Brak uprawnień']);
             exit;
         }
 
         if ($loadParticipantFieldMappings($pdo, $eventId) !== []) {
-            jsonResponse(409, ['error' => 'Participant field mapping already exists for this event']);
+            jsonResponse(409, ['error' => 'Mapowanie pól uczestnika dla tego wydarzenia już istnieje']);
             exit;
         }
 
@@ -2870,12 +3070,12 @@ try {
         $fields = is_array($input['fields'] ?? null) ? $input['fields'] : [];
 
         if ($csvColumns === [] || $emailColumn === '') {
-            jsonResponse(422, ['error' => 'csv_columns and email_column are required']);
+            jsonResponse(422, ['error' => 'Pola csv_columns i email_column są wymagane']);
             exit;
         }
 
         if (!in_array($emailColumn, $csvColumns, true)) {
-            jsonResponse(422, ['error' => 'email_column must exist in CSV columns']);
+            jsonResponse(422, ['error' => 'Pole email_column musi wskazywać istniejącą kolumnę CSV']);
             exit;
         }
 
@@ -2913,12 +3113,12 @@ try {
             }
 
             if ($alias === '') {
-                jsonResponse(422, ['error' => sprintf('Alias is required for active column "%s"', $sourceColumnName)]);
+                jsonResponse(422, ['error' => sprintf('Alias jest wymagany dla aktywnej kolumny "%s"', $sourceColumnName)]);
                 exit;
             }
 
             if (!in_array($fieldRole, ['display_name_part', 'bib_number', 'custom'], true)) {
-                jsonResponse(422, ['error' => sprintf('Invalid field role for column "%s"', $sourceColumnName)]);
+                jsonResponse(422, ['error' => sprintf('Nieprawidłowa rola pola dla kolumny "%s"', $sourceColumnName)]);
                 exit;
             }
 
@@ -2937,7 +3137,7 @@ try {
         }
 
         if ($displayNamePartCount === 0) {
-            jsonResponse(422, ['error' => 'At least one active display_name_part mapping is required']);
+            jsonResponse(422, ['error' => 'Wymagane jest co najmniej jedno aktywne mapowanie display_name_part']);
             exit;
         }
 
@@ -3005,25 +3205,25 @@ try {
         $event = $loadEventById($pdo, $eventId);
 
         if ($event === false) {
-            jsonResponse(404, ['error' => 'Event not found']);
+            jsonResponse(404, ['error' => 'Nie znaleziono wydarzenia']);
             exit;
         }
 
         if (!$canManageEventParticipants($authUser, $event)) {
-            jsonResponse(403, ['error' => 'Forbidden']);
+            jsonResponse(403, ['error' => 'Brak uprawnień']);
             exit;
         }
 
         $mappings = $loadParticipantFieldMappings($pdo, $eventId);
         if ($mappings === []) {
-            jsonResponse(422, ['error' => 'Participant field mapping must be configured before import']);
+            jsonResponse(422, ['error' => 'Przed importem trzeba skonfigurować mapowanie pól uczestnika']);
             exit;
         }
 
         $input = readJsonBody(10485760);
         $csvContent = (string)($input['csv_content'] ?? '');
         if (trim($csvContent) === '') {
-            jsonResponse(422, ['error' => 'csv_content is required']);
+            jsonResponse(422, ['error' => 'Pole csv_content jest wymagane']);
             exit;
         }
 
@@ -3036,7 +3236,7 @@ try {
         $missingColumns = array_values(array_diff($requiredColumns, $cleaned['headers']));
         if ($missingColumns !== []) {
             jsonResponse(422, [
-                'error' => 'CSV is missing required columns from the saved mapping',
+                'error' => 'W pliku CSV brakuje wymaganych kolumn z zapisanego mapowania',
                 'missing_columns' => $missingColumns,
             ]);
             exit;
@@ -3051,7 +3251,7 @@ try {
         }
 
         if ($emailMapping === null) {
-            jsonResponse(500, ['error' => 'Saved mapping is invalid: missing email column']);
+            jsonResponse(500, ['error' => 'Zapisane mapowanie jest nieprawidłowe: brak kolumny e-mail']);
             exit;
         }
 
@@ -3157,12 +3357,12 @@ try {
         $event = $loadEventById($pdo, $eventId);
 
         if ($event === false) {
-            jsonResponse(404, ['error' => 'Event not found']);
+            jsonResponse(404, ['error' => 'Nie znaleziono wydarzenia']);
             exit;
         }
 
         if (!$canManageEventParticipants($authUser, $event)) {
-            jsonResponse(403, ['error' => 'Forbidden']);
+            jsonResponse(403, ['error' => 'Brak uprawnień']);
             exit;
         }
 
@@ -3182,18 +3382,18 @@ try {
         $event = $loadEventById($pdo, $eventId);
 
         if ($event === false) {
-            jsonResponse(404, ['error' => 'Event not found']);
+            jsonResponse(404, ['error' => 'Nie znaleziono wydarzenia']);
             exit;
         }
 
         if (!$canManageEventParticipants($authUser, $event)) {
-            jsonResponse(403, ['error' => 'Forbidden']);
+            jsonResponse(403, ['error' => 'Brak uprawnień']);
             exit;
         }
 
         $mappings = $loadParticipantFieldMappings($pdo, $eventId);
         if ($mappings === []) {
-            jsonResponse(422, ['error' => 'Manual participant creation is available only after the first CSV mapping is saved']);
+            jsonResponse(422, ['error' => 'Ręczne dodawanie uczestników jest dostępne dopiero po zapisaniu pierwszego mapowania CSV']);
             exit;
         }
 
@@ -3202,18 +3402,18 @@ try {
         $fieldValues = is_array($input['field_values'] ?? null) ? $input['field_values'] : [];
 
         if ($email === '' || !isValidEmailAddress($email)) {
-            jsonResponse(422, ['error' => 'A valid email is required']);
+            jsonResponse(422, ['error' => 'Wymagany jest prawidłowy adres e-mail']);
             exit;
         }
 
         $resolvedData = $buildParticipantDataFromMappings($mappings, $fieldValues);
         if ($resolvedData['display_name'] === '') {
-            jsonResponse(422, ['error' => 'At least one display name field is required']);
+            jsonResponse(422, ['error' => 'Wymagane jest co najmniej jedno pole składające się na nazwę uczestnika']);
             exit;
         }
 
         if ($resolvedData['missing_fields'] !== []) {
-            jsonResponse(422, ['error' => 'Missing required participant fields', 'missing_fields' => $resolvedData['missing_fields']]);
+            jsonResponse(422, ['error' => 'Brakuje wymaganych pól uczestnika', 'missing_fields' => $resolvedData['missing_fields']]);
             exit;
         }
 
@@ -3245,18 +3445,18 @@ try {
         $eventLimit = $input['event_limit'] ?? null;
 
         if (!$canAccessOrganization($authUser, $organizationId)) {
-            jsonResponse(403, ['error' => 'Forbidden']);
+            jsonResponse(403, ['error' => 'Brak uprawnień']);
             exit;
         }
 
         if (!is_int($eventLimit) && !(is_string($eventLimit) && ctype_digit($eventLimit))) {
-            jsonResponse(422, ['error' => 'event_limit must be a non-negative integer']);
+            jsonResponse(422, ['error' => 'Limit wydarzeń musi być liczbą całkowitą nie mniejszą niż 0']);
             exit;
         }
 
         $organization = $loadOrganizationById($pdo, $organizationId);
         if ($organization === false) {
-            jsonResponse(404, ['error' => 'Organization not found']);
+            jsonResponse(404, ['error' => 'Nie znaleziono organizacji']);
             exit;
         }
 
@@ -3267,7 +3467,7 @@ try {
         $previousEventLimitValue = (int)$organization['event_limit'];
 
         if ($eventLimitValue < $eventCount) {
-            jsonResponse(422, ['error' => 'event_limit cannot be lower than the current number of events']);
+            jsonResponse(422, ['error' => 'Limit wydarzeń nie może być mniejszy niż bieżąca liczba wydarzeń']);
             exit;
         }
 
@@ -3307,12 +3507,12 @@ try {
         ));
 
         if ($name === '' || $email === '' || $role === '') {
-            jsonResponse(422, ['error' => 'name, email and role are required']);
+            jsonResponse(422, ['error' => 'Nazwa, adres e-mail i rola są wymagane']);
             exit;
         }
 
         if (!isValidEmailAddress($email)) {
-            jsonResponse(422, ['error' => 'email must be a valid email address']);
+            jsonResponse(422, ['error' => 'Adres e-mail musi być prawidłowy']);
             exit;
         }
 
@@ -3323,26 +3523,27 @@ try {
         ];
 
         if (!in_array($role, $allowedRolesByCreator[(string)$authUser['role']] ?? [], true)) {
-            jsonResponse(403, ['error' => 'Forbidden']);
+            jsonResponse(403, ['error' => 'Brak uprawnień']);
             exit;
         }
 
         if ($role === 'admin') {
             if ($authUser['role'] !== 'superadmin') {
-                jsonResponse(403, ['error' => 'Forbidden']);
+                jsonResponse(403, ['error' => 'Brak uprawnień']);
                 exit;
             }
 
             $assignedEvents = [];
+            $organizationId = '';
         } else {
             if ($authUser['role'] === 'superadmin') {
                 if ($organizationId === '') {
-                    jsonResponse(422, ['error' => 'organization_id is required for this role']);
+                    jsonResponse(422, ['error' => 'Dla tej roli pole organization_id jest wymagane']);
                     exit;
                 }
             } elseif ($authUser['role'] === 'admin') {
                 if ($organizationId === '' || !in_array($organizationId, $authUser['organization_ids'] ?? [], true)) {
-                    jsonResponse(403, ['error' => 'Forbidden']);
+                    jsonResponse(403, ['error' => 'Brak uprawnień']);
                     exit;
                 }
             } else {
@@ -3350,12 +3551,12 @@ try {
             }
 
             if ($organizationId === '') {
-                jsonResponse(422, ['error' => 'organization_id is required for this role']);
+                jsonResponse(422, ['error' => 'Dla tej roli pole organization_id jest wymagane']);
                 exit;
             }
 
             if ($loadOrganizationById($pdo, $organizationId) === false) {
-                jsonResponse(422, ['error' => 'Organization not found']);
+                jsonResponse(422, ['error' => 'Nie znaleziono organizacji']);
                 exit;
             }
 
@@ -3370,15 +3571,10 @@ try {
             }
         }
 
-        if ($role === 'admin' && $organizationId !== '' && $loadOrganizationById($pdo, $organizationId) === false) {
-            jsonResponse(422, ['error' => 'Organization not found']);
-            exit;
-        }
-
         $existingUserStmt = $pdo->prepare('SELECT id FROM users WHERE email = :email LIMIT 1');
         $existingUserStmt->execute(['email' => $email]);
         if ($existingUserStmt->fetch() !== false) {
-            jsonResponse(409, ['error' => 'User with this email already exists']);
+            jsonResponse(409, ['error' => 'Użytkownik z tym adresem e-mail już istnieje']);
             exit;
         }
 
@@ -3400,17 +3596,6 @@ try {
                 'role' => $role,
                 'organization_id' => $role === 'admin' ? null : $organizationId,
             ]);
-
-            if ($role === 'admin' && $organizationId !== '') {
-                $assignmentStmt = $pdo->prepare('
-                    INSERT INTO admin_organization_assignments (user_id, organization_id)
-                    VALUES (:user_id, :organization_id)
-                ');
-                $assignmentStmt->execute([
-                    'user_id' => $userId,
-                    'organization_id' => $organizationId,
-                ]);
-            }
 
             if ($isScannerRole($role) && $assignedEvents !== []) {
                 $assignmentStmt = $pdo->prepare('
@@ -3489,23 +3674,23 @@ try {
 
         $targetUser = $loadUserById($pdo, $userId);
         if ($targetUser === false) {
-            jsonResponse(404, ['error' => 'User not found']);
+            jsonResponse(404, ['error' => 'Nie znaleziono użytkownika']);
             exit;
         }
 
         if (!$isScannerRole((string)($targetUser['role'] ?? ''))) {
-            jsonResponse(422, ['error' => 'Only scanners can have event assignments']);
+            jsonResponse(422, ['error' => 'Przypisania do wydarzeń mogą mieć tylko operatorzy']);
             exit;
         }
 
         if (!$canManageTargetUser($authUser, $targetUser)) {
-            jsonResponse(403, ['error' => 'Forbidden']);
+            jsonResponse(403, ['error' => 'Brak uprawnień']);
             exit;
         }
 
         $organizationId = (string)($targetUser['organization_id'] ?? '');
         if ($organizationId === '') {
-            jsonResponse(422, ['error' => 'Scanner must belong to an organization']);
+            jsonResponse(422, ['error' => 'Operator musi należeć do organizacji']);
             exit;
         }
 
@@ -3586,13 +3771,13 @@ try {
         $role = trim((string)($input['role'] ?? ''));
 
         if ($role === '') {
-            jsonResponse(422, ['error' => 'role is required']);
+            jsonResponse(422, ['error' => 'Rola jest wymagana']);
             exit;
         }
 
         $targetUser = $loadUserById($pdo, $userId);
         if ($targetUser === false) {
-            jsonResponse(404, ['error' => 'User not found']);
+            jsonResponse(404, ['error' => 'Nie znaleziono użytkownika']);
             exit;
         }
 
@@ -3603,22 +3788,22 @@ try {
         ];
 
         if (!in_array($role, $allowedRolesByCreator[(string)$authUser['role']] ?? [], true)) {
-            jsonResponse(403, ['error' => 'Forbidden']);
+            jsonResponse(403, ['error' => 'Brak uprawnień']);
             exit;
         }
 
         if (!$canManageTargetUser($authUser, $targetUser)) {
-            jsonResponse(403, ['error' => 'Forbidden']);
+            jsonResponse(403, ['error' => 'Brak uprawnień']);
             exit;
         }
 
         if (($targetUser['role'] ?? '') === 'admin' || $role === 'admin') {
-            jsonResponse(422, ['error' => 'Changing admin roles is not supported by this endpoint']);
+            jsonResponse(422, ['error' => 'Zmiana ról administratorów nie jest obsługiwana przez ten endpoint']);
             exit;
         }
 
         if (($targetUser['organization_id'] ?? null) === null) {
-            jsonResponse(422, ['error' => 'Target user must belong to an organization']);
+            jsonResponse(422, ['error' => 'Docelowy użytkownik musi należeć do organizacji']);
             exit;
         }
 
@@ -3657,28 +3842,28 @@ try {
         $email = normalizeEmailAddress((string)($input['email'] ?? ''));
 
         if ($name === '' || $email === '') {
-            jsonResponse(422, ['error' => 'name and email are required']);
+            jsonResponse(422, ['error' => 'Nazwa i adres e-mail są wymagane']);
             exit;
         }
 
         if (!isValidEmailAddress($email)) {
-            jsonResponse(422, ['error' => 'email must be a valid email address']);
+            jsonResponse(422, ['error' => 'Adres e-mail musi być prawidłowy']);
             exit;
         }
 
         $targetUser = $loadUserById($pdo, $userId);
         if ($targetUser === false) {
-            jsonResponse(404, ['error' => 'User not found']);
+            jsonResponse(404, ['error' => 'Nie znaleziono użytkownika']);
             exit;
         }
 
         if (!$canManageTargetUser($authUser, $targetUser)) {
-            jsonResponse(403, ['error' => 'Forbidden']);
+            jsonResponse(403, ['error' => 'Brak uprawnień']);
             exit;
         }
 
         if (in_array((string)($targetUser['role'] ?? ''), ['admin', 'superadmin'], true)) {
-            jsonResponse(422, ['error' => 'Only organizer and scanner accounts can be updated']);
+            jsonResponse(422, ['error' => 'Aktualizować można tylko konta organizatorów i operatorów']);
             exit;
         }
 
@@ -3696,7 +3881,7 @@ try {
         ]);
 
         if ($emailOwnerStmt->fetch() !== false) {
-            jsonResponse(409, ['error' => 'User with this email already exists']);
+            jsonResponse(409, ['error' => 'Użytkownik z tym adresem e-mail już istnieje']);
             exit;
         }
 
@@ -3746,17 +3931,17 @@ try {
 
         $targetUser = $loadUserById($pdo, $userId);
         if ($targetUser === false) {
-            jsonResponse(404, ['error' => 'User not found']);
+            jsonResponse(404, ['error' => 'Nie znaleziono użytkownika']);
             exit;
         }
 
         if (!$canManageTargetUser($authUser, $targetUser)) {
-            jsonResponse(403, ['error' => 'Forbidden']);
+            jsonResponse(403, ['error' => 'Brak uprawnień']);
             exit;
         }
 
         if (!in_array((string)($targetUser['role'] ?? ''), ['editor', 'scanner', 'scanner_plus'], true)) {
-            jsonResponse(422, ['error' => 'Only organizer and scanner accounts can receive an admin-triggered password reset']);
+            jsonResponse(422, ['error' => 'Reset hasła wywołany przez administratora można wysłać tylko do kont organizatorów i operatorów']);
             exit;
         }
 
@@ -3780,7 +3965,7 @@ try {
                 exit;
             }
 
-            jsonResponse(500, ['error' => 'Could not send password reset email']);
+            jsonResponse(500, ['error' => 'Nie udało się wysłać wiadomości do resetu hasła']);
             exit;
         }
 
@@ -3794,17 +3979,17 @@ try {
 
         $targetUser = $loadUserById($pdo, $userId);
         if ($targetUser === false) {
-            jsonResponse(404, ['error' => 'User not found']);
+            jsonResponse(404, ['error' => 'Nie znaleziono użytkownika']);
             exit;
         }
 
         if (!$canManageTargetUser($authUser, $targetUser)) {
-            jsonResponse(403, ['error' => 'Forbidden']);
+            jsonResponse(403, ['error' => 'Brak uprawnień']);
             exit;
         }
 
         if (!in_array((string)($targetUser['role'] ?? ''), ['editor', 'scanner', 'scanner_plus'], true)) {
-            jsonResponse(422, ['error' => 'Only organizer and scanner accounts can be archived']);
+            jsonResponse(422, ['error' => 'Archiwizować można tylko konta organizatorów i operatorów']);
             exit;
         }
 
@@ -3867,13 +4052,13 @@ try {
         $participant = $loadParticipantById($pdo, (int)$matches[1]);
 
         if ($participant === false) {
-            jsonResponse(404, ['error' => 'Participant not found']);
+            jsonResponse(404, ['error' => 'Nie znaleziono uczestnika']);
             exit;
         }
 
         [$event, $accessError] = $assertParticipantEventAccess($pdo, $authUser, $participant);
         if ($accessError !== null || $event === null || !$canManageEventParticipants($authUser, $event)) {
-            jsonResponse($accessError === 'Forbidden' ? 403 : 422, ['error' => $accessError ?? 'Forbidden']);
+            jsonResponse($accessError === 'Brak uprawnień' ? 403 : 422, ['error' => $accessError ?? 'Brak uprawnień']);
             exit;
         }
 
@@ -3893,13 +4078,13 @@ try {
         $participant = $loadParticipantById($pdo, (int)$matches[1]);
 
         if ($participant === false) {
-            jsonResponse(404, ['error' => 'Participant not found']);
+            jsonResponse(404, ['error' => 'Nie znaleziono uczestnika']);
             exit;
         }
 
         [$event, $accessError] = $assertParticipantEventAccess($pdo, $authUser, $participant);
         if ($accessError !== null || $event === null || !$canManageEventParticipants($authUser, $event)) {
-            jsonResponse($accessError === 'Forbidden' ? 403 : 422, ['error' => $accessError ?? 'Forbidden']);
+            jsonResponse($accessError === 'Brak uprawnień' ? 403 : 422, ['error' => $accessError ?? 'Brak uprawnień']);
             exit;
         }
 
@@ -3944,12 +4129,12 @@ try {
         $event = $loadEventById($pdo, $eventId);
 
         if ($event === false) {
-            jsonResponse(404, ['error' => 'Event not found']);
+            jsonResponse(404, ['error' => 'Nie znaleziono wydarzenia']);
             exit;
         }
 
         if (!$canManageEventParticipants($authUser, $event)) {
-            jsonResponse(403, ['error' => 'Forbidden']);
+            jsonResponse(403, ['error' => 'Brak uprawnień']);
             exit;
         }
 
@@ -4050,23 +4235,23 @@ try {
         $mutations = is_array($input['mutations'] ?? null) ? $input['mutations'] : [];
 
         if ($eventId === '') {
-            jsonResponse(422, ['error' => 'event_id is required']);
+            jsonResponse(422, ['error' => 'Pole event_id jest wymagane']);
             exit;
         }
 
         if ($mutations === []) {
-            jsonResponse(422, ['error' => 'mutations are required']);
+            jsonResponse(422, ['error' => 'Pole mutations jest wymagane']);
             exit;
         }
 
         $event = $loadEventById($pdo, $eventId);
         if ($event === false) {
-            jsonResponse(404, ['error' => 'Event not found']);
+            jsonResponse(404, ['error' => 'Nie znaleziono wydarzenia']);
             exit;
         }
 
         if (!$canManageEventParticipants($authUser, $event)) {
-            jsonResponse(403, ['error' => 'Forbidden']);
+            jsonResponse(403, ['error' => 'Brak uprawnień']);
             exit;
         }
 
@@ -4091,13 +4276,13 @@ try {
             $deviceId = trim((string)($mutation['device_id'] ?? ''));
 
             if ($clientMutationId === '' || !$isValidParticipantStatus($requestedStatus) || !$isValidParticipantStatus($baseStatus)) {
-                $report['errors'][] = ['index' => $index, 'error' => 'Mutation must include client_mutation_id, requested_status and base_status'];
+                $report['errors'][] = ['index' => $index, 'error' => 'Mutacja musi zawierać pola client_mutation_id, requested_status i base_status'];
                 continue;
             }
 
             $participant = $loadParticipantById($pdo, $participantId);
             if ($participant === false || (string)($participant['event_id'] ?? '') !== $eventId) {
-                $report['errors'][] = ['index' => $index, 'error' => 'Participant not found in the target event'];
+                $report['errors'][] = ['index' => $index, 'error' => 'Nie znaleziono uczestnika in the target event'];
                 continue;
             }
 
@@ -4186,25 +4371,25 @@ try {
         $qrCode = trim((string)($input['qr_code'] ?? ''));
 
         if ($qrCode === '') {
-            jsonResponse(422, ['error' => 'qr_code is required']);
+            jsonResponse(422, ['error' => 'Pole qr_code jest wymagane']);
             exit;
         }
 
         $participant = $loadParticipantByQrCode($pdo, $qrCode);
         if ($participant === false) {
-            jsonResponse(404, ['error' => 'Participant not found']);
+            jsonResponse(404, ['error' => 'Nie znaleziono uczestnika']);
             exit;
         }
 
         $eventId = trim((string)($participant['event_id'] ?? ''));
         if ($eventId === '') {
-            jsonResponse(422, ['error' => 'Participant is not assigned to an event']);
+            jsonResponse(422, ['error' => 'Uczestnik nie jest przypisany do wydarzenia']);
             exit;
         }
 
         $event = $loadEventById($pdo, $eventId);
         if ($event === false) {
-            jsonResponse(404, ['error' => 'Event not found']);
+            jsonResponse(404, ['error' => 'Nie znaleziono wydarzenia']);
             exit;
         }
 
@@ -4235,13 +4420,13 @@ try {
         $participant = $loadParticipantById($pdo, (int)$matches[1]);
 
         if ($participant === false) {
-            jsonResponse(404, ['error' => 'Participant not found']);
+            jsonResponse(404, ['error' => 'Nie znaleziono uczestnika']);
             exit;
         }
 
         [$event, $accessError] = $assertParticipantEventAccess($pdo, $authUser, $participant);
         if ($accessError !== null || $event === null || !$canManageEventParticipants($authUser, $event)) {
-            jsonResponse($accessError === 'Forbidden' ? 403 : 422, ['error' => $accessError ?? 'Forbidden']);
+            jsonResponse($accessError === 'Brak uprawnień' ? 403 : 422, ['error' => $accessError ?? 'Brak uprawnień']);
             exit;
         }
 
@@ -4256,28 +4441,28 @@ try {
         $baseStatus = trim((string)($input['base_status'] ?? ''));
 
         if ($nextStatus === '' && $email === null && $fieldValues === null) {
-            jsonResponse(422, ['error' => 'At least one participant field must be provided']);
+            jsonResponse(422, ['error' => 'Podaj co najmniej jedno pole uczestnika']);
             exit;
         }
 
         if ($clientMutationId !== '' && strlen($clientMutationId) > 64) {
-            jsonResponse(422, ['error' => 'client_mutation_id is too long']);
+            jsonResponse(422, ['error' => 'Pole client_mutation_id jest zbyt długie']);
             exit;
         }
 
         if ($eventIdFromClient !== '' && $eventIdFromClient !== (string)$participant['event_id']) {
-            jsonResponse(409, ['error' => 'Participant event does not match requested event', 'code' => 'event_mismatch', 'data' => $participant]);
+            jsonResponse(409, ['error' => 'Wydarzenie uczestnika nie zgadza się z żądanym wydarzeniem', 'code' => 'event_mismatch', 'data' => $participant]);
             exit;
         }
 
         if ($baseStatus !== '' && !$isValidParticipantStatus($baseStatus)) {
-            jsonResponse(422, ['error' => 'Unsupported base participant status']);
+            jsonResponse(422, ['error' => 'Nieobsługiwany bazowy status uczestnika']);
             exit;
         }
 
         if ($nextStatus !== '') {
             if (!$isValidParticipantStatus($nextStatus)) {
-                jsonResponse(422, ['error' => 'Unsupported participant status']);
+                jsonResponse(422, ['error' => 'Nieobsługiwany status uczestnika']);
                 exit;
             }
 
@@ -4285,7 +4470,7 @@ try {
                 $existingMutation = $loadClientMutationById($pdo, $clientMutationId);
                 if ($existingMutation !== false) {
                     if ((int)$existingMutation['participant_id'] !== (int)$participant['id']) {
-                        jsonResponse(409, ['error' => 'client_mutation_id is already bound to another participant', 'code' => 'mutation_id_conflict']);
+                        jsonResponse(409, ['error' => 'client_mutation_id jest już powiązany z innym uczestnikiem', 'code' => 'mutation_id_conflict']);
                         exit;
                     }
 
@@ -4301,7 +4486,7 @@ try {
 
             if ($baseStatus !== '' && $baseStatus !== (string)$participant['status']) {
                 jsonResponse(409, [
-                    'error' => 'Participant status changed on the server. Review required.',
+                    'error' => 'Status uczestnika zmienił się na serwerze. Wymagana jest weryfikacja.',
                     'code' => 'state_conflict',
                     'data' => $participant,
                 ]);
@@ -4385,13 +4570,13 @@ try {
         if ($email !== null || $fieldValues !== null) {
             $mappings = $loadParticipantFieldMappings($pdo, (string)$participant['event_id']);
             if ($mappings === []) {
-                jsonResponse(422, ['error' => 'Participant reassignment requires saved field mapping for the event']);
+                jsonResponse(422, ['error' => 'Przepisanie pakietu uczestnika wymaga zapisanego mapowania pól dla wydarzenia']);
                 exit;
             }
 
             $resolvedEmail = $email ?? normalizeEmailAddress((string)$participant['email']);
             if ($resolvedEmail === '' || !isValidEmailAddress($resolvedEmail)) {
-                jsonResponse(422, ['error' => 'A valid email is required']);
+                jsonResponse(422, ['error' => 'Wymagany jest prawidłowy adres e-mail']);
                 exit;
             }
 
@@ -4404,12 +4589,12 @@ try {
             );
 
             if ($resolvedData['missing_fields'] !== []) {
-                jsonResponse(422, ['error' => 'All participant columns are required for package reassignment', 'missing_fields' => $resolvedData['missing_fields']]);
+                jsonResponse(422, ['error' => 'Do przepisania pakietu wymagane są wszystkie kolumny uczestnika', 'missing_fields' => $resolvedData['missing_fields']]);
                 exit;
             }
 
             if ($resolvedData['display_name'] === '') {
-                jsonResponse(422, ['error' => 'At least one display name field is required']);
+                jsonResponse(422, ['error' => 'Wymagane jest co najmniej jedno pole składające się na nazwę uczestnika']);
                 exit;
             }
 
@@ -4457,13 +4642,13 @@ try {
         $participant = $loadParticipantById($pdo, (int)$matches[1]);
 
         if ($participant === false) {
-            jsonResponse(404, ['error' => 'Participant not found']);
+            jsonResponse(404, ['error' => 'Nie znaleziono uczestnika']);
             exit;
         }
 
         [$event, $accessError] = $assertParticipantEventAccess($pdo, $authUser, $participant);
         if ($accessError !== null || $event === null) {
-            jsonResponse($accessError === 'Forbidden' ? 403 : 422, ['error' => $accessError ?? 'Forbidden']);
+            jsonResponse($accessError === 'Brak uprawnień' ? 403 : 422, ['error' => $accessError ?? 'Brak uprawnień']);
             exit;
         }
 
@@ -4487,13 +4672,13 @@ try {
         $participant = $loadParticipantById($pdo, (int)$matches[1]);
 
         if ($participant === false) {
-            jsonResponse(404, ['error' => 'Participant not found']);
+            jsonResponse(404, ['error' => 'Nie znaleziono uczestnika']);
             exit;
         }
 
         [$event, $accessError] = $assertParticipantEventAccess($pdo, $authUser, $participant);
         if ($accessError !== null || $event === null) {
-            jsonResponse($accessError === 'Forbidden' ? 403 : 422, ['error' => $accessError ?? 'Forbidden']);
+            jsonResponse($accessError === 'Brak uprawnień' ? 403 : 422, ['error' => $accessError ?? 'Brak uprawnień']);
             exit;
         }
 
@@ -4538,23 +4723,23 @@ try {
         $displayName = trim((string)($input['display_name'] ?? trim($firstName . ' ' . $lastName)));
 
         if ($eventId === '' || $displayName === '' || $email === '') {
-            jsonResponse(422, ['error' => 'event_id, display_name and email are required']);
+            jsonResponse(422, ['error' => 'Pola event_id, display_name i email są wymagane']);
             exit;
         }
 
         if (!isValidEmailAddress($email)) {
-            jsonResponse(422, ['error' => 'email must be a valid email address']);
+            jsonResponse(422, ['error' => 'Adres e-mail musi być prawidłowy']);
             exit;
         }
 
         $event = $loadEventById($pdo, $eventId);
         if ($event === false) {
-            jsonResponse(422, ['error' => 'Event not found']);
+            jsonResponse(422, ['error' => 'Nie znaleziono wydarzenia']);
             exit;
         }
 
         if (!$canManageEventParticipants($authUser, $event)) {
-            jsonResponse(403, ['error' => 'Forbidden']);
+            jsonResponse(403, ['error' => 'Brak uprawnień']);
             exit;
         }
 
@@ -4589,13 +4774,13 @@ try {
         $participant = $loadParticipantById($pdo, (int)$matches[1]);
 
         if ($participant === false) {
-            jsonResponse(404, ['error' => 'Participant not found']);
+            jsonResponse(404, ['error' => 'Nie znaleziono uczestnika']);
             exit;
         }
 
         [$event, $accessError] = $assertParticipantEventAccess($pdo, $authUser, $participant);
         if ($accessError !== null || $event === null) {
-            jsonResponse($accessError === 'Forbidden' ? 403 : 422, ['error' => $accessError ?? 'Forbidden']);
+            jsonResponse($accessError === 'Brak uprawnień' ? 403 : 422, ['error' => $accessError ?? 'Brak uprawnień']);
             exit;
         }
 
@@ -4608,13 +4793,13 @@ try {
         $participant = $loadParticipantById($pdo, (int)$matches[1]);
 
         if ($participant === false) {
-            jsonResponse(404, ['error' => 'Participant not found']);
+            jsonResponse(404, ['error' => 'Nie znaleziono uczestnika']);
             exit;
         }
 
         [$event, $accessError] = $assertParticipantEventAccess($pdo, $authUser, $participant);
         if ($accessError !== null || $event === null || !$canManageEventParticipants($authUser, $event)) {
-            jsonResponse($accessError === 'Forbidden' ? 403 : 422, ['error' => $accessError ?? 'Forbidden']);
+            jsonResponse($accessError === 'Brak uprawnień' ? 403 : 422, ['error' => $accessError ?? 'Brak uprawnień']);
             exit;
         }
 
@@ -4647,7 +4832,7 @@ try {
         exit;
     }
 
-    jsonResponse(404, ['error' => 'Route not found']);
+    jsonResponse(404, ['error' => 'Nie znaleziono endpointu']);
 } catch (PDOException $exception) {
     if ($exception->getCode() === '23000') {
         jsonResponse(409, [

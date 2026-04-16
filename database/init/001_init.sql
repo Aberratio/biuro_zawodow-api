@@ -119,7 +119,6 @@ CREATE TABLE admin_organization_assignments (
     organization_id VARCHAR(64) NOT NULL,
     assigned_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (user_id, organization_id),
-    UNIQUE KEY uq_admin_organization_assignments_organization_id (organization_id),
     KEY idx_admin_organization_assignments_organization_id (organization_id),
     CONSTRAINT fk_admin_organization_assignments_user
         FOREIGN KEY (user_id) REFERENCES users(id)
@@ -292,8 +291,8 @@ ON DUPLICATE KEY UPDATE
 INSERT INTO events (id, name, event_date, location, organization_id, office_open_at, office_close_at)
 VALUES
     ('evt-1', 'Bieg Piastowski 10km', '2026-04-12', 'Gniezno, Park Miejski', 'org-1', '2026-03-28 07:00:00', '2026-03-28 18:00:00'),
-    ('evt-2', 'Triathlon Poznan Sprint', '2026-05-18', 'Poznan, Malta', 'org-1', '2026-05-18 06:30:00', '2026-05-18 14:30:00'),
-    ('evt-3', 'Maraton Wroclaw', '2026-06-07', 'Wroclaw, Hala Stulecia', 'org-2', '2026-06-07 05:30:00', '2026-06-07 16:00:00')
+    ('evt-2', 'Triathlon Poznań Sprint', '2026-05-18', 'Poznań, Malta', 'org-1', '2026-05-18 06:30:00', '2026-05-18 14:30:00'),
+    ('evt-3', 'Maraton Wrocław', '2026-06-07', 'Wrocław, Hala Stulecia', 'org-2', '2026-06-07 05:30:00', '2026-06-07 16:00:00')
 ON DUPLICATE KEY UPDATE
     name = VALUES(name),
     event_date = VALUES(event_date),
@@ -308,7 +307,7 @@ VALUES
     ('u-1', 'Admin SportEvents', 'admin@sportevents.pl', '$2y$10$ls0v32FVolwU70qQEiZlY.xpRMoq7AJpTSUgXlFkKrDHN7BVvp/qK', 'admin', NULL),
     ('u-1b', 'Admin RunPoland', 'admin@runpoland.pl', '$2y$10$ls0v32FVolwU70qQEiZlY.xpRMoq7AJpTSUgXlFkKrDHN7BVvp/qK', 'admin', NULL),
     ('u-2', 'Organizator Gniezno', 'org.gniezno@sportevents.pl', '$2y$10$ls0v32FVolwU70qQEiZlY.xpRMoq7AJpTSUgXlFkKrDHN7BVvp/qK', 'editor', 'org-1'),
-    ('u-3', 'Organizator Poznan', 'org.poznan@sportevents.pl', '$2y$10$ls0v32FVolwU70qQEiZlY.xpRMoq7AJpTSUgXlFkKrDHN7BVvp/qK', 'editor', 'org-1'),
+    ('u-3', 'Organizator Poznań', 'org.poznan@sportevents.pl', '$2y$10$ls0v32FVolwU70qQEiZlY.xpRMoq7AJpTSUgXlFkKrDHN7BVvp/qK', 'editor', 'org-1'),
     ('u-4', 'Wolontariusz Operator 1', 'skaner1@sportevents.pl', '$2y$10$ls0v32FVolwU70qQEiZlY.xpRMoq7AJpTSUgXlFkKrDHN7BVvp/qK', 'scanner', 'org-1'),
     ('u-5', 'Wolontariusz Operator 2', 'skaner2@sportevents.pl', '$2y$10$ls0v32FVolwU70qQEiZlY.xpRMoq7AJpTSUgXlFkKrDHN7BVvp/qK', 'scanner', 'org-1')
 ON DUPLICATE KEY UPDATE

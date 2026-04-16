@@ -103,7 +103,7 @@ final class MailService
     private static function createConfiguredMailer(): PHPMailer
     {
         if (!class_exists(PHPMailer::class)) {
-            throw new RuntimeException('PHPMailer is not installed. Run composer install in biuro_zawodow-api.');
+            throw new RuntimeException('PHPMailer nie jest zainstalowany. Uruchom composer install w katalogu biuro_zawodow-api.');
         }
 
         $host = trim((string)(getenv('MAIL_HOST') ?: ''));
@@ -114,7 +114,7 @@ final class MailService
         $fromName = trim((string)(getenv('MAIL_FROM_NAME') ?: 'Biuro Zawodów'));
 
         if ($host === '' || $port <= 0 || $username === '' || $password === '' || $fromAddress === '') {
-            throw new RuntimeException('SMTP is not configured. Fill MAIL_HOST, MAIL_PORT, MAIL_USERNAME, MAIL_PASSWORD and MAIL_FROM_ADDRESS.');
+            throw new RuntimeException('SMTP nie jest skonfigurowane. Uzupełnij MAIL_HOST, MAIL_PORT, MAIL_USERNAME, MAIL_PASSWORD oraz MAIL_FROM_ADDRESS.');
         }
 
         $encryption = strtolower(trim((string)(getenv('MAIL_ENCRYPTION') ?: 'tls')));
@@ -155,7 +155,7 @@ final class MailService
 
     private static function buildSendException(PHPMailer $mail, PHPMailerException $exception): RuntimeException
     {
-        $message = 'Failed to send email: ' . $exception->getMessage();
+        $message = 'Nie udało się wysłać wiadomości e-mail: ' . $exception->getMessage();
         if ((getenv('APP_DEBUG') ?: 'false') === 'true') {
             foreach ($mail->getCustomHeaders() as $header) {
                 if (($header[0] ?? '') !== 'X-Debug-Buffer') {
