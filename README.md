@@ -113,8 +113,8 @@ demo123
 Main seeded accounts:
 
 - `super@biurozawodow.pl` - superadmin
-- `admin@sportevents.pl` - admin for `org-1`
-- `admin@runpoland.pl` - admin for `org-2`
+- `admin@sportevents.pl` - admin with global organization access
+- `admin@runpoland.pl` - admin with global organization access
 - `org.gniezno@sportevents.pl` - editor
 - `skaner1@sportevents.pl` - scanner
 
@@ -133,6 +133,10 @@ If you are upgrading an older local database, review the scripts in `database/mi
 - `008_create_password_resets.php`
 - `009_backfill_participant_qr_codes.php`
 - `010_unify_participant_status.php`
+- `011_add_event_archiving.php`
+- `012_add_scanner_plus_role.php`
+- `013_allow_multiple_admins_per_organization.php`
+- `014_drop_admin_organization_assignments.php`
 
 ## Auth and access model
 
@@ -155,7 +159,7 @@ Authorization: Bearer <access_token>
 Role overview:
 
 - `superadmin` can access all organizations, events, users and participants
-- `admin` can access only assigned organizations
+- `admin` can access all organizations, events, users and participants, except superadmin-only operations
 - `editor` can access only their own organization
 - `scanner` can access only assigned events while the race office is open
 - `scanner_plus` can access assigned open events like `scanner`, plus update participant data and reassign packages
