@@ -1225,6 +1225,26 @@ try {
         ];
     };
 
+    $resolveParticipantDisplayName = static function (
+        string $displayName,
+        string $email,
+        string $fallbackDisplayName = '',
+        string $previousEmail = ''
+    ): string {
+        $normalizedDisplayName = trim($displayName);
+        if ($normalizedDisplayName !== '') {
+            return $normalizedDisplayName;
+        }
+
+        $normalizedFallback = trim($fallbackDisplayName);
+        $normalizedPreviousEmail = normalizeEmailAddress($previousEmail);
+        if ($normalizedFallback !== '' && normalizeEmailAddress($normalizedFallback) !== $normalizedPreviousEmail) {
+            return $normalizedFallback;
+        }
+
+        return $email;
+    };
+
     $ensureParticipantQrCode = static function (PDO $pdo, array $participant) use ($generateUniqueParticipantQrCode): array {
         $qrCode = trim((string)($participant['qr_code'] ?? ''));
         if (QrCodeService::isSecureToken($qrCode)) {
@@ -1472,6 +1492,81 @@ try {
         return $loadParticipantById($pdo, (int)$participant['id']) ?: $participant;
     };
 
+    $normalizeParticipantBibNumber = static function ($value): ?string {
+        $normalized = trim((string)$value);
+
+        return $normalized !== '' ? $normalized : null;
+    };
+
+    $participantBibNumberExistsForEvent = static function (
+        PDO $pdo,
+        string $eventId,
+        string $bibNumber,
+        int $exceptParticipantId
+    ): bool {
+        $stmt = $pdo->prepare('
+            SELECT id
+            FROM participants
+            WHERE event_id = :event_id
+              AND bib_number = :bib_number
+              AND id <> :id
+            LIMIT 1
+        ');
+        $stmt->execute([
+            'event_id' => $eventId,
+            'bib_number' => $bibNumber,
+            'id' => $exceptParticipantId,
+        ]);
+
+        return $stmt->fetch() !== false;
+    };
+
+    $loadParticipantsByEventAndBibNumber = static function (
+        PDO $pdo,
+        string $eventId,
+        string $bibNumber,
+        int $exceptParticipantId = 0
+    ) use (&$ensureParticipantQrCode): array {
+        $stmt = $pdo->prepare('
+            SELECT
+                id,
+                event_id,
+                first_name,
+                last_name,
+                display_name,
+                email,
+                organization,
+                bib_number,
+                qr_code,
+                custom_fields_json,
+                status,
+                email_status,
+                checked_in_at,
+                created_at,
+                updated_at
+            FROM participants
+            WHERE event_id = :event_id
+              AND bib_number = :bib_number
+              AND id <> :except_id
+            ORDER BY display_name ASC, id ASC
+        ');
+        $stmt->execute([
+            'event_id' => $eventId,
+            'bib_number' => $bibNumber,
+            'except_id' => $exceptParticipantId,
+        ]);
+        $participants = $stmt->fetchAll();
+
+        foreach ($participants as &$participant) {
+            $participant['custom_fields'] = decodeJsonObject($participant['custom_fields_json'] ?? null);
+            unset($participant['custom_fields_json']);
+            $participant = $ensureParticipantQrCode($pdo, $participant);
+        }
+        unset($participant);
+
+        return $participants;
+    };
+
     $normalizeImportHeader = static function (string $header): string {
         $normalized = trim($header);
         $normalized = preg_replace('/^\xEF\xBB\xBF/u', '', $normalized) ?? $normalized;
@@ -1628,28 +1723,6 @@ try {
         return $customFields;
     };
 
-    $nextBibNumberForEvent = static function (PDO $pdo, string $eventId): string {
-        $stmt = $pdo->prepare('
-            SELECT bib_number
-            FROM participants
-            WHERE event_id = :event_id
-              AND bib_number IS NOT NULL
-              AND bib_number <> \'\'
-        ');
-        $stmt->execute(['event_id' => $eventId]);
-        $rows = $stmt->fetchAll();
-        $maxBib = 0;
-
-        foreach ($rows as $row) {
-            $bibNumber = (string)($row['bib_number'] ?? '');
-            if (ctype_digit($bibNumber)) {
-                $maxBib = max($maxBib, (int)$bibNumber);
-            }
-        }
-
-        return (string)($maxBib + 1);
-    };
-
     $insertParticipantRecord = static function (
         PDO $pdo,
         string $eventId,
@@ -1659,11 +1732,11 @@ try {
         array $customFields,
         string $organization = '',
         ?string $qrCode = null
-    ) use ($loadParticipantById, $nextBibNumberForEvent, $generateUniqueParticipantQrCode): array {
+    ) use ($loadParticipantById, $generateUniqueParticipantQrCode): array {
         $nameParts = splitParticipantDisplayName($displayName);
         $resolvedBibNumber = $bibNumber !== null && trim($bibNumber) !== ''
             ? trim($bibNumber)
-            : $nextBibNumberForEvent($pdo, $eventId);
+            : null;
         $resolvedQrCode = $qrCode !== null && QrCodeService::isSecureToken(trim($qrCode))
             ? trim($qrCode)
             : $generateUniqueParticipantQrCode($pdo);
@@ -3153,20 +3226,12 @@ try {
         }
 
         $resolvedData = $buildParticipantDataFromMappings($mappings, $fieldValues);
-        if ($resolvedData['display_name'] === '') {
-            jsonResponse(422, ['error' => 'Wymagane jest co najmniej jedno pole składające się na nazwę uczestnika']);
-            exit;
-        }
-
-        if ($resolvedData['missing_fields'] !== []) {
-            jsonResponse(422, ['error' => 'Brakuje wymaganych pól uczestnika', 'missing_fields' => $resolvedData['missing_fields']]);
-            exit;
-        }
+        $resolvedDisplayName = $resolveParticipantDisplayName((string)$resolvedData['display_name'], $email);
 
         $participant = $insertParticipantRecord(
             $pdo,
             $eventId,
-            $resolvedData['display_name'],
+            $resolvedDisplayName,
             $email,
             is_string($resolvedData['bib_number']) ? $resolvedData['bib_number'] : null,
             is_array($resolvedData['custom_fields']) ? $resolvedData['custom_fields'] : []
@@ -4177,13 +4242,16 @@ try {
         $nextStatus = trim((string)($input['status'] ?? ''));
         $email = array_key_exists('email', $input) ? normalizeEmailAddress((string)$input['email']) : null;
         $fieldValues = is_array($input['field_values'] ?? null) ? $input['field_values'] : null;
+        $hasBibNumberUpdate = array_key_exists('bib_number', $input);
+        $requestedBibNumber = $hasBibNumberUpdate ? $normalizeParticipantBibNumber($input['bib_number']) : null;
+        $bibNumberConflictResolution = trim((string)($input['bib_number_conflict_resolution'] ?? ''));
         $clientMutationId = trim((string)($input['client_mutation_id'] ?? ''));
         $deviceId = trim((string)($input['device_id'] ?? ''));
         $sourceNodeId = trim((string)($input['source_node_id'] ?? ''));
         $eventIdFromClient = trim((string)($input['event_id'] ?? ''));
         $baseStatus = trim((string)($input['base_status'] ?? ''));
 
-        if ($nextStatus === '' && $email === null && $fieldValues === null) {
+        if ($nextStatus === '' && $email === null && $fieldValues === null && !$hasBibNumberUpdate) {
             jsonResponse(422, ['error' => 'Podaj co najmniej jedno pole uczestnika']);
             exit;
         }
@@ -4310,10 +4378,105 @@ try {
             }
         }
 
+        if ($hasBibNumberUpdate) {
+            $currentBibNumber = $normalizeParticipantBibNumber($participant['bib_number'] ?? null);
+
+            if ($requestedBibNumber !== null && strlen($requestedBibNumber) > 32) {
+                jsonResponse(422, ['error' => 'Numer startowy może mieć maksymalnie 32 znaki']);
+                exit;
+            }
+
+            if ($requestedBibNumber !== $currentBibNumber) {
+                $conflictingParticipants = $requestedBibNumber !== null
+                    ? $loadParticipantsByEventAndBibNumber(
+                        $pdo,
+                        (string)$participant['event_id'],
+                        $requestedBibNumber,
+                        (int)$participant['id']
+                    )
+                    : [];
+
+                if (
+                    $conflictingParticipants !== []
+                    && !in_array($bibNumberConflictResolution, ['keep_duplicates', 'delete_conflicts'], true)
+                ) {
+                    jsonResponse(409, [
+                        'error' => 'Ten numer startowy jest już używany przez innego uczestnika.',
+                        'code' => 'bib_number_conflict',
+                        'data' => [
+                            'bib_number' => $requestedBibNumber,
+                            'conflicting_participants' => $conflictingParticipants,
+                        ],
+                    ]);
+                    exit;
+                }
+
+                if (
+                    $conflictingParticipants !== []
+                    && $bibNumberConflictResolution === 'delete_conflicts'
+                    && !in_array((string)($authUser['role'] ?? ''), ['superadmin', 'admin', 'editor'], true)
+                ) {
+                    jsonResponse(403, ['error' => 'Brak uprawnień do usuwania innych uczestników z konfliktem numeru startowego']);
+                    exit;
+                }
+
+                $pdo->beginTransaction();
+
+                try {
+                    if ($conflictingParticipants !== [] && $bibNumberConflictResolution === 'delete_conflicts') {
+                        $deleteStmt = $pdo->prepare('DELETE FROM participants WHERE id = :id');
+
+                        foreach ($conflictingParticipants as $conflictingParticipant) {
+                            $addActivityLog(
+                                $pdo,
+                                sprintf('Usunięto uczestnika podczas zwalniania numeru startowego %s', $requestedBibNumber),
+                                (string)$participant['event_id'],
+                                (int)$conflictingParticipant['id'],
+                                (string)$conflictingParticipant['display_name'],
+                                (string)$authUser['id'],
+                                (string)$authUser['name']
+                            );
+                            $deleteStmt->execute(['id' => (int)$conflictingParticipant['id']]);
+                        }
+                    }
+
+                    $updateBibNumberStmt = $pdo->prepare('UPDATE participants SET bib_number = :bib_number WHERE id = :id');
+                    $updateBibNumberStmt->bindValue(':bib_number', $requestedBibNumber, $requestedBibNumber === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
+                    $updateBibNumberStmt->bindValue(':id', (int)$participant['id'], PDO::PARAM_INT);
+                    $updateBibNumberStmt->execute();
+
+                    $participant = $loadParticipantById($pdo, (int)$participant['id']) ?: $participant;
+                    $addActivityLog(
+                        $pdo,
+                        $requestedBibNumber === null
+                            ? 'Wyczyszczono numer startowy uczestnika'
+                            : (
+                                $bibNumberConflictResolution === 'keep_duplicates'
+                                    ? sprintf('Ustawiono współdzielony numer startowy %s', $requestedBibNumber)
+                                    : sprintf('Ustawiono numer startowy uczestnika na %s', $requestedBibNumber)
+                            ),
+                        (string)$participant['event_id'],
+                        (int)$participant['id'],
+                        (string)$participant['display_name'],
+                        (string)$authUser['id'],
+                        (string)$authUser['name']
+                    );
+
+                    $pdo->commit();
+                } catch (Throwable $exception) {
+                    if ($pdo->inTransaction()) {
+                        $pdo->rollBack();
+                    }
+
+                    throw $exception;
+                }
+            }
+        }
+
         if ($email !== null || $fieldValues !== null) {
             $mappings = $loadParticipantFieldMappings($pdo, (string)$participant['event_id']);
             if ($mappings === []) {
-                jsonResponse(422, ['error' => 'Przepisanie pakietu uczestnika wymaga zapisanego mapowania pól dla wydarzenia']);
+                jsonResponse(422, ['error' => 'Edycja danych uczestnika wymaga zapisanego mapowania pól dla wydarzenia']);
                 exit;
             }
 
@@ -4327,21 +4490,17 @@ try {
             $resolvedData = $buildParticipantDataFromMappings(
                 $mappings,
                 is_array($participantFieldValues) ? $participantFieldValues : [],
-                true,
+                false,
                 (string)($participant['bib_number'] ?? '')
             );
+            $resolvedDisplayName = $resolveParticipantDisplayName(
+                (string)$resolvedData['display_name'],
+                $resolvedEmail,
+                (string)($participant['display_name'] ?? ''),
+                (string)($participant['email'] ?? '')
+            );
 
-            if ($resolvedData['missing_fields'] !== []) {
-                jsonResponse(422, ['error' => 'Do przepisania pakietu wymagane są wszystkie kolumny uczestnika', 'missing_fields' => $resolvedData['missing_fields']]);
-                exit;
-            }
-
-            if ($resolvedData['display_name'] === '') {
-                jsonResponse(422, ['error' => 'Wymagane jest co najmniej jedno pole składające się na nazwę uczestnika']);
-                exit;
-            }
-
-            $nameParts = splitParticipantDisplayName($resolvedData['display_name']);
+            $nameParts = splitParticipantDisplayName($resolvedDisplayName);
             $emailChanged = $resolvedEmail !== normalizeEmailAddress((string)$participant['email']);
             $updateStmt = $pdo->prepare('
                 UPDATE participants
@@ -4357,7 +4516,7 @@ try {
             $updateStmt->execute([
                 'first_name' => $nameParts['first_name'],
                 'last_name' => $nameParts['last_name'],
-                'display_name' => $resolvedData['display_name'],
+                'display_name' => $resolvedDisplayName,
                 'email' => $resolvedEmail,
                 'custom_fields_json' => $resolvedData['custom_fields'] !== [] ? json_encode($resolvedData['custom_fields'], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) : null,
                 'email_status' => $emailChanged ? 'not_sent' : (string)$participant['email_status'],
@@ -4367,7 +4526,7 @@ try {
             $participant = $loadParticipantById($pdo, (int)$participant['id']);
             $addActivityLog(
                 $pdo,
-                'Przepisano pakiet na inna osobe',
+                'Zaktualizowano dane uczestnika',
                 (string)$participant['event_id'],
                 (int)$participant['id'],
                 (string)$participant['display_name'],

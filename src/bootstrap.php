@@ -2269,7 +2269,7 @@ function openApiDocument(): array
                 ],
                 'patch' => [
                     'tags' => ['Participants'],
-                    'summary' => 'Update participant status or reassign package data',
+                    'summary' => 'Update participant status or participant data',
                     'security' => [
                         ['bearerAuth' => []],
                     ],
@@ -2934,6 +2934,8 @@ function openApiDocument(): array
                     'properties' => [
                         'status' => ['type' => 'string', 'enum' => ['not_checked_in', 'checked_in', 'checked_in_not_starting']],
                         'email' => ['type' => 'string', 'format' => 'email'],
+                        'bib_number' => ['type' => 'string', 'nullable' => true],
+                        'bib_number_conflict_resolution' => ['type' => 'string', 'enum' => ['keep_duplicates', 'delete_conflicts']],
                         'field_values' => [
                             'type' => 'object',
                             'additionalProperties' => ['type' => 'string'],
