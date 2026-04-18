@@ -131,7 +131,7 @@ CREATE TABLE participants (
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     PRIMARY KEY (id),
     UNIQUE KEY uq_participants_qr_code (qr_code),
-    UNIQUE KEY uq_participants_event_bib (event_id, bib_number),
+    KEY idx_participants_event_bib (event_id, bib_number),
     KEY idx_participants_event_id (event_id),
     KEY idx_participants_event_email (event_id, email),
     CONSTRAINT fk_participants_event
