@@ -201,21 +201,6 @@ try {
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     ");
 
-    $loadAdminOrganizationIds = static function (PDO $pdo, string $userId): array {
-        $stmt = $pdo->prepare('
-            SELECT organization_id
-            FROM admin_organization_assignments
-            WHERE user_id = :user_id
-            ORDER BY organization_id ASC
-        ');
-        $stmt->execute(['user_id' => $userId]);
-
-        return array_map(
-            static fn(array $row): string => (string)$row['organization_id'],
-            $stmt->fetchAll()
-        );
-    };
-
     $currentLocalDateTime = static fn(): string => (new DateTimeImmutable())->format('Y-m-d H:i:s');
 
     $loadAssignedEvents = static function (PDO $pdo, string $userId) use ($currentLocalDateTime): array {
@@ -258,74 +243,7 @@ try {
         return array_values(array_unique($normalizedValues));
     };
 
-    $loadActiveAdminUsersByIds = static function (PDO $pdo, array $userIds) use ($normalizeStringIdList): array {
-        $normalizedUserIds = $normalizeStringIdList($userIds);
-        if ($normalizedUserIds === []) {
-            return [];
-        }
-
-        $placeholders = implode(',', array_fill(0, count($normalizedUserIds), '?'));
-        $stmt = $pdo->prepare("
-            SELECT id, name, email
-            FROM users
-            WHERE id IN ({$placeholders})
-              AND role = 'admin'
-              AND archived_at IS NULL
-            ORDER BY name ASC, id ASC
-        ");
-        $stmt->execute($normalizedUserIds);
-
-        return array_map(
-            static fn(array $row): array => [
-                'id' => (string)$row['id'],
-                'name' => (string)$row['name'],
-                'email' => (string)$row['email'],
-            ],
-            $stmt->fetchAll()
-        );
-    };
-
-    $loadAdminUsersByOrganizationIds = static function (PDO $pdo, array $organizationIds) use ($normalizeStringIdList): array {
-        $normalizedOrganizationIds = $normalizeStringIdList($organizationIds);
-        if ($normalizedOrganizationIds === []) {
-            return [];
-        }
-
-        $placeholders = implode(',', array_fill(0, count($normalizedOrganizationIds), '?'));
-        $stmt = $pdo->prepare("
-            SELECT aoa.organization_id, u.id, u.name, u.email
-            FROM admin_organization_assignments aoa
-            INNER JOIN users u ON u.id = aoa.user_id
-            WHERE aoa.organization_id IN ({$placeholders})
-              AND u.role = 'admin'
-              AND u.archived_at IS NULL
-            ORDER BY aoa.organization_id ASC, u.name ASC, u.id ASC
-        ");
-        $stmt->execute($normalizedOrganizationIds);
-
-        $adminUsersByOrganizationId = array_fill_keys($normalizedOrganizationIds, []);
-        foreach ($stmt->fetchAll() as $row) {
-            $organizationId = (string)$row['organization_id'];
-            $adminUsersByOrganizationId[$organizationId][] = [
-                'id' => (string)$row['id'],
-                'name' => (string)$row['name'],
-                'email' => (string)$row['email'],
-            ];
-        }
-
-        return $adminUsersByOrganizationId;
-    };
-
-    $attachAdminUsersToOrganizations = static function (array $organizations, array $adminUsersByOrganizationId): array {
-        foreach ($organizations as &$organization) {
-            $organization['admin_users'] = $adminUsersByOrganizationId[(string)$organization['id']] ?? [];
-        }
-        unset($organization);
-
-        return $organizations;
-    };
-
-    $loadOrganizationById = static function (PDO $pdo, string $organizationId) use ($loadAdminUsersByOrganizationIds, $attachAdminUsersToOrganizations): array|false {
+    $loadOrganizationById = static function (PDO $pdo, string $organizationId): array|false {
         $stmt = $pdo->prepare('
             SELECT
                 o.id,
@@ -342,14 +260,11 @@ try {
             return false;
         }
 
-        $adminUsersByOrganizationId = $loadAdminUsersByOrganizationIds($pdo, [$organizationId]);
-        $organizations = $attachAdminUsersToOrganizations([$organization], $adminUsersByOrganizationId);
-
-        return $organizations[0] ?? false;
+        return $organization;
     };
 
-    $loadAllOrganizations = static function (PDO $pdo) use ($loadAdminUsersByOrganizationIds, $attachAdminUsersToOrganizations): array {
-        $organizations = $pdo->query('
+    $loadAllOrganizations = static function (PDO $pdo): array {
+        return $pdo->query('
             SELECT
                 o.id,
                 o.name,
@@ -358,14 +273,6 @@ try {
             FROM organizations o
             ORDER BY o.name ASC
         ')->fetchAll();
-
-        $organizationIds = array_map(
-            static fn(array $organization): string => (string)$organization['id'],
-            $organizations
-        );
-        $adminUsersByOrganizationId = $loadAdminUsersByOrganizationIds($pdo, $organizationIds);
-
-        return $attachAdminUsersToOrganizations($organizations, $adminUsersByOrganizationId);
     };
 
     $loadEventById = static function (PDO $pdo, string $eventId): array|false {
@@ -439,7 +346,7 @@ try {
     $scannerRoles = ['scanner', 'scanner_plus'];
     $isScannerRole = static fn(string $role): bool => in_array($role, $scannerRoles, true);
 
-    $loadUserById = static function (PDO $pdo, string $userId) use ($loadAdminOrganizationIds, $loadAssignedEvents, $isScannerRole): array|false {
+    $loadUserById = static function (PDO $pdo, string $userId) use ($loadAssignedEvents, $isScannerRole): array|false {
         $stmt = $pdo->prepare('
             SELECT id, name, email, role, organization_id
             FROM users
@@ -454,9 +361,6 @@ try {
             return false;
         }
 
-        $user['organization_ids'] = $user['role'] === 'admin'
-            ? $loadAdminOrganizationIds($pdo, (string)$user['id'])
-            : [];
         $user['assigned_events'] = $isScannerRole((string)$user['role'])
             ? $loadAssignedEvents($pdo, (string)$user['id'])
             : [];
@@ -464,7 +368,7 @@ try {
         return $user;
     };
 
-    $loadAllUsers = static function (PDO $pdo) use ($loadAdminOrganizationIds, $loadAssignedEvents, $isScannerRole): array {
+    $loadAllUsers = static function (PDO $pdo) use ($loadAssignedEvents, $isScannerRole): array {
         $users = $pdo->query('
             SELECT id, name, email, role, organization_id
             FROM users
@@ -473,9 +377,6 @@ try {
         ')->fetchAll();
 
         foreach ($users as &$user) {
-            $user['organization_ids'] = $user['role'] === 'admin'
-                ? $loadAdminOrganizationIds($pdo, (string)$user['id'])
-                : [];
             $user['assigned_events'] = $isScannerRole((string)$user['role'])
                 ? $loadAssignedEvents($pdo, (string)$user['id'])
                 : [];
@@ -562,12 +463,8 @@ try {
     };
 
     $canAccessOrganization = static function (array $authUser, string $organizationId): bool {
-        if ($authUser['role'] === 'superadmin') {
+        if (in_array($authUser['role'], ['superadmin', 'admin'], true)) {
             return true;
-        }
-
-        if ($authUser['role'] === 'admin') {
-            return in_array($organizationId, $authUser['organization_ids'] ?? [], true);
         }
 
         return (string)($authUser['organization_id'] ?? '') === $organizationId;
@@ -587,7 +484,7 @@ try {
                 return false;
             }
 
-            return in_array((string)($targetUser['organization_id'] ?? ''), $authUser['organization_ids'] ?? [], true);
+            return true;
         }
 
         if ($authUser['role'] === 'editor') {
@@ -728,13 +625,11 @@ try {
     };
 
     $filterAccessibleOrganizations = static function (array $authUser, array $organizations, array $accessibleEvents): array {
-        if ($authUser['role'] === 'superadmin') {
+        if (in_array($authUser['role'], ['superadmin', 'admin'], true)) {
             return array_values($organizations);
         }
 
-        if ($authUser['role'] === 'admin') {
-            $allowedOrganizationIds = $authUser['organization_ids'] ?? [];
-        } elseif ($authUser['role'] === 'editor') {
+        if ($authUser['role'] === 'editor') {
             $allowedOrganizationIds = [(string)($authUser['organization_id'] ?? '')];
         } else {
             $allowedOrganizationIds = array_map(
@@ -755,7 +650,7 @@ try {
     };
 
     $filterAccessibleUsers = static function (array $authUser, array $users, array $accessibleOrganizations) use ($isScannerRole): array {
-        if ($authUser['role'] === 'superadmin') {
+        if (in_array($authUser['role'], ['superadmin', 'admin'], true)) {
             return array_values($users);
         }
 
@@ -770,29 +665,14 @@ try {
             static fn(array $organization): string => (string)$organization['id'],
             $accessibleOrganizations
         );
-        $accessibleAdminIds = [];
-        foreach ($accessibleOrganizations as $organization) {
-            foreach (($organization['admin_users'] ?? []) as $adminUser) {
-                $adminUserId = trim((string)($adminUser['id'] ?? ''));
-                if ($adminUserId !== '') {
-                    $accessibleAdminIds[] = $adminUserId;
-                }
-            }
-        }
-        $accessibleAdminIds = array_values(array_unique($accessibleAdminIds));
-
         return array_values(array_filter(
             $users,
-            static function (array $user) use ($authUser, $accessibleOrganizationIds, $accessibleAdminIds): bool {
+            static function (array $user) use ($authUser, $accessibleOrganizationIds): bool {
                 if ((string)$user['id'] === (string)$authUser['id']) {
                     return true;
                 }
 
-                if (in_array((string)($user['organization_id'] ?? ''), $accessibleOrganizationIds, true)) {
-                    return true;
-                }
-
-                return in_array((string)$user['id'], $accessibleAdminIds, true);
+                return in_array((string)($user['organization_id'] ?? ''), $accessibleOrganizationIds, true);
             }
         ));
     };
@@ -1885,9 +1765,6 @@ try {
             ]);
         }
 
-        $user['organization_ids'] = $user['role'] === 'admin'
-            ? $loadAdminOrganizationIds($pdo, (string)$user['id'])
-            : [];
         $user['assigned_events'] = $isScannerRole((string)$user['role'])
             ? $loadAssignedEvents($pdo, (string)$user['id'])
             : [];
@@ -2137,10 +2014,6 @@ try {
 
         $name = trim((string)($input['name'] ?? ''));
         $eventLimit = $input['event_limit'] ?? null;
-        $adminUserIds = $authUser['role'] === 'admin'
-            ? [(string)$authUser['id']]
-            : [];
-
         if ($name === '') {
             jsonResponse(422, ['error' => 'Nazwa jest wymagana']);
             exit;
@@ -2148,33 +2021,6 @@ try {
 
         if (!is_int($eventLimit) && !(is_string($eventLimit) && ctype_digit($eventLimit))) {
             jsonResponse(422, ['error' => 'Limit wydarzeń musi być liczbą całkowitą nie mniejszą niż 0']);
-            exit;
-        }
-
-        if ($authUser['role'] === 'superadmin' && array_key_exists('admin_user_ids', $input)) {
-            if (!is_array($input['admin_user_ids'])) {
-                jsonResponse(422, ['error' => 'Pole admin_user_ids musi być tablicą identyfikatorów użytkowników']);
-                exit;
-            }
-
-            foreach ($input['admin_user_ids'] as $adminUserId) {
-                if (!is_string($adminUserId) || trim($adminUserId) === '') {
-                    jsonResponse(422, ['error' => 'Pole admin_user_ids może zawierać tylko niepuste ciągi znaków']);
-                    exit;
-                }
-            }
-
-            $adminUserIds = $normalizeStringIdList($input['admin_user_ids']);
-        } elseif ($authUser['role'] === 'superadmin') {
-            $legacyAdminUserId = trim((string)($input['admin_user_id'] ?? ''));
-            if ($legacyAdminUserId !== '') {
-                $adminUserIds = [$legacyAdminUserId];
-            }
-        }
-
-        $resolvedAdminUsers = $loadActiveAdminUsersByIds($pdo, $adminUserIds);
-        if (count($resolvedAdminUsers) !== count($adminUserIds)) {
-            jsonResponse(422, ['error' => 'Nie znaleziono co najmniej jednego przypisanego administratora']);
             exit;
         }
 
@@ -2201,20 +2047,6 @@ try {
                 'event_limit' => $eventLimitValue,
             ]);
 
-            if ($adminUserIds !== []) {
-                $assignmentStmt = $pdo->prepare('
-                    INSERT INTO admin_organization_assignments (user_id, organization_id)
-                    VALUES (:user_id, :organization_id)
-                ');
-
-                foreach ($adminUserIds as $adminUserId) {
-                    $assignmentStmt->execute([
-                        'user_id' => $adminUserId,
-                        'organization_id' => $organizationId,
-                    ]);
-                }
-            }
-
             $pdo->commit();
         } catch (Throwable $exception) {
             if ($pdo->inTransaction()) {
@@ -2225,89 +2057,6 @@ try {
         }
 
         jsonResponse(201, ['data' => $loadOrganizationById($pdo, $organizationId)]);
-        exit;
-    }
-
-    if (preg_match('#^/organizations/([^/]+)/admin-assignments$#', $path, $matches) === 1 && $method === 'PATCH') {
-        $authUser = requireAnyRole(['superadmin'], $resolveAuthenticatedUser);
-        $organizationId = (string)$matches[1];
-        $organization = $loadOrganizationById($pdo, $organizationId);
-
-        if ($organization === false) {
-            jsonResponse(404, ['error' => 'Nie znaleziono organizacji']);
-            exit;
-        }
-
-        $input = readJsonBody();
-        if (!array_key_exists('admin_user_ids', $input) || !is_array($input['admin_user_ids'])) {
-            jsonResponse(422, ['error' => 'Pole admin_user_ids jest wymagane i musi być tablicą']);
-            exit;
-        }
-
-        foreach ($input['admin_user_ids'] as $adminUserId) {
-            if (!is_string($adminUserId) || trim($adminUserId) === '') {
-                jsonResponse(422, ['error' => 'Pole admin_user_ids może zawierać tylko niepuste ciągi znaków']);
-                exit;
-            }
-        }
-
-        $adminUserIds = $normalizeStringIdList($input['admin_user_ids']);
-        $resolvedAdminUsers = $loadActiveAdminUsersByIds($pdo, $adminUserIds);
-        if (count($resolvedAdminUsers) !== count($adminUserIds)) {
-            jsonResponse(422, ['error' => 'Nie znaleziono co najmniej jednego przypisanego administratora']);
-            exit;
-        }
-
-        $pdo->beginTransaction();
-
-        try {
-            $deleteAssignmentsStmt = $pdo->prepare('DELETE FROM admin_organization_assignments WHERE organization_id = :organization_id');
-            $deleteAssignmentsStmt->execute(['organization_id' => $organizationId]);
-
-            if ($adminUserIds !== []) {
-                $insertAssignmentStmt = $pdo->prepare('
-                    INSERT INTO admin_organization_assignments (user_id, organization_id)
-                    VALUES (:user_id, :organization_id)
-                ');
-
-                foreach ($adminUserIds as $adminUserId) {
-                    $insertAssignmentStmt->execute([
-                        'user_id' => $adminUserId,
-                        'organization_id' => $organizationId,
-                    ]);
-                }
-            }
-
-            $assignedAdminNames = array_map(
-                static fn(array $adminUser): string => (string)$adminUser['name'],
-                $resolvedAdminUsers
-            );
-            $addActivityLog(
-                $pdo,
-                $assignedAdminNames === []
-                    ? sprintf('Usunieto wszystkich administratorow z organizacji %s', (string)$organization['name'])
-                    : sprintf(
-                        'Zaktualizowano administratorow organizacji %s: %s',
-                        (string)$organization['name'],
-                        implode(', ', $assignedAdminNames)
-                    ),
-                null,
-                null,
-                null,
-                (string)$authUser['id'],
-                (string)$authUser['name']
-            );
-
-            $pdo->commit();
-        } catch (Throwable $exception) {
-            if ($pdo->inTransaction()) {
-                $pdo->rollBack();
-            }
-
-            throw $exception;
-        }
-
-        jsonResponse(200, ['data' => $loadOrganizationById($pdo, $organizationId)]);
         exit;
     }
 
@@ -2434,9 +2183,6 @@ try {
         $memberCountStmt = $pdo->prepare('SELECT COUNT(*) AS total FROM users WHERE organization_id = :organization_id AND archived_at IS NULL');
         $memberCountStmt->execute(['organization_id' => $organizationId]);
         $memberCount = (int)($memberCountStmt->fetch()['total'] ?? 0);
-        $adminAssignmentCountStmt = $pdo->prepare('SELECT COUNT(*) AS total FROM admin_organization_assignments WHERE organization_id = :organization_id');
-        $adminAssignmentCountStmt->execute(['organization_id' => $organizationId]);
-        $memberCount += (int)($adminAssignmentCountStmt->fetch()['total'] ?? 0);
         if ($memberCount > 0) {
             jsonResponse(422, ['error' => 'Nie można usunąć organizacji z przypisanymi użytkownikami']);
             exit;
@@ -3542,7 +3288,7 @@ try {
                     exit;
                 }
             } elseif ($authUser['role'] === 'admin') {
-                if ($organizationId === '' || !in_array($organizationId, $authUser['organization_ids'] ?? [], true)) {
+                if ($organizationId === '') {
                     jsonResponse(403, ['error' => 'Brak uprawnień']);
                     exit;
                 }
@@ -4018,9 +3764,6 @@ try {
 
             $deleteAssignmentsStmt = $pdo->prepare('DELETE FROM user_event_assignments WHERE user_id = :user_id');
             $deleteAssignmentsStmt->execute(['user_id' => $userId]);
-
-            $deleteAdminAssignmentsStmt = $pdo->prepare('DELETE FROM admin_organization_assignments WHERE user_id = :user_id');
-            $deleteAdminAssignmentsStmt->execute(['user_id' => $userId]);
 
             $invalidatePasswordResetTokensForUser($pdo, $userId);
 

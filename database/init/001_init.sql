@@ -6,7 +6,6 @@ DROP TABLE IF EXISTS client_mutations;
 DROP TABLE IF EXISTS event_sync_state;
 DROP TABLE IF EXISTS request_rate_limits;
 DROP TABLE IF EXISTS password_resets;
-DROP TABLE IF EXISTS admin_organization_assignments;
 DROP TABLE IF EXISTS user_event_assignments;
 DROP TABLE IF EXISTS event_participant_field_mappings;
 DROP TABLE IF EXISTS participants;
@@ -110,22 +109,6 @@ CREATE TABLE user_event_assignments (
         ON UPDATE CASCADE,
     CONSTRAINT fk_user_event_assignments_event
         FOREIGN KEY (event_id) REFERENCES events(id)
-        ON DELETE CASCADE
-        ON UPDATE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
-CREATE TABLE admin_organization_assignments (
-    user_id VARCHAR(64) NOT NULL,
-    organization_id VARCHAR(64) NOT NULL,
-    assigned_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (user_id, organization_id),
-    KEY idx_admin_organization_assignments_organization_id (organization_id),
-    CONSTRAINT fk_admin_organization_assignments_user
-        FOREIGN KEY (user_id) REFERENCES users(id)
-        ON DELETE CASCADE
-        ON UPDATE CASCADE,
-    CONSTRAINT fk_admin_organization_assignments_organization
-        FOREIGN KEY (organization_id) REFERENCES organizations(id)
         ON DELETE CASCADE
         ON UPDATE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
@@ -324,13 +307,6 @@ VALUES
     ('u-5', 'evt-2')
 ON DUPLICATE KEY UPDATE
     event_id = VALUES(event_id);
-
-INSERT INTO admin_organization_assignments (user_id, organization_id)
-VALUES
-    ('u-1', 'org-1'),
-    ('u-1b', 'org-2')
-ON DUPLICATE KEY UPDATE
-    organization_id = VALUES(organization_id);
 
 INSERT INTO participants (event_id, first_name, last_name, display_name, email, organization, bib_number, qr_code, custom_fields_json, status, email_status)
 VALUES

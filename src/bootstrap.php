@@ -338,7 +338,6 @@ function issueAuthToken(array $user): string
         'email' => $user['email'],
         'role' => $user['role'],
         'organization_id' => $user['organization_id'],
-        'organization_ids' => $user['organization_ids'] ?? [],
         'assigned_events' => $user['assigned_events'] ?? [],
         'iat' => time(),
         'exp' => time() + 8 * 60 * 60,
@@ -402,7 +401,6 @@ function authenticatedUserFromRequest(?callable $resolver = null): ?array
         'email' => (string)($payload['email'] ?? ''),
         'role' => (string)($payload['role'] ?? ''),
         'organization_id' => $payload['organization_id'] ?? null,
-        'organization_ids' => is_array($payload['organization_ids'] ?? null) ? $payload['organization_ids'] : [],
         'assigned_events' => is_array($payload['assigned_events'] ?? null) ? $payload['assigned_events'] : [],
     ];
 
@@ -1595,66 +1593,6 @@ function openApiDocument(): array
                     ],
                 ],
             ],
-            '/organizations/{id}/admin-assignments' => [
-                'patch' => [
-                    'tags' => ['Organizations'],
-                    'summary' => 'Replace organization admin assignments',
-                    'security' => [
-                        ['bearerAuth' => []],
-                    ],
-                    'parameters' => [
-                        [
-                            'name' => 'id',
-                            'in' => 'path',
-                            'required' => true,
-                            'schema' => [
-                                'type' => 'string',
-                            ],
-                        ],
-                    ],
-                    'requestBody' => [
-                        'required' => true,
-                        'content' => [
-                            'application/json' => [
-                                'schema' => [
-                                    '$ref' => '#/components/schemas/AdminAssignmentUpdateRequest',
-                                ],
-                            ],
-                        ],
-                    ],
-                    'responses' => [
-                        '200' => [
-                            'description' => 'Organization admin assignments updated',
-                            'content' => [
-                                'application/json' => [
-                                    'schema' => [
-                                        '$ref' => '#/components/schemas/OrganizationResponse',
-                                    ],
-                                ],
-                            ],
-                        ],
-                        '401' => [
-                            '$ref' => '#/components/responses/Brak autoryzacji',
-                        ],
-                        '403' => [
-                            '$ref' => '#/components/responses/Brak uprawnień',
-                        ],
-                        '404' => [
-                            '$ref' => '#/components/responses/NotFound',
-                        ],
-                        '422' => [
-                            'description' => 'Validation error',
-                            'content' => [
-                                'application/json' => [
-                                    'schema' => [
-                                        '$ref' => '#/components/schemas/ErrorResponse',
-                                    ],
-                                ],
-                            ],
-                        ],
-                    ],
-                ],
-            ],
             '/organizations' => [
                 'post' => [
                     'tags' => ['Organizations'],
@@ -2805,27 +2743,14 @@ function openApiDocument(): array
                         'qr_code' => ['type' => 'string', 'nullable' => true, 'example' => 'QR-evt-1-101'],
                     ],
                 ],
-                'AdminUser' => [
-                    'type' => 'object',
-                    'required' => ['id', 'name', 'email'],
-                    'properties' => [
-                        'id' => ['type' => 'string', 'example' => 'u-1'],
-                        'name' => ['type' => 'string', 'example' => 'Admin SportEvents'],
-                        'email' => ['type' => 'string', 'format' => 'email', 'example' => 'admin@sportevents.pl'],
-                    ],
-                ],
                 'Organization' => [
                     'type' => 'object',
-                    'required' => ['id', 'name', 'event_limit', 'admin_users'],
+                    'required' => ['id', 'name', 'event_limit'],
                     'properties' => [
                         'id' => ['type' => 'string', 'example' => 'org-1'],
                         'name' => ['type' => 'string', 'example' => 'SportEvents Pro'],
                         'logo' => ['type' => 'string', 'nullable' => true],
                         'event_limit' => ['type' => 'integer', 'example' => 4],
-                        'admin_users' => [
-                            'type' => 'array',
-                            'items' => ['$ref' => '#/components/schemas/AdminUser'],
-                        ],
                     ],
                 ],
                 'OrganizationResponse' => [
@@ -2882,20 +2807,6 @@ function openApiDocument(): array
                     'properties' => [
                         'name' => ['type' => 'string', 'example' => 'City Runners'],
                         'event_limit' => ['type' => 'integer', 'minimum' => 0, 'example' => 3],
-                        'admin_user_ids' => [
-                            'type' => 'array',
-                            'items' => ['type' => 'string', 'example' => 'u-1'],
-                        ],
-                    ],
-                ],
-                'AdminAssignmentUpdateRequest' => [
-                    'type' => 'object',
-                    'required' => ['admin_user_ids'],
-                    'properties' => [
-                        'admin_user_ids' => [
-                            'type' => 'array',
-                            'items' => ['type' => 'string', 'example' => 'u-1'],
-                        ],
                     ],
                 ],
                 'ChangeUserRoleRequest' => [
@@ -2914,10 +2825,6 @@ function openApiDocument(): array
                         'email' => ['type' => 'string', 'format' => 'email'],
                         'role' => ['type' => 'string', 'enum' => ['superadmin', 'admin', 'editor', 'scanner', 'scanner_plus']],
                         'organization_id' => ['type' => 'string', 'nullable' => true],
-                        'organization_ids' => [
-                            'type' => 'array',
-                            'items' => ['type' => 'string'],
-                        ],
                         'assigned_events' => [
                             'type' => 'array',
                             'items' => ['type' => 'string'],
@@ -2941,10 +2848,6 @@ function openApiDocument(): array
                         'email' => ['type' => 'string', 'format' => 'email', 'example' => 'admin.new@example.com'],
                         'role' => ['type' => 'string', 'enum' => ['admin', 'editor', 'scanner', 'scanner_plus']],
                         'organization_id' => ['type' => 'string', 'nullable' => true, 'example' => 'org-1'],
-                        'organization_ids' => [
-                            'type' => 'array',
-                            'items' => ['type' => 'string'],
-                        ],
                         'assigned_events' => [
                             'type' => 'array',
                             'items' => ['type' => 'string'],
