@@ -245,3 +245,9 @@ php -l public/index.php
 - JSON: `GET /openapi.json`
 
 Use Swagger as the source of truth for request and response payloads.
+
+### Init DB on Windows
+
+```bash
+"C:\Program Files\MySQL\MySQL Server 8.0\bin\mysql.exe" --default-character-set=utf8mb4 -u root -p biuro_zawodow < database/init/001_init.sql
+```
