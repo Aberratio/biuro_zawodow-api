@@ -1,4 +1,5 @@
 ﻿SET FOREIGN_KEY_CHECKS = 0;
+SET NAMES utf8mb4;
 
 DROP TABLE IF EXISTS activity_logs;
 DROP TABLE IF EXISTS sync_outbox;
