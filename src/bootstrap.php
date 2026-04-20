@@ -111,15 +111,31 @@ function parseLocalDateTimeString(string $value): ?DateTimeImmutable
         return null;
     }
 
-    $formats = ['Y-m-d\TH:i:s', 'Y-m-d\TH:i'];
+    $normalized = preg_replace('/\.\d+$/', '', $trimmed);
+    if (!is_string($normalized) || $normalized === '') {
+        return null;
+    }
+
+    $formats = [
+        'Y-m-d\TH:i:s',
+        'Y-m-d\TH:i',
+        'Y-m-d H:i:s',
+        'Y-m-d H:i',
+    ];
     foreach ($formats as $format) {
-        $dateTime = DateTimeImmutable::createFromFormat($format, $trimmed);
-        if ($dateTime !== false && $dateTime->format($format) === $trimmed) {
+        $dateTime = DateTimeImmutable::createFromFormat($format, $normalized);
+        if ($dateTime !== false && $dateTime->format($format) === $normalized) {
             return $dateTime;
         }
     }
 
-    return null;
+    // Fallback for broader ISO-8601 payloads that may include timezone suffixes.
+    try {
+        $dateTime = new DateTimeImmutable($trimmed);
+        return $dateTime;
+    } catch (Exception) {
+        return null;
+    }
 }
 
 function isValidLocalDateTimeString(string $value): bool
