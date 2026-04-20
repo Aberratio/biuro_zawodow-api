@@ -3366,7 +3366,7 @@ try {
         $allowedRolesByCreator = [
             'superadmin' => ['admin', 'editor', 'scanner', 'scanner_plus'],
             'admin' => ['editor', 'scanner', 'scanner_plus'],
-            'editor' => ['scanner', 'scanner_plus'],
+            'editor' => ['editor', 'scanner', 'scanner_plus'],
         ];
 
         if (!in_array($role, $allowedRolesByCreator[(string)$authUser['role']] ?? [], true)) {
@@ -3821,7 +3821,7 @@ try {
     }
 
     if (preg_match('#^/users/([^/]+)$#', $path, $matches) === 1 && $method === 'DELETE') {
-        $authUser = requireAnyRole(['superadmin', 'admin'], $resolveAuthenticatedUser);
+        $authUser = requireAnyRole(['superadmin', 'admin', 'editor'], $resolveAuthenticatedUser);
         $userId = (string)$matches[1];
 
         $targetUser = $loadUserById($pdo, $userId);
