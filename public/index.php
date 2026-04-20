@@ -202,10 +202,18 @@ try {
     ");
 
     $currentLocalDateTime = static fn(): string => (new DateTimeImmutable())->format('Y-m-d H:i:s');
-    $validateEventOfficeWindow = static function (string $normalizedOfficeOpenAt, string $normalizedOfficeCloseAt, bool $allowPastOpenAt = false) use ($currentLocalDateTime): ?string {
+    $currentLocalDateTimeMinutePrecision = static function (): string {
+        $now = new DateTimeImmutable();
+        return $now->setTime(
+            (int)$now->format('H'),
+            (int)$now->format('i'),
+            0
+        )->format('Y-m-d H:i:s');
+    };
+    $validateEventOfficeWindow = static function (string $normalizedOfficeOpenAt, string $normalizedOfficeCloseAt, bool $allowPastOpenAt = false) use ($currentLocalDateTimeMinutePrecision): ?string {
         $openAt = parseLocalDateTimeString($normalizedOfficeOpenAt);
         $closeAt = parseLocalDateTimeString($normalizedOfficeCloseAt);
-        $now = parseLocalDateTimeString($currentLocalDateTime());
+        $now = parseLocalDateTimeString($currentLocalDateTimeMinutePrecision());
 
         if ($openAt === null || $closeAt === null || $now === null) {
             return 'office_open_at i office_close_at muszą być prawidłowymi lokalnymi datami i godzinami';
@@ -428,7 +436,7 @@ try {
         $stmt->execute(['user_id' => $userId]);
     };
 
-    $createPasswordResetToken = static function (PDO $pdo, string $userId) use ($invalidatePasswordResetTokensForUser): string {
+    $createPasswordResetToken = static function (PDO $pdo, string $userId, int $ttlSeconds = 3600) use ($invalidatePasswordResetTokensForUser): string {
         $token = bin2hex(random_bytes(32));
         $invalidatePasswordResetTokensForUser($pdo, $userId);
 
@@ -440,7 +448,7 @@ try {
             'id' => 'pr-' . bin2hex(random_bytes(8)),
             'user_id' => $userId,
             'token_hash' => passwordResetTokenHash($token),
-            'expires_at' => passwordResetExpiresAt(),
+            'expires_at' => passwordResetExpiresAt($ttlSeconds),
         ]);
 
         return $token;
@@ -3493,7 +3501,7 @@ try {
                 'user_name_snapshot' => $authUser['name'],
             ]);
 
-            $setupToken = $createPasswordResetToken($pdo, $userId);
+            $setupToken = $createPasswordResetToken($pdo, $userId, 7 * 24 * 60 * 60);
             $setupUrl = appFrontendUrl() . '/reset-password?token=' . urlencode($setupToken);
             MailService::sendAccountSetupEmail($email, $name, $setupUrl);
 

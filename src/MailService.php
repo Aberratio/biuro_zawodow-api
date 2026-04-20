@@ -15,6 +15,7 @@ final class MailService
             recipientName: $recipientName,
             subject: 'Reset hasła',
             introText: 'Otrzymaliśmy prośbę o ustawienie nowego hasła do Twojego konta.',
+            validityText: 'Link jest ważny przez 60 minut.',
             actionLabel: 'Ustaw nowe hasło',
             actionUrl: $resetUrl
         );
@@ -27,6 +28,7 @@ final class MailService
             recipientName: $recipientName,
             subject: 'Twoje konto zostało utworzone',
             introText: 'Twoje konto zostało utworzone. Aby rozpocząć pracę, ustaw własne hasło.',
+            validityText: 'Link do ustawienia hasła jest ważny przez 7 dni.',
             actionLabel: 'Ustaw hasło',
             actionUrl: $resetUrl
         );
@@ -83,6 +85,7 @@ final class MailService
         string $recipientName,
         string $subject,
         string $introText,
+        string $validityText,
         string $actionLabel,
         string $actionUrl
     ): void {
@@ -92,8 +95,8 @@ final class MailService
             $mail->addAddress($recipientEmail, $recipientName);
             $mail->isHTML(true);
             $mail->Subject = $subject;
-            $mail->Body = self::actionHtml($recipientName, $introText, $actionLabel, $actionUrl);
-            $mail->AltBody = self::actionText($recipientName, $introText, $actionLabel, $actionUrl);
+            $mail->Body = self::actionHtml($recipientName, $introText, $validityText, $actionLabel, $actionUrl);
+            $mail->AltBody = self::actionText($recipientName, $introText, $validityText, $actionLabel, $actionUrl);
             $mail->send();
         } catch (PHPMailerException $exception) {
             throw self::buildSendException($mail, $exception);
@@ -173,10 +176,16 @@ final class MailService
         return new RuntimeException($message, 0, $exception);
     }
 
-    private static function actionHtml(string $recipientName, string $introText, string $actionLabel, string $actionUrl): string
-    {
+    private static function actionHtml(
+        string $recipientName,
+        string $introText,
+        string $validityText,
+        string $actionLabel,
+        string $actionUrl
+    ): string {
         $safeName = htmlspecialchars($recipientName !== '' ? $recipientName : 'Użytkowniku', ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
         $safeIntroText = htmlspecialchars($introText, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+        $safeValidityText = htmlspecialchars($validityText, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
         $safeActionLabel = htmlspecialchars($actionLabel, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
         $safeUrl = htmlspecialchars($actionUrl, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
 
@@ -185,7 +194,7 @@ final class MailService
   <h1 style="font-size:22px;margin:0 0 16px;">{$safeActionLabel}</h1>
   <p style="margin:0 0 12px;">Cześć {$safeName},</p>
   <p style="margin:0 0 12px;">{$safeIntroText}</p>
-  <p style="margin:0 0 20px;">Link jest ważny przez 60 minut.</p>
+  <p style="margin:0 0 20px;">{$safeValidityText}</p>
   <p style="margin:0 0 20px;">
     <a href="{$safeUrl}" style="display:inline-block;background:#111827;color:#ffffff;text-decoration:none;padding:12px 18px;border-radius:8px;">{$safeActionLabel}</a>
   </p>
@@ -196,14 +205,19 @@ final class MailService
 HTML;
     }
 
-    private static function actionText(string $recipientName, string $introText, string $actionLabel, string $actionUrl): string
-    {
+    private static function actionText(
+        string $recipientName,
+        string $introText,
+        string $validityText,
+        string $actionLabel,
+        string $actionUrl
+    ): string {
         $name = $recipientName !== '' ? $recipientName : 'Użytkowniku';
 
         return implode("\n\n", [
             "Cześć {$name},",
             $introText,
-            'Link jest ważny przez 60 minut.',
+            $validityText,
             "{$actionLabel}: {$actionUrl}",
             'Jeśli to nie Ty, zignoruj tę wiadomość.',
         ]);
