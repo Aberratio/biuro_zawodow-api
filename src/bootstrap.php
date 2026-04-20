@@ -321,7 +321,7 @@ function passwordResetTokenHash(string $token): string
 
 function passwordResetExpiresAt(): string
 {
-    return gmdate('Y-m-d H:i:s', time() + 60 * 60);
+    return gmdate('Y-m-d H:i:s', time() + 24 * 60 * 60);
 }
 
 function forgotPasswordSuccessMessage(): string

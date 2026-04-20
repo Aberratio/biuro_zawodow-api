@@ -202,6 +202,25 @@ try {
     ");
 
     $currentLocalDateTime = static fn(): string => (new DateTimeImmutable())->format('Y-m-d H:i:s');
+    $validateEventOfficeWindow = static function (string $normalizedOfficeOpenAt, string $normalizedOfficeCloseAt, bool $allowPastOpenAt = false) use ($currentLocalDateTime): ?string {
+        $openAt = parseLocalDateTimeString($normalizedOfficeOpenAt);
+        $closeAt = parseLocalDateTimeString($normalizedOfficeCloseAt);
+        $now = parseLocalDateTimeString($currentLocalDateTime());
+
+        if ($openAt === null || $closeAt === null || $now === null) {
+            return 'office_open_at i office_close_at muszą być prawidłowymi lokalnymi datami i godzinami';
+        }
+
+        if (!$allowPastOpenAt && $openAt < $now) {
+            return 'Godzina otwarcia biura nie może być w przeszłości';
+        }
+
+        if (($closeAt->getTimestamp() - $openAt->getTimestamp()) < 3600) {
+            return 'Biuro zawodów musi być otwarte przez minimum 1 godzinę';
+        }
+
+        return null;
+    };
 
     $loadAssignedEvents = static function (PDO $pdo, string $userId) use ($currentLocalDateTime): array {
         $stmt = $pdo->prepare('
@@ -2173,7 +2192,7 @@ try {
             $eventLimitValue = (int)$eventLimit;
         }
 
-        $eventCountStmt = $pdo->prepare('SELECT COUNT(*) AS total FROM events WHERE organization_id = :organization_id AND archived_at IS NULL');
+        $eventCountStmt = $pdo->prepare('SELECT COUNT(*) AS total FROM events WHERE organization_id = :organization_id');
         $eventCountStmt->execute(['organization_id' => $organizationId]);
         $eventCount = (int)($eventCountStmt->fetch()['total'] ?? 0);
         if ($eventLimitValue < $eventCount) {
@@ -2310,6 +2329,12 @@ try {
             exit;
         }
 
+        $officeWindowValidationError = $validateEventOfficeWindow($normalizedOfficeOpenAt, $normalizedOfficeCloseAt);
+        if ($officeWindowValidationError !== null) {
+            jsonResponse(422, ['error' => $officeWindowValidationError]);
+            exit;
+        }
+
         $eventDate = substr($normalizedOfficeOpenAt, 0, 10);
 
         if (!$canAccessOrganization($authUser, $organizationId)) {
@@ -2323,7 +2348,7 @@ try {
             exit;
         }
 
-        $eventCountStmt = $pdo->prepare('SELECT COUNT(*) AS total FROM events WHERE organization_id = :organization_id AND archived_at IS NULL');
+        $eventCountStmt = $pdo->prepare('SELECT COUNT(*) AS total FROM events WHERE organization_id = :organization_id');
         $eventCountStmt->execute(['organization_id' => $organizationId]);
         $eventCount = (int)($eventCountStmt->fetch()['total'] ?? 0);
 
@@ -2496,6 +2521,17 @@ try {
 
         if ($normalizedOfficeOpenAt >= $normalizedOfficeCloseAt) {
             jsonResponse(422, ['error' => 'Godzina otwarcia biura musi być wcześniejsza niż godzina zamknięcia']);
+            exit;
+        }
+
+        $isCurrentlyOpen = $isEventOfficeOpenNow($event);
+        $officeWindowValidationError = $validateEventOfficeWindow(
+            $normalizedOfficeOpenAt,
+            $normalizedOfficeCloseAt,
+            $isCurrentlyOpen
+        );
+        if ($officeWindowValidationError !== null) {
+            jsonResponse(422, ['error' => $officeWindowValidationError]);
             exit;
         }
 
@@ -3271,7 +3307,7 @@ try {
             exit;
         }
 
-        $eventCountStmt = $pdo->prepare('SELECT COUNT(*) AS total FROM events WHERE organization_id = :organization_id AND archived_at IS NULL');
+        $eventCountStmt = $pdo->prepare('SELECT COUNT(*) AS total FROM events WHERE organization_id = :organization_id');
         $eventCountStmt->execute(['organization_id' => $organizationId]);
         $eventCount = (int)($eventCountStmt->fetch()['total'] ?? 0);
         $eventLimitValue = (int)$eventLimit;
