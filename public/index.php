@@ -4020,7 +4020,12 @@ try {
         $sentCount = 0;
         $errorCount = 0;
         $errors = [];
-        $updatedParticipantIds = [];
+
+        if (function_exists('set_time_limit')) {
+            @set_time_limit(0);
+        }
+
+        $updateSentEmailStatusStmt = $pdo->prepare('UPDATE participants SET email_status = :email_status WHERE id = :id');
 
         foreach ($participants as $participantRow) {
             $participantRow['custom_fields'] = decodeJsonObject($participantRow['custom_fields_json'] ?? null);
@@ -4042,7 +4047,10 @@ try {
                     qrToken: (string)$participantRow['qr_code']
                 );
 
-                $updatedParticipantIds[] = (int)$participantRow['id'];
+                $updateSentEmailStatusStmt->execute([
+                    'email_status' => 'sent',
+                    'id' => (int)$participantRow['id'],
+                ]);
                 $sentCount++;
             } catch (Throwable $exception) {
                 $errorCount++;
@@ -4054,10 +4062,7 @@ try {
             }
         }
 
-        if ($updatedParticipantIds !== []) {
-            $placeholders = implode(',', array_fill(0, count($updatedParticipantIds), '?'));
-            $updateStmt = $pdo->prepare("UPDATE participants SET email_status = 'sent' WHERE id IN ({$placeholders})");
-            $updateStmt->execute($updatedParticipantIds);
+        if ($sentCount > 0) {
             $addActivityLog(
                 $pdo,
                 $resendAll ? 'Wyslano ponownie kody QR dla wydarzenia' : 'Wyslano kody QR dla wydarzenia',
