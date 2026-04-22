@@ -3215,7 +3215,7 @@ try {
     }
 
     if (preg_match('#^/events/([^/]+)/participant-field-mappings$#', $path, $matches) === 1 && $method === 'GET') {
-        $authUser = requireAnyRole(['superadmin', 'admin', 'editor', 'scanner_plus'], $resolveAuthenticatedUser);
+        $authUser = requireAnyRole(['superadmin', 'admin', 'editor', 'scanner', 'scanner_plus'], $resolveAuthenticatedUser);
         $eventId = (string)$matches[1];
         $event = $loadEventById($pdo, $eventId);
 
@@ -4273,7 +4273,7 @@ try {
     }
 
     if (preg_match('#^/participants/(\d+)$#', $path, $matches) === 1 && $method === 'PATCH') {
-        $authUser = requireAnyRole(['superadmin', 'admin', 'editor', 'scanner_plus'], $resolveAuthenticatedUser);
+        $authUser = requireAnyRole(['superadmin', 'admin', 'editor', 'scanner', 'scanner_plus'], $resolveAuthenticatedUser);
         $participant = $loadParticipantById($pdo, (int)$matches[1]);
 
         if ($participant === false) {
@@ -4282,7 +4282,7 @@ try {
         }
 
         [$event, $accessError] = $assertParticipantEventAccess($pdo, $authUser, $participant);
-        if ($accessError !== null || $event === null || !$canManageEventParticipants($authUser, $event)) {
+        if ($accessError !== null || $event === null) {
             jsonResponse($accessError === 'Brak uprawnień' ? 403 : 422, ['error' => $accessError ?? 'Brak uprawnień']);
             exit;
         }
@@ -4299,9 +4299,21 @@ try {
         $sourceNodeId = trim((string)($input['source_node_id'] ?? ''));
         $eventIdFromClient = trim((string)($input['event_id'] ?? ''));
         $baseStatus = trim((string)($input['base_status'] ?? ''));
+        $canUpdateStatus = $canAccessEvent($authUser, $event) || $canManageEventParticipants($authUser, $event);
+        $canManageParticipantRecord = $canManageEventParticipants($authUser, $event);
 
         if ($nextStatus === '' && $email === null && $fieldValues === null && !$hasBibNumberUpdate) {
             jsonResponse(422, ['error' => 'Podaj co najmniej jedno pole uczestnika']);
+            exit;
+        }
+
+        if ($nextStatus !== '' && !$canUpdateStatus) {
+            jsonResponse(403, ['error' => 'Brak uprawnien']);
+            exit;
+        }
+
+        if (($email !== null || $fieldValues !== null || $hasBibNumberUpdate) && !$canManageParticipantRecord) {
+            jsonResponse(403, ['error' => 'Brak uprawnien']);
             exit;
         }
 
