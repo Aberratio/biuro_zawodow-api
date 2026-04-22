@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 
 declare(strict_types=1);
 
@@ -2596,12 +2596,6 @@ try {
 
         if (trim((string)($event['archived_at'] ?? '')) !== '') {
             jsonResponse(422, ['error' => 'Wydarzenie jest już zarchiwizowane']);
-            exit;
-        }
-
-        $officeCloseAt = parseLocalDateTimeString((string)($event['office_close_at'] ?? ''));
-        if ($officeCloseAt === null || new DateTimeImmutable() <= $officeCloseAt) {
-            jsonResponse(422, ['error' => 'Archiwizować można tylko zakończone wydarzenia']);
             exit;
         }
 
