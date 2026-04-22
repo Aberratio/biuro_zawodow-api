@@ -1,0 +1,16 @@
+<IfModule mod_rewrite.c>
+  RewriteEngine On
+  RewriteBase /
+
+  # Existing files and directories should bypass rewrites.
+  RewriteCond %{REQUEST_FILENAME} -f [OR]
+  RewriteCond %{REQUEST_FILENAME} -d
+  RewriteRule ^ - [L]
+
+  # API and documentation routes stay handled by PHP.
+  RewriteCond %{REQUEST_URI} ^/(auth|bootstrap|docs|events|health|openapi\.json|organizations|participants|qr-images|users)(/|$) [NC]
+  RewriteRule ^ index.php [QSA,L]
+
+  # Frontend routes handled by React Router must always resolve to index.html.
+  RewriteRule ^ index.html [L]
+</IfModule>
