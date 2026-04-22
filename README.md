@@ -232,6 +232,8 @@ php -S localhost:8080 router.php
 
 The router is defined in `router.php` and forwards dynamic requests to `public/index.php`.
 
+If you deploy the React build into `public/` behind Apache/XAMPP, keep `public/.htaccess` in place. It preserves PHP handling for API endpoints and rewrites frontend routes like `/events/:id` or `/organizations/:id` to `index.html`, which prevents `404` after a browser refresh.
+
 Useful checks:
 
 ```powershell
