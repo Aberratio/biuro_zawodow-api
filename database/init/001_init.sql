@@ -148,7 +148,7 @@ CREATE TABLE event_participant_field_mappings (
     event_id VARCHAR(64) NOT NULL,
     source_column_name VARCHAR(190) NOT NULL,
     alias VARCHAR(190) NOT NULL,
-    field_role ENUM('email', 'display_name_part', 'bib_number', 'custom') NOT NULL,
+    field_role ENUM('email', 'display_name_part', 'bib_number', 'custom', 'important_custom') NOT NULL,
     display_order INT UNSIGNED NOT NULL DEFAULT 0,
     is_required TINYINT(1) NOT NULL DEFAULT 0,
     is_active TINYINT(1) NOT NULL DEFAULT 1,

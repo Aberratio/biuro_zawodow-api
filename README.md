@@ -137,6 +137,8 @@ If you are upgrading an older local database, review the scripts in `database/mi
 - `012_add_scanner_plus_role.php`
 - `013_allow_multiple_admins_per_organization.php`
 - `014_drop_admin_organization_assignments.php`
+- `015_allow_duplicate_participant_bib_numbers.php`
+- `016_add_important_participant_field_role.php`
 
 ## Auth and access model
 
