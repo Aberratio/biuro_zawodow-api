@@ -2786,7 +2786,7 @@ try {
         }
 
         if (trim((string)($event['deleted_at'] ?? '')) !== '') {
-            jsonResponse(422, ['error' => 'Usuniętego z UI wydarzenia nie można przenieść do archiwum']);
+            jsonResponse(422, ['error' => 'Usuniętego wydarzenia nie można przenieść do archiwum']);
             exit;
         }
 
@@ -2850,19 +2850,19 @@ try {
         }
 
         if (trim((string)($event['deleted_at'] ?? '')) !== '') {
-            jsonResponse(422, ['error' => 'Wydarzenie jest już usunięte z UI']);
+            jsonResponse(422, ['error' => 'Wydarzenie jest już usunięte']);
             exit;
         }
 
         if (trim((string)($event['archived_at'] ?? '')) !== '') {
-            jsonResponse(422, ['error' => 'Wydarzenie jest zarchiwizowane i nie można go usuwać z UI']);
+            jsonResponse(422, ['error' => 'Wydarzenie jest zarchiwizowane i nie można go usuwać']);
             exit;
         }
 
         $officeCloseAt = parseLocalDateTimeString((string)($event['office_close_at'] ?? ''));
         $now = new DateTimeImmutable();
         if ($officeCloseAt !== null && $now > $officeCloseAt) {
-            jsonResponse(422, ['error' => 'Zakończone wydarzenia trzeba przenieść do archiwum zamiast usuwać z UI']);
+            jsonResponse(422, ['error' => 'Zakończone wydarzenia trzeba przenieść do archiwum']);
             exit;
         }
 
@@ -2871,7 +2871,7 @@ try {
         try {
             $addActivityLog(
                 $pdo,
-                sprintf('Usunięto wydarzenie z UI: %s', (string)$event['name']),
+                sprintf('Usunięto wydarzenie: %s', (string)$event['name']),
                 $eventId,
                 null,
                 null,
