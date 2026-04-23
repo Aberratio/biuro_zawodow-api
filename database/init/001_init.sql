@@ -36,11 +36,13 @@ CREATE TABLE events (
     office_open_at DATETIME NOT NULL,
     office_close_at DATETIME NOT NULL,
     archived_at DATETIME NULL,
+    deleted_at DATETIME NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     PRIMARY KEY (id),
     KEY idx_events_organization_id (organization_id),
     KEY idx_events_archived_at (archived_at),
+    KEY idx_events_deleted_at (deleted_at),
     CONSTRAINT fk_events_organization
         FOREIGN KEY (organization_id) REFERENCES organizations(id)
         ON DELETE CASCADE

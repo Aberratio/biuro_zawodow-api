@@ -119,6 +119,22 @@ try {
         ");
     }
 
+    $eventsDeletedAtColumnExistsStmt = $pdo->query("
+        SELECT COUNT(*) AS total
+        FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = 'events'
+          AND COLUMN_NAME = 'deleted_at'
+    ");
+    $eventsDeletedAtColumnExists = (int)($eventsDeletedAtColumnExistsStmt->fetch()['total'] ?? 0) > 0;
+    if (!$eventsDeletedAtColumnExists) {
+        $pdo->exec("
+            ALTER TABLE events
+            ADD COLUMN deleted_at DATETIME NULL AFTER archived_at,
+            ADD KEY idx_events_deleted_at (deleted_at)
+        ");
+    }
+
     $pdo->exec("
         CREATE TABLE IF NOT EXISTS event_sync_state (
             event_id VARCHAR(64) NOT NULL,
@@ -237,6 +253,7 @@ try {
             INNER JOIN events e ON e.id = uea.event_id
             WHERE uea.user_id = :user_id
               AND e.archived_at IS NULL
+              AND e.deleted_at IS NULL
               AND e.office_close_at > :current_time
             ORDER BY uea.event_id ASC
         ');
@@ -311,7 +328,8 @@ try {
                 organization_id,
                 DATE_FORMAT(office_open_at, "%Y-%m-%dT%H:%i:%s") AS office_open_at,
                 DATE_FORMAT(office_close_at, "%Y-%m-%dT%H:%i:%s") AS office_close_at,
-                DATE_FORMAT(archived_at, "%Y-%m-%dT%H:%i:%s") AS archived_at
+                DATE_FORMAT(archived_at, "%Y-%m-%dT%H:%i:%s") AS archived_at,
+                DATE_FORMAT(deleted_at, "%Y-%m-%dT%H:%i:%s") AS deleted_at
             FROM events
             WHERE id = :id
             LIMIT 1
@@ -330,9 +348,11 @@ try {
                 organization_id,
                 DATE_FORMAT(office_open_at, "%Y-%m-%dT%H:%i:%s") AS office_open_at,
                 DATE_FORMAT(office_close_at, "%Y-%m-%dT%H:%i:%s") AS office_close_at,
-                DATE_FORMAT(archived_at, "%Y-%m-%dT%H:%i:%s") AS archived_at
+                DATE_FORMAT(archived_at, "%Y-%m-%dT%H:%i:%s") AS archived_at,
+                DATE_FORMAT(deleted_at, "%Y-%m-%dT%H:%i:%s") AS deleted_at
             FROM events
             WHERE archived_at IS NULL
+              AND deleted_at IS NULL
             ORDER BY event_date ASC
         ')->fetchAll();
     };
@@ -346,9 +366,11 @@ try {
                 organization_id,
                 DATE_FORMAT(office_open_at, "%Y-%m-%dT%H:%i:%s") AS office_open_at,
                 DATE_FORMAT(office_close_at, "%Y-%m-%dT%H:%i:%s") AS office_close_at,
-                DATE_FORMAT(archived_at, "%Y-%m-%dT%H:%i:%s") AS archived_at
+                DATE_FORMAT(archived_at, "%Y-%m-%dT%H:%i:%s") AS archived_at,
+                DATE_FORMAT(deleted_at, "%Y-%m-%dT%H:%i:%s") AS deleted_at
             FROM events
             WHERE archived_at IS NOT NULL
+              AND deleted_at IS NULL
             ORDER BY archived_at DESC, event_date DESC
         ')->fetchAll();
     };
@@ -533,6 +555,7 @@ try {
             WHERE id = :id
               AND organization_id = :organization_id
               AND archived_at IS NULL
+              AND deleted_at IS NULL
               AND office_close_at > :current_time
             LIMIT 1
         ');
@@ -553,6 +576,7 @@ try {
     };
 
     $isArchivedEvent = static fn(array $event): bool => trim((string)($event['archived_at'] ?? '')) !== '';
+    $isDeletedEvent = static fn(array $event): bool => trim((string)($event['deleted_at'] ?? '')) !== '';
 
     $isEventOfficeOpenNow = static function (array $event): bool {
         $openAt = parseLocalDateTimeString((string)($event['office_open_at'] ?? ''));
@@ -565,8 +589,12 @@ try {
         return $now >= $openAt && $now <= $closeAt;
     };
 
-    $canManageEventParticipants = static function (array $authUser, array $event) use ($canAccessOrganization, $isArchivedEvent, $isEventOfficeOpenNow): bool {
+    $canManageEventParticipants = static function (array $authUser, array $event) use ($canAccessOrganization, $isArchivedEvent, $isDeletedEvent, $isEventOfficeOpenNow): bool {
         if (in_array($authUser['role'], ['superadmin', 'admin', 'editor', 'scanner_plus'], true) === false) {
+            return false;
+        }
+
+        if ($isDeletedEvent($event)) {
             return false;
         }
 
@@ -597,7 +625,11 @@ try {
         );
     };
 
-    $canAccessEvent = static function (array $authUser, array $event) use ($canAccessOrganization, $isEventOfficeOpenNow, $isArchivedEvent, $isScannerRole): bool {
+    $canAccessEvent = static function (array $authUser, array $event) use ($canAccessOrganization, $isDeletedEvent, $isEventOfficeOpenNow, $isArchivedEvent, $isScannerRole): bool {
+        if ($isDeletedEvent($event)) {
+            return false;
+        }
+
         if ($isArchivedEvent($event)) {
             return $authUser['role'] === 'superadmin'
                 && $canAccessOrganization($authUser, (string)$event['organization_id']);
@@ -615,8 +647,12 @@ try {
         return false;
     };
 
-    $canViewArchivedEvent = static function (array $authUser, array $event) use ($canAccessOrganization, $isArchivedEvent): bool {
+    $canViewArchivedEvent = static function (array $authUser, array $event) use ($canAccessOrganization, $isArchivedEvent, $isDeletedEvent): bool {
         if (!$isArchivedEvent($event)) {
+            return false;
+        }
+
+        if ($isDeletedEvent($event)) {
             return false;
         }
 
@@ -1128,6 +1164,7 @@ try {
             SELECT id, name
             FROM events
             WHERE archived_at IS NULL
+              AND deleted_at IS NULL
               AND office_close_at <= DATE_SUB(NOW(), INTERVAL 1 MONTH)
         ');
         $eventsToArchive = $eventsToArchiveStmt->fetchAll();
@@ -1144,6 +1181,7 @@ try {
                 SET archived_at = UTC_TIMESTAMP()
                 WHERE id = :id
                   AND archived_at IS NULL
+                  AND deleted_at IS NULL
             ');
 
             foreach ($eventsToArchive as $event) {
@@ -2200,7 +2238,7 @@ try {
             $eventLimitValue = (int)$eventLimit;
         }
 
-        $eventCountStmt = $pdo->prepare('SELECT COUNT(*) AS total FROM events WHERE organization_id = :organization_id');
+        $eventCountStmt = $pdo->prepare('SELECT COUNT(*) AS total FROM events WHERE organization_id = :organization_id AND deleted_at IS NULL');
         $eventCountStmt->execute(['organization_id' => $organizationId]);
         $eventCount = (int)($eventCountStmt->fetch()['total'] ?? 0);
         if ($eventLimitValue < $eventCount) {
@@ -2272,7 +2310,7 @@ try {
             exit;
         }
 
-        $eventCountStmt = $pdo->prepare('SELECT COUNT(*) AS total FROM events WHERE organization_id = :organization_id');
+        $eventCountStmt = $pdo->prepare('SELECT COUNT(*) AS total FROM events WHERE organization_id = :organization_id AND deleted_at IS NULL');
         $eventCountStmt->execute(['organization_id' => $organizationId]);
         $eventCount = (int)($eventCountStmt->fetch()['total'] ?? 0);
         if ($eventCount > 0) {
@@ -2356,7 +2394,7 @@ try {
             exit;
         }
 
-        $eventCountStmt = $pdo->prepare('SELECT COUNT(*) AS total FROM events WHERE organization_id = :organization_id');
+        $eventCountStmt = $pdo->prepare('SELECT COUNT(*) AS total FROM events WHERE organization_id = :organization_id AND deleted_at IS NULL');
         $eventCountStmt->execute(['organization_id' => $organizationId]);
         $eventCount = (int)($eventCountStmt->fetch()['total'] ?? 0);
 
@@ -2616,8 +2654,139 @@ try {
                 (string)$authUser['name']
             );
 
-            $archiveEventStmt = $pdo->prepare('UPDATE events SET archived_at = UTC_TIMESTAMP() WHERE id = :id');
+            $archiveEventStmt = $pdo->prepare('UPDATE events SET archived_at = UTC_TIMESTAMP() WHERE id = :id AND deleted_at IS NULL');
             $archiveEventStmt->execute(['id' => $eventId]);
+
+            $pdo->commit();
+        } catch (Throwable $exception) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+
+            throw $exception;
+        }
+
+        jsonResponse(200, ['success' => true]);
+        exit;
+    }
+
+    if (preg_match('#^/events/([^/]+)/archive$#', $path, $matches) === 1 && $method === 'POST') {
+        $authUser = requireAnyRole(['superadmin', 'admin', 'editor'], $resolveAuthenticatedUser);
+        $eventId = (string)$matches[1];
+        $event = $loadEventById($pdo, $eventId);
+
+        if ($event === false) {
+            jsonResponse(404, ['error' => 'Nie znaleziono wydarzenia']);
+            exit;
+        }
+
+        if (!$canManageEventParticipants($authUser, $event)) {
+            jsonResponse(403, ['error' => 'Brak uprawnień']);
+            exit;
+        }
+
+        if (trim((string)($event['deleted_at'] ?? '')) !== '') {
+            jsonResponse(422, ['error' => 'Usuniętego z UI wydarzenia nie można przenieść do archiwum']);
+            exit;
+        }
+
+        if (trim((string)($event['archived_at'] ?? '')) !== '') {
+            jsonResponse(422, ['error' => 'Wydarzenie jest już zarchiwizowane']);
+            exit;
+        }
+
+        $participantCountStmt = $pdo->prepare('SELECT COUNT(*) AS total FROM participants WHERE event_id = :event_id');
+        $participantCountStmt->execute(['event_id' => $eventId]);
+        $participantCount = (int)($participantCountStmt->fetch()['total'] ?? 0);
+
+        $pdo->beginTransaction();
+
+        try {
+            $addActivityLog(
+                $pdo,
+                sprintf('Zarchiwizowano wydarzenie: %s (%d uczestnikow)', (string)$event['name'], $participantCount),
+                $eventId,
+                null,
+                null,
+                (string)$authUser['id'],
+                (string)$authUser['name']
+            );
+
+            $archiveEventStmt = $pdo->prepare('
+                UPDATE events
+                SET archived_at = UTC_TIMESTAMP()
+                WHERE id = :id
+                  AND archived_at IS NULL
+                  AND deleted_at IS NULL
+            ');
+            $archiveEventStmt->execute(['id' => $eventId]);
+
+            $pdo->commit();
+        } catch (Throwable $exception) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+
+            throw $exception;
+        }
+
+        jsonResponse(200, ['success' => true]);
+        exit;
+    }
+
+    if (preg_match('#^/events/([^/]+)/delete-ui$#', $path, $matches) === 1 && $method === 'POST') {
+        $authUser = requireAnyRole(['superadmin', 'admin', 'editor'], $resolveAuthenticatedUser);
+        $eventId = (string)$matches[1];
+        $event = $loadEventById($pdo, $eventId);
+
+        if ($event === false) {
+            jsonResponse(404, ['error' => 'Nie znaleziono wydarzenia']);
+            exit;
+        }
+
+        if (!$canManageEventParticipants($authUser, $event)) {
+            jsonResponse(403, ['error' => 'Brak uprawnień']);
+            exit;
+        }
+
+        if (trim((string)($event['deleted_at'] ?? '')) !== '') {
+            jsonResponse(422, ['error' => 'Wydarzenie jest już usunięte z UI']);
+            exit;
+        }
+
+        if (trim((string)($event['archived_at'] ?? '')) !== '') {
+            jsonResponse(422, ['error' => 'Wydarzenie jest zarchiwizowane i nie można go usuwać z UI']);
+            exit;
+        }
+
+        $officeCloseAt = parseLocalDateTimeString((string)($event['office_close_at'] ?? ''));
+        $now = new DateTimeImmutable();
+        if ($officeCloseAt !== null && $now > $officeCloseAt) {
+            jsonResponse(422, ['error' => 'Zakończone wydarzenia trzeba przenieść do archiwum zamiast usuwać z UI']);
+            exit;
+        }
+
+        $pdo->beginTransaction();
+
+        try {
+            $addActivityLog(
+                $pdo,
+                sprintf('Usunięto wydarzenie z UI: %s', (string)$event['name']),
+                $eventId,
+                null,
+                null,
+                (string)$authUser['id'],
+                (string)$authUser['name']
+            );
+
+            $deleteEventStmt = $pdo->prepare('
+                UPDATE events
+                SET deleted_at = UTC_TIMESTAMP()
+                WHERE id = :id
+                  AND archived_at IS NULL
+                  AND deleted_at IS NULL
+            ');
+            $deleteEventStmt->execute(['id' => $eventId]);
 
             $pdo->commit();
         } catch (Throwable $exception) {
@@ -3309,7 +3478,7 @@ try {
             exit;
         }
 
-        $eventCountStmt = $pdo->prepare('SELECT COUNT(*) AS total FROM events WHERE organization_id = :organization_id');
+        $eventCountStmt = $pdo->prepare('SELECT COUNT(*) AS total FROM events WHERE organization_id = :organization_id AND deleted_at IS NULL');
         $eventCountStmt->execute(['organization_id' => $organizationId]);
         $eventCount = (int)($eventCountStmt->fetch()['total'] ?? 0);
         $eventLimitValue = (int)$eventLimit;
@@ -3987,6 +4156,11 @@ try {
         $input = readJsonBody();
         $resendAll = (bool)($input['resend_all'] ?? false);
 
+        if ($resendAll && $isEventOfficeOpenNow($event)) {
+            jsonResponse(422, ['error' => 'W godzinach działania biura nie można ponownie wysłać kodów QR do wszystkich uczestników.']);
+            exit;
+        }
+
         $stmt = $pdo->prepare('
             SELECT
                 id,
@@ -4456,7 +4630,7 @@ try {
                     && !in_array($bibNumberConflictResolution, ['keep_duplicates', 'delete_conflicts'], true)
                 ) {
                     jsonResponse(409, [
-                        'error' => 'Ten numer startowy jest już używany przez innego uczestnika.',
+                        'error' => 'Inny uczestnik ma już przypisany ten numer startowy.',
                         'code' => 'bib_number_conflict',
                         'data' => [
                             'bib_number' => $requestedBibNumber,
