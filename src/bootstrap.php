@@ -2887,6 +2887,10 @@ function openApiDocument(): array
                             'type' => 'object',
                             'additionalProperties' => ['type' => 'string'],
                         ],
+                        'important_field_aliases' => [
+                            'type' => 'array',
+                            'items' => ['type' => 'string'],
+                        ],
                         'status' => ['type' => 'string', 'enum' => ['not_checked_in', 'checked_in', 'checked_in_not_starting']],
                         'email_status' => ['type' => 'string', 'enum' => ['not_sent', 'sent']],
                         'checked_in_at' => ['type' => 'string', 'format' => 'date-time', 'nullable' => true],
@@ -2912,7 +2916,7 @@ function openApiDocument(): array
                     'properties' => [
                         'source_column_name' => ['type' => 'string', 'example' => 'Imię'],
                         'alias' => ['type' => 'string', 'example' => 'Imię'],
-                        'field_role' => ['type' => 'string', 'enum' => ['email', 'display_name_part', 'bib_number', 'custom']],
+                        'field_role' => ['type' => 'string', 'enum' => ['email', 'display_name_part', 'bib_number', 'custom', 'important_custom']],
                         'display_order' => ['type' => 'integer', 'example' => 1],
                         'is_required' => ['type' => 'boolean'],
                         'is_active' => ['type' => 'boolean'],
@@ -2990,6 +2994,14 @@ function openApiDocument(): array
                         'display_name' => ['type' => 'string'],
                         'email' => ['type' => 'string', 'format' => 'email'],
                         'bib_number' => ['type' => 'string', 'nullable' => true],
+                        'custom_fields' => [
+                            'type' => 'object',
+                            'additionalProperties' => ['type' => 'string'],
+                        ],
+                        'important_field_aliases' => [
+                            'type' => 'array',
+                            'items' => ['type' => 'string'],
+                        ],
                         'status' => ['type' => 'string', 'enum' => ['not_checked_in', 'checked_in', 'checked_in_not_starting']],
                         'email_status' => ['type' => 'string', 'enum' => ['not_sent', 'sent']],
                         'checked_in_at' => ['type' => 'string', 'format' => 'date-time', 'nullable' => true],
@@ -3106,7 +3118,7 @@ function openApiDocument(): array
                     'properties' => [
                         'source_column_name' => ['type' => 'string'],
                         'alias' => ['type' => 'string'],
-                        'field_role' => ['type' => 'string', 'enum' => ['display_name_part', 'bib_number', 'custom']],
+                        'field_role' => ['type' => 'string', 'enum' => ['display_name_part', 'bib_number', 'custom', 'important_custom']],
                         'is_active' => ['type' => 'boolean'],
                     ],
                 ],

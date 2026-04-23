@@ -1209,6 +1209,71 @@ try {
 
     $archiveExpiredEvents($pdo);
 
+    $participantImportantFieldsMetaKey = '__important_field_aliases';
+
+    $normalizeParticipantImportantFieldAliases = static function (array $aliases): array {
+        $normalizedAliases = [];
+
+        foreach ($aliases as $alias) {
+            if (!is_string($alias)) {
+                continue;
+            }
+
+            $trimmedAlias = trim($alias);
+            if ($trimmedAlias === '') {
+                continue;
+            }
+
+            $normalizedAliases[] = $trimmedAlias;
+        }
+
+        return array_values(array_unique($normalizedAliases));
+    };
+
+    $extractParticipantFieldMetadata = static function (array $decodedCustomFields) use ($participantImportantFieldsMetaKey, $normalizeParticipantImportantFieldAliases): array {
+        $importantFieldAliases = $normalizeParticipantImportantFieldAliases(
+            is_array($decodedCustomFields[$participantImportantFieldsMetaKey] ?? null)
+                ? $decodedCustomFields[$participantImportantFieldsMetaKey]
+                : []
+        );
+
+        unset($decodedCustomFields[$participantImportantFieldsMetaKey]);
+
+        $customFields = [];
+        foreach ($decodedCustomFields as $fieldName => $value) {
+            $normalizedFieldName = trim((string)$fieldName);
+            if ($normalizedFieldName === '') {
+                continue;
+            }
+
+            $customFields[$normalizedFieldName] = trim((string)$value);
+        }
+
+        return [
+            'custom_fields' => $customFields,
+            'important_field_aliases' => $importantFieldAliases,
+        ];
+    };
+
+    $encodeParticipantCustomFields = static function (array $customFields, array $importantFieldAliases) use ($participantImportantFieldsMetaKey, $normalizeParticipantImportantFieldAliases): array {
+        $normalizedCustomFields = [];
+        foreach ($customFields as $fieldName => $value) {
+            $normalizedFieldName = trim((string)$fieldName);
+            if ($normalizedFieldName === '') {
+                continue;
+            }
+
+            $normalizedCustomFields[$normalizedFieldName] = trim((string)$value);
+        }
+
+        $normalizedImportantFieldAliases = $normalizeParticipantImportantFieldAliases($importantFieldAliases);
+        if ($normalizedImportantFieldAliases !== []) {
+            $normalizedCustomFields[$participantImportantFieldsMetaKey] = $normalizedImportantFieldAliases;
+        }
+
+        return $normalizedCustomFields;
+    };
+
     $loadParticipantFieldMappings = static function (PDO $pdo, string $eventId): array {
         $stmt = $pdo->prepare('
             SELECT
@@ -1246,6 +1311,7 @@ try {
         $customFields = [];
         $bibNumber = $preservedBibNumber;
         $missingFields = [];
+        $importantFieldAliases = [];
 
         foreach ($mappings as $mapping) {
             if (!($mapping['is_active'] ?? true) || $mapping['field_role'] === 'email') {
@@ -1280,6 +1346,9 @@ try {
             }
 
             $customFields[$alias] = $value;
+            if ($mapping['field_role'] === 'important_custom') {
+                $importantFieldAliases[] = $alias;
+            }
         }
 
         return [
@@ -1287,6 +1356,7 @@ try {
             'custom_fields' => $customFields,
             'bib_number' => $bibNumber,
             'missing_fields' => $missingFields,
+            'important_field_aliases' => $importantFieldAliases,
         ];
     };
 
@@ -1327,7 +1397,7 @@ try {
         return $participant;
     };
 
-    $loadParticipantById = static function (PDO $pdo, int $participantId) use (&$ensureParticipantQrCode): array|false {
+    $loadParticipantById = static function (PDO $pdo, int $participantId) use (&$ensureParticipantQrCode, $extractParticipantFieldMetadata): array|false {
         $stmt = $pdo->prepare('
             SELECT
                 id,
@@ -1354,13 +1424,16 @@ try {
             return false;
         }
 
-        $participant['custom_fields'] = decodeJsonObject($participant['custom_fields_json'] ?? null);
+        $decodedCustomFields = decodeJsonObject($participant['custom_fields_json'] ?? null);
+        $participantFieldMetadata = $extractParticipantFieldMetadata($decodedCustomFields);
+        $participant['custom_fields'] = $participantFieldMetadata['custom_fields'];
+        $participant['important_field_aliases'] = $participantFieldMetadata['important_field_aliases'];
         unset($participant['custom_fields_json']);
 
         return $ensureParticipantQrCode($pdo, $participant);
     };
 
-    $loadParticipantByQrCode = static function (PDO $pdo, string $qrCode) use (&$ensureParticipantQrCode): array|false {
+    $loadParticipantByQrCode = static function (PDO $pdo, string $qrCode) use (&$ensureParticipantQrCode, $extractParticipantFieldMetadata): array|false {
         $stmt = $pdo->prepare('
             SELECT
                 id,
@@ -1389,13 +1462,16 @@ try {
             return false;
         }
 
-        $participant['custom_fields'] = decodeJsonObject($participant['custom_fields_json'] ?? null);
+        $decodedCustomFields = decodeJsonObject($participant['custom_fields_json'] ?? null);
+        $participantFieldMetadata = $extractParticipantFieldMetadata($decodedCustomFields);
+        $participant['custom_fields'] = $participantFieldMetadata['custom_fields'];
+        $participant['important_field_aliases'] = $participantFieldMetadata['important_field_aliases'];
         unset($participant['custom_fields_json']);
 
         return $ensureParticipantQrCode($pdo, $participant);
     };
 
-    $loadParticipantsByEventId = static function (PDO $pdo, string $eventId) use (&$ensureParticipantQrCode): array {
+    $loadParticipantsByEventId = static function (PDO $pdo, string $eventId) use (&$ensureParticipantQrCode, $extractParticipantFieldMetadata): array {
         $stmt = $pdo->prepare('
             SELECT
                 id,
@@ -1421,7 +1497,10 @@ try {
         $participants = $stmt->fetchAll();
 
         foreach ($participants as &$participant) {
-            $participant['custom_fields'] = decodeJsonObject($participant['custom_fields_json'] ?? null);
+            $decodedCustomFields = decodeJsonObject($participant['custom_fields_json'] ?? null);
+            $participantFieldMetadata = $extractParticipantFieldMetadata($decodedCustomFields);
+            $participant['custom_fields'] = $participantFieldMetadata['custom_fields'];
+            $participant['important_field_aliases'] = $participantFieldMetadata['important_field_aliases'];
             unset($participant['custom_fields_json']);
             $participant = $ensureParticipantQrCode($pdo, $participant);
         }
@@ -1430,7 +1509,7 @@ try {
         return $participants;
     };
 
-    $loadParticipantsByEventIds = static function (PDO $pdo, array $eventIds) use (&$ensureParticipantQrCode): array {
+    $loadParticipantsByEventIds = static function (PDO $pdo, array $eventIds) use (&$ensureParticipantQrCode, $extractParticipantFieldMetadata): array {
         $normalizedEventIds = array_values(array_filter(
             array_map(static fn(mixed $eventId): string => trim((string)$eventId), $eventIds),
             static fn(string $eventId): bool => $eventId !== ''
@@ -1465,7 +1544,10 @@ try {
         $participants = $stmt->fetchAll();
 
         foreach ($participants as &$participant) {
-            $participant['custom_fields'] = decodeJsonObject($participant['custom_fields_json'] ?? null);
+            $decodedCustomFields = decodeJsonObject($participant['custom_fields_json'] ?? null);
+            $participantFieldMetadata = $extractParticipantFieldMetadata($decodedCustomFields);
+            $participant['custom_fields'] = $participantFieldMetadata['custom_fields'];
+            $participant['important_field_aliases'] = $participantFieldMetadata['important_field_aliases'];
             unset($participant['custom_fields_json']);
             $participant = $ensureParticipantQrCode($pdo, $participant);
         }
@@ -1497,6 +1579,8 @@ try {
                 'display_name' => (string)$participant['display_name'],
                 'email' => (string)$participant['email'],
                 'bib_number' => (string)($participant['bib_number'] ?? ''),
+                'custom_fields' => $participant['custom_fields'] ?? [],
+                'important_field_aliases' => $participant['important_field_aliases'] ?? [],
                 'status' => (string)$participant['status'],
                 'email_status' => (string)$participant['email_status'],
                 'checked_in_at' => $participant['checked_in_at'],
@@ -1591,7 +1675,7 @@ try {
         string $eventId,
         string $bibNumber,
         int $exceptParticipantId = 0
-    ) use (&$ensureParticipantQrCode): array {
+    ) use (&$ensureParticipantQrCode, $extractParticipantFieldMetadata): array {
         $stmt = $pdo->prepare('
             SELECT
                 id,
@@ -1623,7 +1707,10 @@ try {
         $participants = $stmt->fetchAll();
 
         foreach ($participants as &$participant) {
-            $participant['custom_fields'] = decodeJsonObject($participant['custom_fields_json'] ?? null);
+            $decodedCustomFields = decodeJsonObject($participant['custom_fields_json'] ?? null);
+            $participantFieldMetadata = $extractParticipantFieldMetadata($decodedCustomFields);
+            $participant['custom_fields'] = $participantFieldMetadata['custom_fields'];
+            $participant['important_field_aliases'] = $participantFieldMetadata['important_field_aliases'];
             unset($participant['custom_fields_json']);
             $participant = $ensureParticipantQrCode($pdo, $participant);
         }
@@ -1761,6 +1848,7 @@ try {
 
     $normalizeCustomFieldsFromMapping = static function (array $row, array $mappings): array {
         $customFields = [];
+        $importantFieldAliases = [];
 
         foreach ($mappings as $mapping) {
             if (!($mapping['is_active'] ?? true)) {
@@ -1768,7 +1856,7 @@ try {
             }
 
             $role = (string)$mapping['field_role'];
-            if (!in_array($role, ['display_name_part', 'bib_number', 'custom'], true)) {
+            if (!in_array($role, ['display_name_part', 'bib_number', 'custom', 'important_custom'], true)) {
                 continue;
             }
 
@@ -1783,9 +1871,15 @@ try {
             }
 
             $customFields[$alias] = $value;
+            if ($role === 'important_custom') {
+                $importantFieldAliases[] = $alias;
+            }
         }
 
-        return $customFields;
+        return [
+            'custom_fields' => $customFields,
+            'important_field_aliases' => $importantFieldAliases,
+        ];
     };
 
     $insertParticipantRecord = static function (
@@ -1797,7 +1891,7 @@ try {
         array $customFields,
         string $organization = '',
         ?string $qrCode = null
-    ) use ($loadParticipantById, $generateUniqueParticipantQrCode): array {
+    ) use ($loadParticipantById, $generateUniqueParticipantQrCode, $encodeParticipantCustomFields): array {
         $nameParts = splitParticipantDisplayName($displayName);
         $resolvedBibNumber = $bibNumber !== null && trim($bibNumber) !== ''
             ? trim($bibNumber)
@@ -1805,6 +1899,12 @@ try {
         $resolvedQrCode = $qrCode !== null && QrCodeService::isSecureToken(trim($qrCode))
             ? trim($qrCode)
             : $generateUniqueParticipantQrCode($pdo);
+        $resolvedImportantFieldAliases = [];
+        if (isset($customFields['important_field_aliases']) && is_array($customFields['important_field_aliases'])) {
+            $resolvedImportantFieldAliases = $customFields['important_field_aliases'];
+            unset($customFields['important_field_aliases']);
+        }
+        $encodedCustomFields = $encodeParticipantCustomFields($customFields, $resolvedImportantFieldAliases);
 
         $stmt = $pdo->prepare('
             INSERT INTO participants (
@@ -1842,7 +1942,7 @@ try {
             'organization' => $organization !== '' ? $organization : null,
             'bib_number' => $resolvedBibNumber,
             'qr_code' => $resolvedQrCode,
-            'custom_fields_json' => $customFields !== [] ? json_encode($customFields, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) : null,
+            'custom_fields_json' => $encodedCustomFields !== [] ? json_encode($encodedCustomFields, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) : null,
             'status' => 'not_checked_in',
             'email_status' => 'not_sent',
         ]);
@@ -3143,7 +3243,7 @@ try {
                 exit;
             }
 
-            if (!in_array($fieldRole, ['display_name_part', 'bib_number', 'custom'], true)) {
+            if (!in_array($fieldRole, ['display_name_part', 'bib_number', 'custom', 'important_custom'], true)) {
                 jsonResponse(422, ['error' => sprintf('Nieprawidłowa rola pola dla kolumny "%s"', $sourceColumnName)]);
                 exit;
             }
@@ -3339,8 +3439,18 @@ try {
                 continue;
             }
 
-            $customFields = $normalizeCustomFieldsFromMapping($row, $mappings);
-            $participant = $insertParticipantRecord($pdo, $eventId, $displayName, $email, $bibNumber, $customFields);
+            $customFieldData = $normalizeCustomFieldsFromMapping($row, $mappings);
+            $participant = $insertParticipantRecord(
+                $pdo,
+                $eventId,
+                $displayName,
+                $email,
+                $bibNumber,
+                [
+                    'important_field_aliases' => $customFieldData['important_field_aliases'] ?? [],
+                    ...($customFieldData['custom_fields'] ?? []),
+                ]
+            );
             if ($participant !== []) {
                 $createdParticipants[] = $participant;
                 $createdBibNumber = trim((string)($participant['bib_number'] ?? ''));
@@ -3441,7 +3551,10 @@ try {
             $resolvedDisplayName,
             $email,
             is_string($resolvedData['bib_number']) ? $resolvedData['bib_number'] : null,
-            is_array($resolvedData['custom_fields']) ? $resolvedData['custom_fields'] : []
+            [
+                'important_field_aliases' => is_array($resolvedData['important_field_aliases'] ?? null) ? $resolvedData['important_field_aliases'] : [],
+                ...(is_array($resolvedData['custom_fields']) ? $resolvedData['custom_fields'] : []),
+            ]
         );
         $addActivityLog(
             $pdo,
@@ -4196,7 +4309,10 @@ try {
         $updateSentEmailStatusStmt = $pdo->prepare('UPDATE participants SET email_status = :email_status WHERE id = :id');
 
         foreach ($participants as $participantRow) {
-            $participantRow['custom_fields'] = decodeJsonObject($participantRow['custom_fields_json'] ?? null);
+            $decodedCustomFields = decodeJsonObject($participantRow['custom_fields_json'] ?? null);
+            $participantFieldMetadata = $extractParticipantFieldMetadata($decodedCustomFields);
+            $participantRow['custom_fields'] = $participantFieldMetadata['custom_fields'];
+            $participantRow['important_field_aliases'] = $participantFieldMetadata['important_field_aliases'];
             unset($participantRow['custom_fields_json']);
             $participantRow = $ensureParticipantQrCode($pdo, $participantRow);
 
@@ -4728,6 +4844,10 @@ try {
                 (string)($participant['display_name'] ?? ''),
                 (string)($participant['email'] ?? '')
             );
+            $encodedCustomFields = $encodeParticipantCustomFields(
+                is_array($resolvedData['custom_fields']) ? $resolvedData['custom_fields'] : [],
+                is_array($resolvedData['important_field_aliases'] ?? null) ? $resolvedData['important_field_aliases'] : []
+            );
 
             $nameParts = splitParticipantDisplayName($resolvedDisplayName);
             $emailChanged = $resolvedEmail !== normalizeEmailAddress((string)$participant['email']);
@@ -4747,7 +4867,7 @@ try {
                 'last_name' => $nameParts['last_name'],
                 'display_name' => $resolvedDisplayName,
                 'email' => $resolvedEmail,
-                'custom_fields_json' => $resolvedData['custom_fields'] !== [] ? json_encode($resolvedData['custom_fields'], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) : null,
+                'custom_fields_json' => $encodedCustomFields !== [] ? json_encode($encodedCustomFields, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) : null,
                 'email_status' => $emailChanged ? 'not_sent' : (string)$participant['email_status'],
                 'id' => (int)$participant['id'],
             ]);
