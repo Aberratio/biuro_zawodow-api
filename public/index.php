@@ -4246,7 +4246,7 @@ try {
 
         if (!$canAccessEvent($authUser, $event)) {
             jsonResponse(403, [
-                'error' => 'QR belongs to an event outside your permissions',
+                'error' => 'Ten kod QR należy do uczestnika z innego wydarzenia niż aktualnie wybrane.',
                 'data' => $serializeParticipantScanResponse($participant, $event, false),
             ]);
             exit;
