@@ -217,6 +217,181 @@ try {
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     ");
 
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS event_participant_import_baseline_records (
+            id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+            event_id VARCHAR(64) NOT NULL,
+            participant_audit_key VARCHAR(64) NOT NULL,
+            source_row_number INT UNSIGNED NULL,
+            display_name VARCHAR(255) NOT NULL,
+            email VARCHAR(190) NOT NULL,
+            bib_number VARCHAR(32) NULL,
+            custom_fields_json LONGTEXT NULL,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (id),
+            UNIQUE KEY uq_event_participant_import_baseline_records_audit_key (participant_audit_key),
+            KEY idx_event_participant_import_baseline_records_event_id (event_id),
+            CONSTRAINT fk_event_participant_import_baseline_records_event
+                FOREIGN KEY (event_id) REFERENCES events(id)
+                ON DELETE CASCADE
+                ON UPDATE CASCADE
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    ");
+
+    $participantsAuditKeyColumnExistsStmt = $pdo->query("
+        SELECT COUNT(*) AS total
+        FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = 'participants'
+          AND COLUMN_NAME = 'participant_audit_key'
+    ");
+    $participantsAuditKeyColumnExists = (int)($participantsAuditKeyColumnExistsStmt->fetch()['total'] ?? 0) > 0;
+    if (!$participantsAuditKeyColumnExists) {
+        $pdo->exec("
+            ALTER TABLE participants
+            ADD COLUMN participant_audit_key VARCHAR(64) NULL AFTER event_id
+        ");
+    }
+
+    $participantsBaselineRecordColumnExistsStmt = $pdo->query("
+        SELECT COUNT(*) AS total
+        FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = 'participants'
+          AND COLUMN_NAME = 'baseline_import_record_id'
+    ");
+    $participantsBaselineRecordColumnExists = (int)($participantsBaselineRecordColumnExistsStmt->fetch()['total'] ?? 0) > 0;
+    if (!$participantsBaselineRecordColumnExists) {
+        $pdo->exec("
+            ALTER TABLE participants
+            ADD COLUMN baseline_import_record_id BIGINT UNSIGNED NULL AFTER participant_audit_key
+        ");
+    }
+
+    $participantsAuditKeyIndexExistsStmt = $pdo->query("
+        SHOW INDEX FROM participants
+        WHERE Key_name = 'uq_participants_audit_key'
+    ");
+    $participantsAuditKeyIndexExists = $participantsAuditKeyIndexExistsStmt !== false && $participantsAuditKeyIndexExistsStmt->fetch() !== false;
+    if (!$participantsAuditKeyIndexExists) {
+        $pdo->exec("
+            ALTER TABLE participants
+            ADD UNIQUE KEY uq_participants_audit_key (participant_audit_key)
+        ");
+    }
+
+    $participantsBaselineIndexExistsStmt = $pdo->query("
+        SHOW INDEX FROM participants
+        WHERE Key_name = 'idx_participants_baseline_import_record_id'
+    ");
+    $participantsBaselineIndexExists = $participantsBaselineIndexExistsStmt !== false && $participantsBaselineIndexExistsStmt->fetch() !== false;
+    if (!$participantsBaselineIndexExists) {
+        $pdo->exec("
+            ALTER TABLE participants
+            ADD KEY idx_participants_baseline_import_record_id (baseline_import_record_id)
+        ");
+    }
+
+    $participantBaselineForeignKeyExistsStmt = $pdo->query("
+        SELECT COUNT(*) AS total
+        FROM information_schema.KEY_COLUMN_USAGE
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = 'participants'
+          AND COLUMN_NAME = 'baseline_import_record_id'
+          AND CONSTRAINT_NAME = 'fk_participants_baseline_import_record'
+    ");
+    $participantBaselineForeignKeyExists = (int)($participantBaselineForeignKeyExistsStmt->fetch()['total'] ?? 0) > 0;
+    if (!$participantBaselineForeignKeyExists) {
+        $pdo->exec("
+            ALTER TABLE participants
+            ADD CONSTRAINT fk_participants_baseline_import_record
+                FOREIGN KEY (baseline_import_record_id) REFERENCES event_participant_import_baseline_records(id)
+                ON DELETE SET NULL
+                ON UPDATE CASCADE
+        ");
+    }
+
+    $participantsWithoutAuditKeyStmt = $pdo->query("
+        SELECT id
+        FROM participants
+        WHERE participant_audit_key IS NULL
+           OR participant_audit_key = ''
+    ");
+    if ($participantsWithoutAuditKeyStmt !== false) {
+        $participantAuditKeyUpdateStmt = $pdo->prepare("
+            UPDATE participants
+            SET participant_audit_key = :participant_audit_key
+            WHERE id = :id
+        ");
+
+        foreach ($participantsWithoutAuditKeyStmt->fetchAll() as $participantRow) {
+            $participantAuditKeyUpdateStmt->execute([
+                'participant_audit_key' => 'pa-' . bin2hex(random_bytes(12)),
+                'id' => (int)$participantRow['id'],
+            ]);
+        }
+    }
+
+    $participantsAuditKeyNullCountStmt = $pdo->query("
+        SELECT COUNT(*) AS total
+        FROM participants
+        WHERE participant_audit_key IS NULL
+    ");
+    $participantsAuditKeyNullCount = (int)($participantsAuditKeyNullCountStmt->fetch()['total'] ?? 0);
+    if ($participantsAuditKeyNullCount === 0) {
+        $participantsAuditKeyTypeStmt = $pdo->query("
+            SELECT IS_NULLABLE
+            FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'participants'
+              AND COLUMN_NAME = 'participant_audit_key'
+            LIMIT 1
+        ");
+        $participantsAuditKeyIsNullable = (string)($participantsAuditKeyTypeStmt->fetch()['IS_NULLABLE'] ?? 'YES');
+        if ($participantsAuditKeyIsNullable === 'YES') {
+            $pdo->exec("
+                ALTER TABLE participants
+                MODIFY participant_audit_key VARCHAR(64) NOT NULL
+            ");
+        }
+    }
+
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS event_participant_change_logs (
+            id VARCHAR(64) NOT NULL,
+            event_id VARCHAR(64) NOT NULL,
+            participant_audit_key VARCHAR(64) NOT NULL,
+            baseline_record_id BIGINT UNSIGNED NULL,
+            participant_id BIGINT UNSIGNED NULL,
+            change_type ENUM('added', 'updated', 'deleted') NOT NULL,
+            change_source ENUM('csv_import', 'manual', 'participant_edit', 'participant_delete', 'bib_conflict_resolution') NOT NULL,
+            changed_fields_json LONGTEXT NULL,
+            before_state_json LONGTEXT NULL,
+            after_state_json LONGTEXT NULL,
+            user_id VARCHAR(64) NULL,
+            user_name_snapshot VARCHAR(190) NULL,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (id),
+            KEY idx_event_participant_change_logs_event_id (event_id),
+            KEY idx_event_participant_change_logs_audit_key (participant_audit_key),
+            KEY idx_event_participant_change_logs_baseline_record_id (baseline_record_id),
+            KEY idx_event_participant_change_logs_participant_id (participant_id),
+            KEY idx_event_participant_change_logs_user_id (user_id),
+            CONSTRAINT fk_event_participant_change_logs_event
+                FOREIGN KEY (event_id) REFERENCES events(id)
+                ON DELETE CASCADE
+                ON UPDATE CASCADE,
+            CONSTRAINT fk_event_participant_change_logs_baseline_record
+                FOREIGN KEY (baseline_record_id) REFERENCES event_participant_import_baseline_records(id)
+                ON DELETE SET NULL
+                ON UPDATE CASCADE,
+            CONSTRAINT fk_event_participant_change_logs_user
+                FOREIGN KEY (user_id) REFERENCES users(id)
+                ON DELETE SET NULL
+                ON UPDATE CASCADE
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    ");
+
     $currentLocalDateTime = static fn(): string => (new DateTimeImmutable())->format('Y-m-d H:i:s');
     $currentLocalDateTimeMinutePrecision = static function (): string {
         $now = new DateTimeImmutable();
@@ -1402,6 +1577,8 @@ try {
             SELECT
                 id,
                 event_id,
+                participant_audit_key,
+                baseline_import_record_id,
                 first_name,
                 last_name,
                 display_name,
@@ -1438,6 +1615,8 @@ try {
             SELECT
                 id,
                 event_id,
+                participant_audit_key,
+                baseline_import_record_id,
                 first_name,
                 last_name,
                 display_name,
@@ -1476,6 +1655,8 @@ try {
             SELECT
                 id,
                 event_id,
+                participant_audit_key,
+                baseline_import_record_id,
                 first_name,
                 last_name,
                 display_name,
@@ -1523,6 +1704,8 @@ try {
             SELECT
                 id,
                 event_id,
+                participant_audit_key,
+                baseline_import_record_id,
                 first_name,
                 last_name,
                 display_name,
@@ -1647,6 +1830,262 @@ try {
         return $normalized !== '' ? $normalized : null;
     };
 
+    $normalizeParticipantChangeState = static function (array $participant) use (
+        $extractParticipantFieldMetadata,
+        $normalizeParticipantImportantFieldAliases,
+        $normalizeParticipantBibNumber
+    ): array {
+        $customFields = [];
+        $importantFieldAliases = [];
+
+        if (isset($participant['custom_fields']) && is_array($participant['custom_fields'])) {
+            foreach ($participant['custom_fields'] as $fieldName => $value) {
+                $normalizedFieldName = trim((string)$fieldName);
+                if ($normalizedFieldName === '') {
+                    continue;
+                }
+
+                $customFields[$normalizedFieldName] = trim((string)$value);
+            }
+        } else {
+            $participantFieldMetadata = $extractParticipantFieldMetadata(
+                decodeJsonObject(isset($participant['custom_fields_json']) ? (string)$participant['custom_fields_json'] : null)
+            );
+            $customFields = $participantFieldMetadata['custom_fields'];
+            $importantFieldAliases = $participantFieldMetadata['important_field_aliases'];
+        }
+
+        if (isset($participant['important_field_aliases']) && is_array($participant['important_field_aliases'])) {
+            $importantFieldAliases = $normalizeParticipantImportantFieldAliases($participant['important_field_aliases']);
+        }
+
+        ksort($customFields);
+
+        return [
+            'display_name' => trim((string)($participant['display_name'] ?? '')),
+            'email' => normalizeEmailAddress((string)($participant['email'] ?? '')),
+            'bib_number' => $normalizeParticipantBibNumber($participant['bib_number'] ?? null),
+            'custom_fields' => $customFields,
+            'important_field_aliases' => $importantFieldAliases,
+        ];
+    };
+
+    $diffParticipantChangeStates = static function (array $beforeState, array $afterState): array {
+        $changedFields = [];
+
+        foreach (['display_name', 'email', 'bib_number'] as $fieldName) {
+            if (($beforeState[$fieldName] ?? null) !== ($afterState[$fieldName] ?? null)) {
+                $changedFields[] = $fieldName;
+            }
+        }
+
+        $beforeCustomFields = is_array($beforeState['custom_fields'] ?? null) ? $beforeState['custom_fields'] : [];
+        $afterCustomFields = is_array($afterState['custom_fields'] ?? null) ? $afterState['custom_fields'] : [];
+        $customFieldAliases = array_values(array_unique(array_merge(array_keys($beforeCustomFields), array_keys($afterCustomFields))));
+        sort($customFieldAliases);
+
+        foreach ($customFieldAliases as $alias) {
+            $beforeValue = trim((string)($beforeCustomFields[$alias] ?? ''));
+            $afterValue = trim((string)($afterCustomFields[$alias] ?? ''));
+            if ($beforeValue !== $afterValue) {
+                $changedFields[] = $alias;
+            }
+        }
+
+        return $changedFields;
+    };
+
+    $eventHasParticipantImportBaseline = static function (PDO $pdo, string $eventId): bool {
+        $stmt = $pdo->prepare('
+            SELECT COUNT(*) AS total
+            FROM event_participant_import_baseline_records
+            WHERE event_id = :event_id
+        ');
+        $stmt->execute(['event_id' => $eventId]);
+
+        return (int)($stmt->fetch()['total'] ?? 0) > 0;
+    };
+
+    $createParticipantImportBaselineRecord = static function (
+        PDO $pdo,
+        string $eventId,
+        string $participantAuditKey,
+        array $participantState,
+        ?int $sourceRowNumber = null
+    ) use ($encodeParticipantCustomFields): int {
+        $encodedCustomFields = $encodeParticipantCustomFields(
+            is_array($participantState['custom_fields'] ?? null) ? $participantState['custom_fields'] : [],
+            is_array($participantState['important_field_aliases'] ?? null) ? $participantState['important_field_aliases'] : []
+        );
+        $stmt = $pdo->prepare('
+            INSERT INTO event_participant_import_baseline_records (
+                event_id,
+                participant_audit_key,
+                source_row_number,
+                display_name,
+                email,
+                bib_number,
+                custom_fields_json
+            ) VALUES (
+                :event_id,
+                :participant_audit_key,
+                :source_row_number,
+                :display_name,
+                :email,
+                :bib_number,
+                :custom_fields_json
+            )
+        ');
+        $stmt->bindValue(':event_id', $eventId);
+        $stmt->bindValue(':participant_audit_key', $participantAuditKey);
+        $stmt->bindValue(':source_row_number', $sourceRowNumber, $sourceRowNumber === null ? PDO::PARAM_NULL : PDO::PARAM_INT);
+        $stmt->bindValue(':display_name', trim((string)($participantState['display_name'] ?? '')));
+        $stmt->bindValue(':email', normalizeEmailAddress((string)($participantState['email'] ?? '')));
+        $stmt->bindValue(':bib_number', $participantState['bib_number'] ?? null, ($participantState['bib_number'] ?? null) === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
+        $stmt->bindValue(':custom_fields_json', $encodedCustomFields !== [] ? encodeJsonValue($encodedCustomFields) : null, $encodedCustomFields !== [] ? PDO::PARAM_STR : PDO::PARAM_NULL);
+        $stmt->execute();
+
+        return (int)$pdo->lastInsertId();
+    };
+
+    $attachParticipantBaselineRecord = static function (PDO $pdo, int $participantId, int $baselineRecordId): void {
+        $stmt = $pdo->prepare('
+            UPDATE participants
+            SET baseline_import_record_id = :baseline_import_record_id
+            WHERE id = :id
+        ');
+        $stmt->execute([
+            'baseline_import_record_id' => $baselineRecordId,
+            'id' => $participantId,
+        ]);
+    };
+
+    $addParticipantChangeLog = static function (
+        PDO $pdo,
+        string $eventId,
+        string $participantAuditKey,
+        ?int $baselineRecordId,
+        ?int $participantId,
+        string $changeType,
+        string $changeSource,
+        array $beforeState,
+        array $afterState,
+        array $changedFields,
+        ?string $userId = null,
+        ?string $userName = null
+    ): void {
+        $stmt = $pdo->prepare('
+            INSERT INTO event_participant_change_logs (
+                id,
+                event_id,
+                participant_audit_key,
+                baseline_record_id,
+                participant_id,
+                change_type,
+                change_source,
+                changed_fields_json,
+                before_state_json,
+                after_state_json,
+                user_id,
+                user_name_snapshot
+            ) VALUES (
+                :id,
+                :event_id,
+                :participant_audit_key,
+                :baseline_record_id,
+                :participant_id,
+                :change_type,
+                :change_source,
+                :changed_fields_json,
+                :before_state_json,
+                :after_state_json,
+                :user_id,
+                :user_name_snapshot
+            )
+        ');
+        $stmt->bindValue(':id', 'pcl-' . bin2hex(random_bytes(8)));
+        $stmt->bindValue(':event_id', $eventId);
+        $stmt->bindValue(':participant_audit_key', $participantAuditKey);
+        $stmt->bindValue(':baseline_record_id', $baselineRecordId, $baselineRecordId === null ? PDO::PARAM_NULL : PDO::PARAM_INT);
+        $stmt->bindValue(':participant_id', $participantId, $participantId === null ? PDO::PARAM_NULL : PDO::PARAM_INT);
+        $stmt->bindValue(':change_type', $changeType);
+        $stmt->bindValue(':change_source', $changeSource);
+        $stmt->bindValue(':changed_fields_json', $changedFields !== [] ? encodeJsonValue(array_values($changedFields)) : null, $changedFields !== [] ? PDO::PARAM_STR : PDO::PARAM_NULL);
+        $stmt->bindValue(':before_state_json', $beforeState !== [] ? encodeJsonValue($beforeState) : null, $beforeState !== [] ? PDO::PARAM_STR : PDO::PARAM_NULL);
+        $stmt->bindValue(':after_state_json', $afterState !== [] ? encodeJsonValue($afterState) : null, $afterState !== [] ? PDO::PARAM_STR : PDO::PARAM_NULL);
+        $stmt->bindValue(':user_id', $userId, $userId === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
+        $stmt->bindValue(':user_name_snapshot', $userName, $userName === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
+        $stmt->execute();
+    };
+
+    $loadParticipantImportBaselineRecords = static function (PDO $pdo, string $eventId) use ($normalizeParticipantChangeState): array {
+        $stmt = $pdo->prepare('
+            SELECT
+                id,
+                event_id,
+                participant_audit_key,
+                source_row_number,
+                display_name,
+                email,
+                bib_number,
+                custom_fields_json,
+                created_at
+            FROM event_participant_import_baseline_records
+            WHERE event_id = :event_id
+            ORDER BY id ASC
+        ');
+        $stmt->execute(['event_id' => $eventId]);
+
+        return array_map(static function (array $row) use ($normalizeParticipantChangeState): array {
+            $row['state'] = $normalizeParticipantChangeState($row);
+            return $row;
+        }, $stmt->fetchAll());
+    };
+
+    $loadParticipantChangeLogsByEvent = static function (PDO $pdo, string $eventId): array {
+        $stmt = $pdo->prepare('
+            SELECT
+                id,
+                event_id,
+                participant_audit_key,
+                baseline_record_id,
+                participant_id,
+                change_type,
+                change_source,
+                changed_fields_json,
+                before_state_json,
+                after_state_json,
+                user_id,
+                user_name_snapshot,
+                created_at
+            FROM event_participant_change_logs
+            WHERE event_id = :event_id
+            ORDER BY created_at ASC, id ASC
+        ');
+        $stmt->execute(['event_id' => $eventId]);
+
+        return array_map(static function (array $row): array {
+            return [
+                ...$row,
+                'baseline_record_id' => isset($row['baseline_record_id']) ? (int)$row['baseline_record_id'] : null,
+                'participant_id' => isset($row['participant_id']) ? (int)$row['participant_id'] : null,
+                'changed_fields' => array_values(array_filter(
+                    array_map(static fn(mixed $fieldName): string => trim((string)$fieldName), decodeJsonObject($row['changed_fields_json'] ?? null)),
+                    static fn(string $fieldName): bool => $fieldName !== ''
+                )),
+                'before_state' => decodeJsonObject($row['before_state_json'] ?? null),
+                'after_state' => decodeJsonObject($row['after_state_json'] ?? null),
+            ];
+        }, $stmt->fetchAll());
+    };
+
+    $loadParticipantFieldMappingState = static function (PDO $pdo, string $eventId) use ($loadParticipantFieldMappings, $eventHasParticipantImportBaseline): array {
+        return [
+            'has_mapping' => $loadParticipantFieldMappings($pdo, $eventId) !== [],
+            'has_baseline_import' => $eventHasParticipantImportBaseline($pdo, $eventId),
+        ];
+    };
+
     $participantBibNumberExistsForEvent = static function (
         PDO $pdo,
         string $eventId,
@@ -1680,6 +2119,8 @@ try {
             SELECT
                 id,
                 event_id,
+                participant_audit_key,
+                baseline_import_record_id,
                 first_name,
                 last_name,
                 display_name,
@@ -1891,7 +2332,9 @@ try {
         ?string $bibNumber,
         array $customFields,
         string $organization = '',
-        ?string $qrCode = null
+        ?string $qrCode = null,
+        ?string $participantAuditKey = null,
+        ?int $baselineImportRecordId = null
     ) use ($loadParticipantById, $generateUniqueParticipantQrCode, $encodeParticipantCustomFields): array {
         $nameParts = splitParticipantDisplayName($displayName);
         $resolvedBibNumber = $bibNumber !== null && trim($bibNumber) !== ''
@@ -1906,10 +2349,15 @@ try {
             unset($customFields['important_field_aliases']);
         }
         $encodedCustomFields = $encodeParticipantCustomFields($customFields, $resolvedImportantFieldAliases);
+        $resolvedParticipantAuditKey = is_string($participantAuditKey) && trim($participantAuditKey) !== ''
+            ? trim($participantAuditKey)
+            : 'pa-' . bin2hex(random_bytes(12));
 
         $stmt = $pdo->prepare('
             INSERT INTO participants (
                 event_id,
+                participant_audit_key,
+                baseline_import_record_id,
                 first_name,
                 last_name,
                 display_name,
@@ -1922,6 +2370,8 @@ try {
                 email_status
             ) VALUES (
                 :event_id,
+                :participant_audit_key,
+                :baseline_import_record_id,
                 :first_name,
                 :last_name,
                 :display_name,
@@ -1936,6 +2386,8 @@ try {
         ');
         $stmt->execute([
             'event_id' => $eventId,
+            'participant_audit_key' => $resolvedParticipantAuditKey,
+            'baseline_import_record_id' => $baselineImportRecordId,
             'first_name' => $nameParts['first_name'],
             'last_name' => $nameParts['last_name'],
             'display_name' => $displayName,
@@ -2745,6 +3197,22 @@ try {
         $pdo->beginTransaction();
 
         try {
+            if ($eventHasParticipantImportBaseline($pdo, (string)$event['id'])) {
+                $addParticipantChangeLog(
+                    $pdo,
+                    (string)$event['id'],
+                    (string)$participant['participant_audit_key'],
+                    isset($participant['baseline_import_record_id']) ? (int)$participant['baseline_import_record_id'] : null,
+                    (int)$participant['id'],
+                    'deleted',
+                    'participant_delete',
+                    $normalizeParticipantChangeState($participant),
+                    [],
+                    ['participant_record'],
+                    (string)$authUser['id'],
+                    (string)$authUser['name']
+                );
+            }
             $addActivityLog(
                 $pdo,
                 sprintf('Zarchiwizowano wydarzenie: %s (%d uczestnikow)', (string)$event['name'], $participantCount),
@@ -3112,6 +3580,264 @@ try {
         exit;
     }
 
+    if (preg_match('#^/events/([^/]+)/participant-changes/export\.csv$#', $path, $matches) === 1 && $method === 'GET') {
+        $authUser = requireAnyRole(['superadmin', 'admin', 'editor'], $resolveAuthenticatedUser);
+        $eventId = (string)$matches[1];
+        $event = $loadEventById($pdo, $eventId);
+
+        if ($event === false) {
+            jsonResponse(404, ['error' => 'Nie znaleziono wydarzenia']);
+            exit;
+        }
+
+        if (!$canManageEventParticipants($authUser, $event)) {
+            jsonResponse(403, ['error' => 'Brak uprawnieĹ„']);
+            exit;
+        }
+
+        if (!$eventHasParticipantImportBaseline($pdo, $eventId)) {
+            jsonResponse(422, ['error' => 'Eksport zmian uczestnikĂłw jest dostÄ™pny dopiero po pierwszym udanym imporcie CSV dla wydarzenia']);
+            exit;
+        }
+
+        $baselineRecords = $loadParticipantImportBaselineRecords($pdo, $eventId);
+        $currentParticipants = $loadParticipantsByEventId($pdo, $eventId);
+        $changeLogs = $loadParticipantChangeLogsByEvent($pdo, $eventId);
+
+        $entities = [];
+        $customFieldAliases = [];
+        $collectCustomFieldAliases = static function (array $participantState) use (&$customFieldAliases): void {
+            foreach (array_keys(is_array($participantState['custom_fields'] ?? null) ? $participantState['custom_fields'] : []) as $alias) {
+                $normalizedAlias = trim((string)$alias);
+                if ($normalizedAlias === '') {
+                    continue;
+                }
+
+                $customFieldAliases[$normalizedAlias] = true;
+            }
+        };
+
+        foreach ($baselineRecords as $baselineRecord) {
+            $auditKey = trim((string)($baselineRecord['participant_audit_key'] ?? ''));
+            if ($auditKey === '') {
+                continue;
+            }
+
+            $entities[$auditKey] ??= [
+                'baseline_record' => null,
+                'current_participant' => null,
+                'logs' => [],
+            ];
+            $entities[$auditKey]['baseline_record'] = $baselineRecord;
+            $collectCustomFieldAliases(is_array($baselineRecord['state'] ?? null) ? $baselineRecord['state'] : []);
+        }
+
+        foreach ($currentParticipants as $currentParticipant) {
+            $auditKey = trim((string)($currentParticipant['participant_audit_key'] ?? ''));
+            if ($auditKey === '') {
+                continue;
+            }
+
+            $entities[$auditKey] ??= [
+                'baseline_record' => null,
+                'current_participant' => null,
+                'logs' => [],
+            ];
+            $entities[$auditKey]['current_participant'] = $currentParticipant;
+            $collectCustomFieldAliases($normalizeParticipantChangeState($currentParticipant));
+        }
+
+        foreach ($changeLogs as $changeLog) {
+            $auditKey = trim((string)($changeLog['participant_audit_key'] ?? ''));
+            if ($auditKey === '') {
+                continue;
+            }
+
+            $entities[$auditKey] ??= [
+                'baseline_record' => null,
+                'current_participant' => null,
+                'logs' => [],
+            ];
+            $entities[$auditKey]['logs'][] = $changeLog;
+        }
+
+        $customFieldColumns = array_keys($customFieldAliases);
+        sort($customFieldColumns);
+
+        $rows = [];
+        foreach ($entities as $auditKey => $entity) {
+            $baselineRecord = is_array($entity['baseline_record'] ?? null) ? $entity['baseline_record'] : null;
+            $currentParticipant = is_array($entity['current_participant'] ?? null) ? $entity['current_participant'] : null;
+            $logs = is_array($entity['logs'] ?? null) ? $entity['logs'] : [];
+            $baselineState = $baselineRecord !== null && is_array($baselineRecord['state'] ?? null) ? $baselineRecord['state'] : [];
+            $currentState = $currentParticipant !== null ? $normalizeParticipantChangeState($currentParticipant) : [];
+
+            $lastLog = $logs !== [] ? $logs[count($logs) - 1] : null;
+            $firstLog = $logs !== [] ? $logs[0] : null;
+            $addedSeen = false;
+            $deletedSeen = false;
+            $latestAddSource = '';
+
+            foreach ($logs as $logEntry) {
+                if (($logEntry['change_type'] ?? '') === 'added' && !$addedSeen) {
+                    $addedSeen = true;
+                    $latestAddSource = (string)($logEntry['change_source'] ?? '');
+                }
+
+                if (($logEntry['change_type'] ?? '') === 'deleted') {
+                    $deletedSeen = true;
+                }
+            }
+
+            $rowChangeType = '';
+            $changeSource = '';
+            $currentStateLabel = '';
+            $originalState = [];
+            $currentStateForExport = [];
+            $changedFields = [];
+
+            if ($baselineRecord !== null && $currentParticipant !== null) {
+                $changedFields = $diffParticipantChangeStates($baselineState, $currentState);
+                if ($changedFields === []) {
+                    continue;
+                }
+
+                $rowChangeType = 'updated';
+                $changeSource = (string)($lastLog['change_source'] ?? 'participant_edit');
+                $currentStateLabel = 'active';
+                $originalState = $baselineState;
+                $currentStateForExport = $currentState;
+            } elseif ($baselineRecord !== null) {
+                $rowChangeType = 'deleted';
+                $changeSource = (string)($lastLog['change_source'] ?? 'participant_delete');
+                $currentStateLabel = 'deleted';
+                $originalState = $baselineState;
+                $currentStateForExport = [];
+                $changedFields = ['participant_record'];
+            } elseif ($currentParticipant !== null) {
+                $rowChangeType = 'added';
+                $changeSource = $latestAddSource !== '' ? $latestAddSource : (string)($lastLog['change_source'] ?? '');
+                $currentStateLabel = 'active';
+                $originalState = [];
+                $currentStateForExport = $currentState;
+                $changedFields = ['participant_record'];
+            } elseif ($addedSeen || $deletedSeen) {
+                $rowChangeType = $addedSeen && $deletedSeen ? 'added_then_deleted' : ($deletedSeen ? 'deleted' : 'added');
+                $changeSource = (string)($lastLog['change_source'] ?? '');
+                $currentStateLabel = 'deleted';
+                $originalState = [];
+                $currentStateForExport = [];
+                $changedFields = ['participant_record'];
+            } else {
+                continue;
+            }
+
+            $row = [
+                'change_type' => $rowChangeType,
+                'change_source' => $changeSource,
+                'event_id' => $eventId,
+                'event_name' => (string)$event['name'],
+                'baseline_record_id' => $baselineRecord !== null ? (string)$baselineRecord['id'] : '',
+                'current_participant_id' => $currentParticipant !== null ? (string)$currentParticipant['id'] : '',
+                'current_state' => $currentStateLabel,
+                'changed_fields' => implode('|', $changedFields),
+                'change_count' => (string)count($logs),
+                'first_changed_at' => (string)($firstLog['created_at'] ?? ''),
+                'last_changed_at' => (string)($lastLog['created_at'] ?? ''),
+                'last_changed_by' => (string)($lastLog['user_name_snapshot'] ?? ''),
+                'original_display_name' => (string)($originalState['display_name'] ?? ''),
+                'current_display_name' => (string)($currentStateForExport['display_name'] ?? ''),
+                'original_email' => (string)($originalState['email'] ?? ''),
+                'current_email' => (string)($currentStateForExport['email'] ?? ''),
+                'original_bib_number' => (string)($originalState['bib_number'] ?? ''),
+                'current_bib_number' => (string)($currentStateForExport['bib_number'] ?? ''),
+            ];
+
+            foreach ($customFieldColumns as $columnName) {
+                $row['original__' . $columnName] = (string)((is_array($originalState['custom_fields'] ?? null) ? $originalState['custom_fields'] : [])[$columnName] ?? '');
+                $row['current__' . $columnName] = (string)((is_array($currentStateForExport['custom_fields'] ?? null) ? $currentStateForExport['custom_fields'] : [])[$columnName] ?? '');
+            }
+
+            $rows[] = $row;
+        }
+
+        usort($rows, static function (array $left, array $right): int {
+            $leftTimestamp = trim((string)($left['last_changed_at'] ?? ''));
+            $rightTimestamp = trim((string)($right['last_changed_at'] ?? ''));
+
+            if ($leftTimestamp === $rightTimestamp) {
+                return strcmp((string)($left['current_participant_id'] ?? $left['baseline_record_id'] ?? ''), (string)($right['current_participant_id'] ?? $right['baseline_record_id'] ?? ''));
+            }
+
+            return strcmp($rightTimestamp, $leftTimestamp);
+        });
+
+        $columns = [
+            'change_type',
+            'change_source',
+            'event_id',
+            'event_name',
+            'baseline_record_id',
+            'current_participant_id',
+            'current_state',
+            'changed_fields',
+            'change_count',
+            'first_changed_at',
+            'last_changed_at',
+            'last_changed_by',
+            'original_display_name',
+            'current_display_name',
+            'original_email',
+            'current_email',
+            'original_bib_number',
+            'current_bib_number',
+        ];
+        foreach ($customFieldColumns as $columnName) {
+            $columns[] = 'original__' . $columnName;
+            $columns[] = 'current__' . $columnName;
+        }
+
+        $stream = fopen('php://temp', 'r+');
+        if ($stream === false) {
+            jsonResponse(500, ['error' => 'Nie udaĹ‚o siÄ™ rozpoczÄ…Ä‡ eksportu CSV']);
+            exit;
+        }
+
+        fputcsv($stream, $columns);
+        foreach ($rows as $row) {
+            fputcsv($stream, array_map(
+                static fn(string $columnName): string => (string)($row[$columnName] ?? ''),
+                $columns
+            ));
+        }
+
+        rewind($stream);
+        $csvContent = stream_get_contents($stream);
+        fclose($stream);
+
+        $addActivityLog(
+            $pdo,
+            'Wyeksportowano zmiany uczestnikow do CSV',
+            $eventId,
+            null,
+            null,
+            (string)$authUser['id'],
+            (string)$authUser['name']
+        );
+
+        if ($csvContent === false) {
+            jsonResponse(500, ['error' => 'Nie udaĹ‚o siÄ™ przygotowaÄ‡ eksportu CSV']);
+            exit;
+        }
+
+        $safeEventName = preg_replace('/[^a-zA-Z0-9_-]+/', '-', (string)$event['name']) ?: 'event';
+        header('Content-Type: text/csv; charset=UTF-8');
+        header(sprintf('Content-Disposition: attachment; filename="%s-participant-changes.csv"', trim($safeEventName, '-')));
+        echo "\xEF\xBB\xBF";
+        echo $csvContent;
+        exit;
+    }
+
     if (preg_match('#^/events/([^/]+)/participant-imports/analyze$#', $path, $matches) === 1 && $method === 'POST') {
         $authUser = requireAnyRole(['superadmin', 'admin', 'editor'], $resolveAuthenticatedUser);
         $eventId = (string)$matches[1];
@@ -3160,6 +3886,7 @@ try {
                 'sample_rows' => array_slice($cleaned['rows'], 0, 5),
                 'email_candidates' => $emailCandidates,
                 'has_mapping' => $existingMappings !== [],
+                'has_baseline_import' => $eventHasParticipantImportBaseline($pdo, $eventId),
                 'mappings' => $existingMappings,
                 'missing_required_columns' => $missingColumns,
                 'row_count' => count($cleaned['rows']),
@@ -3404,55 +4131,90 @@ try {
             }
         }
 
+        $hasBaselineImport = $eventHasParticipantImportBaseline($pdo, $eventId);
         $createdParticipants = [];
         $duplicateCount = 0;
         $invalidCount = 0;
         $invalidRows = [];
 
-        foreach ($cleaned['rows'] as $index => $row) {
-            $email = trim((string)($row[(string)$emailMapping['source_column_name']] ?? ''));
-            $displayName = $buildDisplayNameFromMapping($row, $mappings);
+        $pdo->beginTransaction();
 
-            if ($email === '' || !isValidEmailAddress($email) || $displayName === '') {
-                $invalidCount++;
-                $invalidRows[] = $index + 2;
-                continue;
-            }
+        try {
+            foreach ($cleaned['rows'] as $index => $row) {
+                $email = trim((string)($row[(string)$emailMapping['source_column_name']] ?? ''));
+                $displayName = $buildDisplayNameFromMapping($row, $mappings);
 
-            $normalizedEmail = strtolower($email);
-
-            $bibNumber = null;
-            foreach ($mappings as $mapping) {
-                if ($mapping['field_role'] === 'bib_number') {
-                    $candidateBib = trim((string)($row[(string)$mapping['source_column_name']] ?? ''));
-                    if ($candidateBib !== '') {
-                        $bibNumber = $candidateBib;
-                    }
-                    break;
+                if ($email === '' || !isValidEmailAddress($email) || $displayName === '') {
+                    $invalidCount++;
+                    $invalidRows[] = $index + 2;
+                    continue;
                 }
-            }
 
-            $fallbackKey = $normalizedEmail . '|' . strtolower($displayName);
-            $bibDuplicateKey = $bibNumber !== null ? $normalizedEmail . '|' . $bibNumber : null;
+                $normalizedEmail = strtolower($email);
 
-            if (($bibDuplicateKey !== null && isset($existingBibKeys[$bibDuplicateKey])) || ($bibDuplicateKey === null && isset($existingFallbackKeys[$fallbackKey]))) {
-                $duplicateCount++;
-                continue;
-            }
+                $bibNumber = null;
+                foreach ($mappings as $mapping) {
+                    if ($mapping['field_role'] === 'bib_number') {
+                        $candidateBib = trim((string)($row[(string)$mapping['source_column_name']] ?? ''));
+                        if ($candidateBib !== '') {
+                            $bibNumber = $candidateBib;
+                        }
+                        break;
+                    }
+                }
 
-            $customFieldData = $normalizeCustomFieldsFromMapping($row, $mappings);
-            $participant = $insertParticipantRecord(
-                $pdo,
-                $eventId,
-                $displayName,
-                $email,
-                $bibNumber,
-                [
-                    'important_field_aliases' => $customFieldData['important_field_aliases'] ?? [],
-                    ...($customFieldData['custom_fields'] ?? []),
-                ]
-            );
-            if ($participant !== []) {
+                $fallbackKey = $normalizedEmail . '|' . strtolower($displayName);
+                $bibDuplicateKey = $bibNumber !== null ? $normalizedEmail . '|' . $bibNumber : null;
+
+                if (($bibDuplicateKey !== null && isset($existingBibKeys[$bibDuplicateKey])) || ($bibDuplicateKey === null && isset($existingFallbackKeys[$fallbackKey]))) {
+                    $duplicateCount++;
+                    continue;
+                }
+
+                $customFieldData = $normalizeCustomFieldsFromMapping($row, $mappings);
+                $participant = $insertParticipantRecord(
+                    $pdo,
+                    $eventId,
+                    $displayName,
+                    $email,
+                    $bibNumber,
+                    [
+                        'important_field_aliases' => $customFieldData['important_field_aliases'] ?? [],
+                        ...($customFieldData['custom_fields'] ?? []),
+                    ]
+                );
+                if ($participant === []) {
+                    continue;
+                }
+
+                $participantState = $normalizeParticipantChangeState($participant);
+                if (!$hasBaselineImport) {
+                    $baselineRecordId = $createParticipantImportBaselineRecord(
+                        $pdo,
+                        $eventId,
+                        (string)$participant['participant_audit_key'],
+                        $participantState,
+                        $index + 2
+                    );
+                    $attachParticipantBaselineRecord($pdo, (int)$participant['id'], $baselineRecordId);
+                    $participant['baseline_import_record_id'] = $baselineRecordId;
+                } else {
+                    $addParticipantChangeLog(
+                        $pdo,
+                        $eventId,
+                        (string)$participant['participant_audit_key'],
+                        null,
+                        (int)$participant['id'],
+                        'added',
+                        'csv_import',
+                        [],
+                        $participantState,
+                        ['participant_record'],
+                        (string)$authUser['id'],
+                        (string)$authUser['name']
+                    );
+                }
+
                 $createdParticipants[] = $participant;
                 $createdBibNumber = trim((string)($participant['bib_number'] ?? ''));
                 if ($createdBibNumber !== '') {
@@ -3460,6 +4222,14 @@ try {
                 }
                 $existingFallbackKeys[$fallbackKey] = true;
             }
+
+            $pdo->commit();
+        } catch (Throwable $exception) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+
+            throw $exception;
         }
 
         $addActivityLog(
@@ -3504,9 +4274,11 @@ try {
         }
 
         $mappings = $loadParticipantFieldMappings($pdo, $eventId);
+        $mappingState = $loadParticipantFieldMappingState($pdo, $eventId);
         jsonResponse(200, [
             'data' => [
-                'has_mapping' => $mappings !== [],
+                'has_mapping' => $mappingState['has_mapping'],
+                'has_baseline_import' => $mappingState['has_baseline_import'],
                 'mappings' => $mappings,
             ],
         ]);
@@ -3557,6 +4329,22 @@ try {
                 ...(is_array($resolvedData['custom_fields']) ? $resolvedData['custom_fields'] : []),
             ]
         );
+        if ($eventHasParticipantImportBaseline($pdo, $eventId)) {
+            $addParticipantChangeLog(
+                $pdo,
+                $eventId,
+                (string)$participant['participant_audit_key'],
+                isset($participant['baseline_import_record_id']) ? (int)$participant['baseline_import_record_id'] : null,
+                (int)$participant['id'],
+                'added',
+                'manual',
+                [],
+                $normalizeParticipantChangeState($participant),
+                ['participant_record'],
+                (string)$authUser['id'],
+                (string)$authUser['name']
+            );
+        }
         $addActivityLog(
             $pdo,
             'Dodano uczestnika recznie',
@@ -4576,6 +5364,9 @@ try {
         $nextStatus = trim((string)($input['status'] ?? ''));
         $email = array_key_exists('email', $input) ? normalizeEmailAddress((string)$input['email']) : null;
         $fieldValues = is_array($input['field_values'] ?? null) ? $input['field_values'] : null;
+        $requestedImportantFieldAliases = isset($input['important_field_aliases']) && is_array($input['important_field_aliases'])
+            ? $normalizeParticipantImportantFieldAliases($input['important_field_aliases'])
+            : null;
         $hasBibNumberUpdate = array_key_exists('bib_number', $input);
         $requestedBibNumber = $hasBibNumberUpdate ? $normalizeParticipantBibNumber($input['bib_number']) : null;
         $bibNumberConflictResolution = trim((string)($input['bib_number_conflict_resolution'] ?? ''));
@@ -4586,6 +5377,7 @@ try {
         $baseStatus = trim((string)($input['base_status'] ?? ''));
         $canUpdateStatus = $canAccessEvent($authUser, $event) || $canManageEventParticipants($authUser, $event);
         $canManageParticipantRecord = $canManageEventParticipants($authUser, $event);
+        $hasParticipantChangeBaseline = $eventHasParticipantImportBaseline($pdo, (string)$participant['event_id']);
 
         if ($nextStatus === '' && $email === null && $fieldValues === null && !$hasBibNumberUpdate) {
             jsonResponse(422, ['error' => 'Podaj co najmniej jedno pole uczestnika']);
@@ -4655,6 +5447,7 @@ try {
                 $pdo->beginTransaction();
 
                 try {
+                    $participantStateBeforeBibUpdate = $normalizeParticipantChangeState($participant);
                     if ($nextStatus !== $statusBeforeUpdate) {
                         $participant = $updateParticipantStatus($pdo, $participant, $nextStatus);
                         $addActivityLog(
@@ -4726,6 +5519,9 @@ try {
 
         if ($hasBibNumberUpdate) {
             $currentBibNumber = $normalizeParticipantBibNumber($participant['bib_number'] ?? null);
+            $participantStateBeforeBibUpdate = $hasParticipantChangeBaseline
+                ? $normalizeParticipantChangeState($participant)
+                : null;
 
             if ($requestedBibNumber !== null && strlen($requestedBibNumber) > 32) {
                 jsonResponse(422, ['error' => 'Numer startowy może mieć maksymalnie 32 znaki']);
@@ -4773,6 +5569,22 @@ try {
                         $deleteStmt = $pdo->prepare('DELETE FROM participants WHERE id = :id');
 
                         foreach ($conflictingParticipants as $conflictingParticipant) {
+                            if ($hasParticipantChangeBaseline) {
+                                $addParticipantChangeLog(
+                                    $pdo,
+                                    (string)$participant['event_id'],
+                                    (string)$conflictingParticipant['participant_audit_key'],
+                                    isset($conflictingParticipant['baseline_import_record_id']) ? (int)$conflictingParticipant['baseline_import_record_id'] : null,
+                                    (int)$conflictingParticipant['id'],
+                                    'deleted',
+                                    'bib_conflict_resolution',
+                                    $normalizeParticipantChangeState($conflictingParticipant),
+                                    [],
+                                    ['participant_record'],
+                                    (string)$authUser['id'],
+                                    (string)$authUser['name']
+                                );
+                            }
                             $addActivityLog(
                                 $pdo,
                                 sprintf('Usunięto uczestnika podczas zwalniania numeru startowego %s', $requestedBibNumber),
@@ -4792,6 +5604,26 @@ try {
                     $updateBibNumberStmt->execute();
 
                     $participant = $loadParticipantById($pdo, (int)$participant['id']) ?: $participant;
+                    if ($hasParticipantChangeBaseline && is_array($participantStateBeforeBibUpdate)) {
+                        $participantStateAfterBibUpdate = $normalizeParticipantChangeState($participant);
+                        $changedFields = $diffParticipantChangeStates($participantStateBeforeBibUpdate, $participantStateAfterBibUpdate);
+                        if ($changedFields !== []) {
+                            $addParticipantChangeLog(
+                                $pdo,
+                                (string)$participant['event_id'],
+                                (string)$participant['participant_audit_key'],
+                                isset($participant['baseline_import_record_id']) ? (int)$participant['baseline_import_record_id'] : null,
+                                (int)$participant['id'],
+                                'updated',
+                                'participant_edit',
+                                $participantStateBeforeBibUpdate,
+                                $participantStateAfterBibUpdate,
+                                $changedFields,
+                                (string)$authUser['id'],
+                                (string)$authUser['name']
+                            );
+                        }
+                    }
                     $addActivityLog(
                         $pdo,
                         $requestedBibNumber === null
@@ -4832,13 +5664,73 @@ try {
                 exit;
             }
 
-            $participantFieldValues = $fieldValues ?? ($participant['custom_fields'] ?? []);
+            $existingCustomFields = [];
+            if (is_array($participant['custom_fields'] ?? null)) {
+                foreach ($participant['custom_fields'] as $fieldName => $value) {
+                    $normalizedFieldName = trim((string)$fieldName);
+                    if ($normalizedFieldName === '') {
+                        continue;
+                    }
+
+                    $existingCustomFields[$normalizedFieldName] = trim((string)$value);
+                }
+            }
+
+            $participantFieldValues = $fieldValues ?? $existingCustomFields;
             $resolvedData = $buildParticipantDataFromMappings(
                 $mappings,
                 is_array($participantFieldValues) ? $participantFieldValues : [],
                 false,
                 (string)($participant['bib_number'] ?? '')
             );
+            $mappedAliases = [];
+            foreach ($mappings as $mapping) {
+                if (!($mapping['is_active'] ?? true) || ($mapping['field_role'] ?? '') === 'email') {
+                    continue;
+                }
+
+                $alias = trim((string)($mapping['alias'] ?? ''));
+                if ($alias === '') {
+                    continue;
+                }
+
+                $mappedAliases[$alias] = true;
+            }
+
+            $resolvedCustomFields = $existingCustomFields;
+            foreach (array_keys($mappedAliases) as $alias) {
+                unset($resolvedCustomFields[$alias]);
+            }
+
+            foreach ((is_array($resolvedData['custom_fields'] ?? null) ? $resolvedData['custom_fields'] : []) as $alias => $value) {
+                $normalizedAlias = trim((string)$alias);
+                if ($normalizedAlias === '') {
+                    continue;
+                }
+
+                $resolvedCustomFields[$normalizedAlias] = trim((string)$value);
+            }
+            ksort($resolvedCustomFields);
+
+            $resolvedImportantFieldAliases = $requestedImportantFieldAliases
+                ?? $normalizeParticipantImportantFieldAliases(
+                    is_array($participant['important_field_aliases'] ?? null) ? $participant['important_field_aliases'] : []
+                );
+
+            if (is_array($resolvedData['important_field_aliases'] ?? null)) {
+                $resolvedImportantFieldAliases = $normalizeParticipantImportantFieldAliases(array_merge(
+                    $resolvedImportantFieldAliases,
+                    $resolvedData['important_field_aliases']
+                ));
+            }
+
+            $resolvedImportantFieldAliases = array_values(array_filter(
+                $resolvedImportantFieldAliases,
+                static function (string $alias) use ($resolvedCustomFields): bool {
+                    return isset($resolvedCustomFields[$alias]) && trim((string)$resolvedCustomFields[$alias]) !== '';
+                }
+            ));
+
             $resolvedDisplayName = $resolveParticipantDisplayName(
                 (string)$resolvedData['display_name'],
                 $resolvedEmail,
@@ -4846,12 +5738,13 @@ try {
                 (string)($participant['email'] ?? '')
             );
             $encodedCustomFields = $encodeParticipantCustomFields(
-                is_array($resolvedData['custom_fields']) ? $resolvedData['custom_fields'] : [],
-                is_array($resolvedData['important_field_aliases'] ?? null) ? $resolvedData['important_field_aliases'] : []
+                $resolvedCustomFields,
+                $resolvedImportantFieldAliases
             );
 
             $nameParts = splitParticipantDisplayName($resolvedDisplayName);
             $emailChanged = $resolvedEmail !== normalizeEmailAddress((string)$participant['email']);
+            $participantStateBeforeDataUpdate = $normalizeParticipantChangeState($participant);
             $updateStmt = $pdo->prepare('
                 UPDATE participants
                 SET
@@ -4873,7 +5766,27 @@ try {
                 'id' => (int)$participant['id'],
             ]);
 
-            $participant = $loadParticipantById($pdo, (int)$participant['id']);
+            $participant = $loadParticipantById($pdo, (int)$participant['id']) ?: $participant;
+            if ($hasParticipantChangeBaseline) {
+                $participantStateAfterDataUpdate = $normalizeParticipantChangeState($participant);
+                $changedFields = $diffParticipantChangeStates($participantStateBeforeDataUpdate, $participantStateAfterDataUpdate);
+                if ($changedFields !== []) {
+                    $addParticipantChangeLog(
+                        $pdo,
+                        (string)$participant['event_id'],
+                        (string)$participant['participant_audit_key'],
+                        isset($participant['baseline_import_record_id']) ? (int)$participant['baseline_import_record_id'] : null,
+                        (int)$participant['id'],
+                        'updated',
+                        'participant_edit',
+                        $participantStateBeforeDataUpdate,
+                        $participantStateAfterDataUpdate,
+                        $changedFields,
+                        (string)$authUser['id'],
+                        (string)$authUser['name']
+                    );
+                }
+            }
             $addActivityLog(
                 $pdo,
                 'Zaktualizowano dane uczestnika',
@@ -5005,6 +5918,23 @@ try {
             $organization,
             $qrCode === '' ? null : $qrCode
         );
+
+        if ($eventHasParticipantImportBaseline($pdo, $eventId)) {
+            $addParticipantChangeLog(
+                $pdo,
+                $eventId,
+                (string)$participant['participant_audit_key'],
+                isset($participant['baseline_import_record_id']) ? (int)$participant['baseline_import_record_id'] : null,
+                (int)($participant['id'] ?? 0),
+                'added',
+                'manual',
+                [],
+                $normalizeParticipantChangeState($participant),
+                ['participant_record'],
+                (string)$authUser['id'],
+                (string)$authUser['name']
+            );
+        }
 
         $addActivityLog(
             $pdo,

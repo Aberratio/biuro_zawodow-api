@@ -30,10 +30,10 @@ PHP 8.2 API for the `biuro_zawodow` project. It serves the React frontend, expos
 cd biuro_zawodow-api
 Copy-Item .env.example .env
 composer install
-mysql -u root -p -e "CREATE DATABASE IF NOT EXISTS biuro_zawodow CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
-mysql -u root -p biuro_zawodow < database/init/001_init.sql
-mysql -u root -p -e "CREATE USER IF NOT EXISTS 'biuro_user'@'localhost' IDENTIFIED BY 'biuro_pass';"
-mysql -u root -p -e "GRANT ALL PRIVILEGES ON biuro_zawodow.* TO 'biuro_user'@'localhost'; FLUSH PRIVILEGES;"
+"C:\Program Files\MySQL\MySQL Server 8.0\bin\mysql.exe" -u root -p -e "CREATE DATABASE IF NOT EXISTS biuro_zawodow CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+"C:\Program Files\MySQL\MySQL Server 8.0\bin\mysql.exe" -u root -p biuro_zawodow < database/init/001_init.sql
+"C:\Program Files\MySQL\MySQL Server 8.0\bin\mysql.exe" -u root -p -e "CREATE USER IF NOT EXISTS 'biuro_user'@'localhost' IDENTIFIED BY 'biuro_pass';"
+"C:\Program Files\MySQL\MySQL Server 8.0\bin\mysql.exe" -u root -p -e "GRANT ALL PRIVILEGES ON biuro_zawodow.* TO 'biuro_user'@'localhost'; FLUSH PRIVILEGES;"
 php -S localhost:8080 router.php
 ```
 
@@ -139,6 +139,7 @@ If you are upgrading an older local database, review the scripts in `database/mi
 - `014_drop_admin_organization_assignments.php`
 - `015_allow_duplicate_participant_bib_numbers.php`
 - `016_add_important_participant_field_role.php`
+- `017_add_event_participant_change_audit.php`
 
 ## Auth and access model
 
@@ -192,6 +193,7 @@ The full and current contract lives in Swagger. The most important route groups 
   - `DELETE /events/{id}`
   - `GET /events/{id}/export.csv`
   - `GET /events/{id}/logs/export.csv`
+  - `GET /events/{id}/participant-changes/export.csv`
   - `POST /events/{id}/participant-imports/analyze`
   - `POST /events/{id}/participant-imports/confirm`
   - `POST /events/{id}/participant-imports/run`
