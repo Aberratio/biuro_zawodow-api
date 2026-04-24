@@ -1088,6 +1088,53 @@ function openApiDocument(): array
                     ],
                 ],
             ],
+            '/events/{id}/participant-changes/export.csv' => [
+                'get' => [
+                    'tags' => ['Events'],
+                    'summary' => 'Export participant changes against the first imported CSV',
+                    'security' => [
+                        ['bearerAuth' => []],
+                    ],
+                    'parameters' => [
+                        [
+                            'name' => 'id',
+                            'in' => 'path',
+                            'required' => true,
+                            'schema' => [
+                                'type' => 'string',
+                            ],
+                        ],
+                    ],
+                    'responses' => [
+                        '200' => [
+                            'description' => 'CSV export',
+                            'content' => [
+                                'text/csv' => [
+                                    'schema' => [
+                                        'type' => 'string',
+                                        'format' => 'binary',
+                                    ],
+                                ],
+                            ],
+                        ],
+                        '403' => [
+                            '$ref' => '#/components/responses/Brak uprawnieĹ„',
+                        ],
+                        '404' => [
+                            '$ref' => '#/components/responses/NotFound',
+                        ],
+                        '422' => [
+                            '$ref' => '#/components/responses/BadRequest',
+                        ],
+                        '500' => [
+                            '$ref' => '#/components/responses/DatabaseError',
+                        ],
+                        '401' => [
+                            '$ref' => '#/components/responses/Brak autoryzacji',
+                        ],
+                    ],
+                ],
+            ],
             '/events/{id}/participant-imports/analyze' => [
                 'post' => [
                     'tags' => ['Events'],
@@ -3124,7 +3171,7 @@ function openApiDocument(): array
                     'properties' => [
                         'data' => [
                             'type' => 'object',
-                            'required' => ['headers', 'sample_rows', 'email_candidates', 'has_mapping', 'mappings', 'missing_required_columns', 'row_count'],
+                            'required' => ['headers', 'sample_rows', 'email_candidates', 'has_mapping', 'has_baseline_import', 'mappings', 'missing_required_columns', 'row_count'],
                             'properties' => [
                                 'headers' => [
                                     'type' => 'array',
@@ -3149,6 +3196,7 @@ function openApiDocument(): array
                                     ],
                                 ],
                                 'has_mapping' => ['type' => 'boolean'],
+                                'has_baseline_import' => ['type' => 'boolean'],
                                 'mappings' => [
                                     'type' => 'array',
                                     'items' => ['$ref' => '#/components/schemas/ParticipantFieldMapping'],
@@ -3226,9 +3274,10 @@ function openApiDocument(): array
                     'properties' => [
                         'data' => [
                             'type' => 'object',
-                            'required' => ['has_mapping', 'mappings'],
+                            'required' => ['has_mapping', 'has_baseline_import', 'mappings'],
                             'properties' => [
                                 'has_mapping' => ['type' => 'boolean'],
+                                'has_baseline_import' => ['type' => 'boolean'],
                                 'mappings' => [
                                     'type' => 'array',
                                     'items' => ['$ref' => '#/components/schemas/ParticipantFieldMapping'],

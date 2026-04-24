@@ -2,6 +2,8 @@
 SET NAMES utf8mb4;
 
 DROP TABLE IF EXISTS activity_logs;
+DROP TABLE IF EXISTS event_participant_change_logs;
+DROP TABLE IF EXISTS event_participant_import_baseline_records;
 DROP TABLE IF EXISTS sync_outbox;
 DROP TABLE IF EXISTS client_mutations;
 DROP TABLE IF EXISTS event_sync_state;
@@ -116,9 +118,30 @@ CREATE TABLE user_event_assignments (
         ON UPDATE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+CREATE TABLE event_participant_import_baseline_records (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    event_id VARCHAR(64) NOT NULL,
+    participant_audit_key VARCHAR(64) NOT NULL,
+    source_row_number INT UNSIGNED NULL,
+    display_name VARCHAR(255) NOT NULL,
+    email VARCHAR(190) NOT NULL,
+    bib_number VARCHAR(32) NULL,
+    custom_fields_json LONGTEXT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    UNIQUE KEY uq_event_participant_import_baseline_records_audit_key (participant_audit_key),
+    KEY idx_event_participant_import_baseline_records_event_id (event_id),
+    CONSTRAINT fk_event_participant_import_baseline_records_event
+        FOREIGN KEY (event_id) REFERENCES events(id)
+        ON DELETE CASCADE
+        ON UPDATE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 CREATE TABLE participants (
     id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
     event_id VARCHAR(64) NULL,
+    participant_audit_key VARCHAR(64) NOT NULL,
+    baseline_import_record_id BIGINT UNSIGNED NULL,
     first_name VARCHAR(120) NULL,
     last_name VARCHAR(120) NULL,
     display_name VARCHAR(255) NOT NULL,
@@ -134,11 +157,51 @@ CREATE TABLE participants (
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     PRIMARY KEY (id),
     UNIQUE KEY uq_participants_qr_code (qr_code),
+    UNIQUE KEY uq_participants_audit_key (participant_audit_key),
     KEY idx_participants_event_bib (event_id, bib_number),
     KEY idx_participants_event_id (event_id),
     KEY idx_participants_event_email (event_id, email),
+    KEY idx_participants_baseline_import_record_id (baseline_import_record_id),
     CONSTRAINT fk_participants_event
         FOREIGN KEY (event_id) REFERENCES events(id)
+        ON DELETE SET NULL
+        ON UPDATE CASCADE,
+    CONSTRAINT fk_participants_baseline_import_record
+        FOREIGN KEY (baseline_import_record_id) REFERENCES event_participant_import_baseline_records(id)
+        ON DELETE SET NULL
+        ON UPDATE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE event_participant_change_logs (
+    id VARCHAR(64) NOT NULL,
+    event_id VARCHAR(64) NOT NULL,
+    participant_audit_key VARCHAR(64) NOT NULL,
+    baseline_record_id BIGINT UNSIGNED NULL,
+    participant_id BIGINT UNSIGNED NULL,
+    change_type ENUM('added', 'updated', 'deleted') NOT NULL,
+    change_source ENUM('csv_import', 'manual', 'participant_edit', 'participant_delete', 'bib_conflict_resolution') NOT NULL,
+    changed_fields_json LONGTEXT NULL,
+    before_state_json LONGTEXT NULL,
+    after_state_json LONGTEXT NULL,
+    user_id VARCHAR(64) NULL,
+    user_name_snapshot VARCHAR(190) NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    KEY idx_event_participant_change_logs_event_id (event_id),
+    KEY idx_event_participant_change_logs_audit_key (participant_audit_key),
+    KEY idx_event_participant_change_logs_baseline_record_id (baseline_record_id),
+    KEY idx_event_participant_change_logs_participant_id (participant_id),
+    KEY idx_event_participant_change_logs_user_id (user_id),
+    CONSTRAINT fk_event_participant_change_logs_event
+        FOREIGN KEY (event_id) REFERENCES events(id)
+        ON DELETE CASCADE
+        ON UPDATE CASCADE,
+    CONSTRAINT fk_event_participant_change_logs_baseline_record
+        FOREIGN KEY (baseline_record_id) REFERENCES event_participant_import_baseline_records(id)
+        ON DELETE SET NULL
+        ON UPDATE CASCADE,
+    CONSTRAINT fk_event_participant_change_logs_user
+        FOREIGN KEY (user_id) REFERENCES users(id)
         ON DELETE SET NULL
         ON UPDATE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
@@ -311,10 +374,23 @@ VALUES
 ON DUPLICATE KEY UPDATE
     event_id = VALUES(event_id);
 
-INSERT INTO participants (event_id, first_name, last_name, display_name, email, organization, bib_number, qr_code, custom_fields_json, status, email_status)
+INSERT INTO participants (
+    event_id,
+    participant_audit_key,
+    first_name,
+    last_name,
+    display_name,
+    email,
+    organization,
+    bib_number,
+    qr_code,
+    custom_fields_json,
+    status,
+    email_status
+)
 VALUES
-    ('evt-1', 'Anna', 'Kowalska', 'Anna Kowalska', 'anna.kowalska@example.com', 'Politechnika Warszawska', '101', 'QR-evt-1-101', NULL, 'not_checked_in', 'not_sent'),
-    ('evt-2', 'Jan', 'Nowak', 'Jan Nowak', 'jan.nowak@example.com', 'Uniwersytet Warszawski', '201', 'QR-evt-2-201', NULL, 'not_checked_in', 'not_sent')
+    ('evt-1', 'audit-evt-1-anna-kowalska', 'Anna', 'Kowalska', 'Anna Kowalska', 'anna.kowalska@example.com', 'Politechnika Warszawska', '101', 'QR-evt-1-101', NULL, 'not_checked_in', 'not_sent'),
+    ('evt-2', 'audit-evt-2-jan-nowak', 'Jan', 'Nowak', 'Jan Nowak', 'jan.nowak@example.com', 'Uniwersytet Warszawski', '201', 'QR-evt-2-201', NULL, 'not_checked_in', 'not_sent')
 ON DUPLICATE KEY UPDATE
     first_name = VALUES(first_name),
     last_name = VALUES(last_name),
@@ -327,9 +403,32 @@ ON DUPLICATE KEY UPDATE
     email_status = VALUES(email_status);
 
 INSERT INTO activity_logs (id, action, participant_id, participant_name_snapshot, user_id, user_name_snapshot)
-VALUES
-    ('log-1', 'Check-in', 1, 'Anna Kowalska', 'u-4', 'Wolontariusz Operator 1'),
-    ('log-2', 'Wydano pakiet', 2, 'Jan Nowak', 'u-2', 'Organizator Gniezno')
+SELECT
+    'log-1',
+    'Check-in',
+    p.id,
+    'Anna Kowalska',
+    'u-4',
+    'Wolontariusz Operator 1'
+FROM participants p
+WHERE p.qr_code = 'QR-evt-1-101'
+ON DUPLICATE KEY UPDATE
+    action = VALUES(action),
+    participant_id = VALUES(participant_id),
+    participant_name_snapshot = VALUES(participant_name_snapshot),
+    user_id = VALUES(user_id),
+    user_name_snapshot = VALUES(user_name_snapshot);
+
+INSERT INTO activity_logs (id, action, participant_id, participant_name_snapshot, user_id, user_name_snapshot)
+SELECT
+    'log-2',
+    'Wydano pakiet',
+    p.id,
+    'Jan Nowak',
+    'u-2',
+    'Organizator Gniezno'
+FROM participants p
+WHERE p.qr_code = 'QR-evt-2-201'
 ON DUPLICATE KEY UPDATE
     action = VALUES(action),
     participant_id = VALUES(participant_id),
