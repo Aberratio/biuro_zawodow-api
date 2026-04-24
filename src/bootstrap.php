@@ -54,7 +54,7 @@ function jsonResponse(int $statusCode, array $payload): void
 {
     http_response_code($statusCode);
     header('Content-Type: application/json; charset=utf-8');
-    $encoded = json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+    $encoded = encodeJsonValue($payload);
     if ($encoded === false) {
         http_response_code(500);
         echo '{"error":"Nie udało się zakodować odpowiedzi"}';
@@ -286,6 +286,56 @@ function decodeJsonObject(?string $json): array
 
     $decoded = json_decode($json, true);
     return is_array($decoded) ? $decoded : [];
+}
+
+function normalizeUtf8String(string $value): string
+{
+    if ($value === '' || preg_match('//u', $value) === 1) {
+        return $value;
+    }
+
+    foreach (['Windows-1250', 'ISO-8859-2', 'Windows-1252'] as $encoding) {
+        $converted = function_exists('iconv') ? @iconv($encoding, 'UTF-8//IGNORE', $value) : false;
+        if (is_string($converted) && $converted !== '') {
+            return $converted;
+        }
+    }
+
+    if (function_exists('mb_convert_encoding')) {
+        $converted = @mb_convert_encoding($value, 'UTF-8', 'UTF-8,Windows-1250,ISO-8859-2,Windows-1252');
+        if (is_string($converted) && $converted !== '') {
+            return $converted;
+        }
+    }
+
+    return (string)(preg_replace('/[^\x09\x0A\x0D\x20-\x7E]/', '', $value) ?? '');
+}
+
+function normalizeUtf8Value(mixed $value): mixed
+{
+    if (is_string($value)) {
+        return normalizeUtf8String($value);
+    }
+
+    if (!is_array($value)) {
+        return $value;
+    }
+
+    $normalized = [];
+    foreach ($value as $key => $item) {
+        $normalizedKey = is_string($key) ? normalizeUtf8String($key) : $key;
+        $normalized[$normalizedKey] = normalizeUtf8Value($item);
+    }
+
+    return $normalized;
+}
+
+function encodeJsonValue(mixed $value): string|false
+{
+    return json_encode(
+        normalizeUtf8Value($value),
+        JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE
+    );
 }
 
 function validatePasswordRules(string $password): ?string

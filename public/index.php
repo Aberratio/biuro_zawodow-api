@@ -1134,7 +1134,7 @@ try {
                 :payload_json
             )
         ');
-        $payloadJson = json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        $payloadJson = encodeJsonValue($payload);
         $stmt->bindValue(':client_mutation_id', $clientMutationId, $clientMutationId === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
         $stmt->bindValue(':event_id', $eventId, PDO::PARAM_STR);
         $stmt->bindValue(':source_node_id', $sourceNodeId, $sourceNodeId === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
@@ -1720,7 +1720,7 @@ try {
     };
 
     $normalizeImportHeader = static function (string $header): string {
-        $normalized = trim($header);
+        $normalized = trim(normalizeUtf8String($header));
         $normalized = preg_replace('/^\xEF\xBB\xBF/u', '', $normalized) ?? $normalized;
 
         return $normalized;
@@ -1743,7 +1743,8 @@ try {
     };
 
     $parseCsvContent = static function (string $csvContent) use ($normalizeImportHeader, $detectCsvDelimiter): array {
-        $normalized = preg_replace('/^\xEF\xBB\xBF/u', '', $csvContent) ?? $csvContent;
+        $normalizedContent = normalizeUtf8String($csvContent);
+        $normalized = preg_replace('/^\xEF\xBB\xBF/u', '', $normalizedContent) ?? $normalizedContent;
         $lines = preg_split('/\r\n|\n|\r/', $normalized) ?: [];
         $lines = array_values(array_filter($lines, static fn(string $line): bool => trim($line) !== ''));
 
@@ -1770,7 +1771,7 @@ try {
 
             $row = [];
             foreach ($headers as $index => $header) {
-                $row[$header] = trim((string)($values[$index] ?? ''));
+                $row[$header] = trim(normalizeUtf8String((string)($values[$index] ?? '')));
             }
             $rows[] = $row;
         }
@@ -1942,7 +1943,7 @@ try {
             'organization' => $organization !== '' ? $organization : null,
             'bib_number' => $resolvedBibNumber,
             'qr_code' => $resolvedQrCode,
-            'custom_fields_json' => $encodedCustomFields !== [] ? json_encode($encodedCustomFields, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) : null,
+            'custom_fields_json' => $encodedCustomFields !== [] ? encodeJsonValue($encodedCustomFields) : null,
             'status' => 'not_checked_in',
             'email_status' => 'not_sent',
         ]);
@@ -4867,7 +4868,7 @@ try {
                 'last_name' => $nameParts['last_name'],
                 'display_name' => $resolvedDisplayName,
                 'email' => $resolvedEmail,
-                'custom_fields_json' => $encodedCustomFields !== [] ? json_encode($encodedCustomFields, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) : null,
+                'custom_fields_json' => $encodedCustomFields !== [] ? encodeJsonValue($encodedCustomFields) : null,
                 'email_status' => $emailChanged ? 'not_sent' : (string)$participant['email_status'],
                 'id' => (int)$participant['id'],
             ]);
