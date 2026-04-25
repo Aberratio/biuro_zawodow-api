@@ -764,6 +764,15 @@ try {
         return $now >= $openAt && $now <= $closeAt;
     };
 
+    $isEventFinished = static function (array $event): bool {
+        $closeAt = parseLocalDateTimeString((string)($event['office_close_at'] ?? ''));
+        if ($closeAt === null) {
+            return false;
+        }
+
+        return new DateTimeImmutable() > $closeAt;
+    };
+
     $canManageEventParticipants = static function (array $authUser, array $event) use ($canAccessOrganization, $isArchivedEvent, $isDeletedEvent, $isEventOfficeOpenNow): bool {
         if (in_array($authUser['role'], ['superadmin', 'admin', 'editor', 'scanner_plus'], true) === false) {
             return false;
@@ -3190,6 +3199,11 @@ try {
             exit;
         }
 
+        if (!$isEventFinished($event)) {
+            jsonResponse(422, ['error' => 'Do archiwum można przenieść tylko zakończone wydarzenia']);
+            exit;
+        }
+
         $participantCountStmt = $pdo->prepare('SELECT COUNT(*) AS total FROM participants WHERE event_id = :event_id');
         $participantCountStmt->execute(['event_id' => $eventId]);
         $participantCount = (int)($participantCountStmt->fetch()['total'] ?? 0);
@@ -3261,6 +3275,11 @@ try {
 
         if (trim((string)($event['archived_at'] ?? '')) !== '') {
             jsonResponse(422, ['error' => 'Wydarzenie jest już zarchiwizowane']);
+            exit;
+        }
+
+        if (!$isEventFinished($event)) {
+            jsonResponse(422, ['error' => 'Do archiwum można przenieść tylko zakończone wydarzenia']);
             exit;
         }
 
