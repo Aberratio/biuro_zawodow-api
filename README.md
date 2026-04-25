@@ -20,7 +20,7 @@ PHP 8.2 API for the `biuro_zawodow` project. It serves the React frontend, expos
 ## Requirements
 
 - PHP 8.2+
-- PHP extensions: `pdo`, `pdo_mysql`
+- PHP extensions: `pdo`, `pdo_mysql`, `zlib`
 - MySQL 8+
 - Composer
 
