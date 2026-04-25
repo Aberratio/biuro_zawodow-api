@@ -8,7 +8,7 @@
   RewriteRule ^ - [L]
 
   # API and documentation routes stay handled by PHP.
-  RewriteCond %{REQUEST_URI} ^/(auth|bootstrap|docs|events|health|openapi\.json|organizations|participants|qr-images|users)(/|$) [NC]
+  RewriteCond %{REQUEST_URI} ^/(auth|bootstrap|docs|events|health|openapi\.json|organizations|participants|qr-images|superadmin|users)(/|$) [NC]
   RewriteRule ^ index.php [QSA,L]
 
   # Frontend routes handled by React Router must always resolve to index.html.
