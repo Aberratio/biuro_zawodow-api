@@ -802,9 +802,10 @@ try {
         }
 
         return sprintf(
-            '%s, %s - %s',
+            'Otwarcie: %s %s, zamknięcie: %s %s',
             $openAt->format('d.m.Y'),
             $openAt->format('H:i'),
+            $closeAt->format('d.m.Y'),
             $closeAt->format('H:i')
         );
     };

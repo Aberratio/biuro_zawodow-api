@@ -44,17 +44,24 @@ final class MailService
         string $qrToken
     ): void {
         $mail = self::createConfiguredMailer();
-        $imageUrl = qrCodeImageUrl($qrToken);
-        $inlineQrSvg = QrCodeService::renderSvg($qrToken, 320, 10);
+        $qrImage = QrCodeService::renderPng($qrToken, 320, 10);
+        $qrMimeType = 'image/png';
+        $qrFilename = 'kod-qr.png';
 
         try {
             $mail->addAddress($recipientEmail, $recipientName);
             $mail->addStringEmbeddedImage(
-                $inlineQrSvg,
+                $qrImage,
                 'participant-qr',
-                'participant-qr.svg',
+                $qrFilename,
                 PHPMailer::ENCODING_BASE64,
-                'image/svg+xml'
+                $qrMimeType
+            );
+            $mail->addStringAttachment(
+                $qrImage,
+                $qrFilename,
+                PHPMailer::ENCODING_BASE64,
+                $qrMimeType
             );
             $mail->isHTML(true);
             $mail->Subject = sprintf('Twój kod QR na wydarzenie %s', $eventName);
@@ -63,16 +70,14 @@ final class MailService
                 $eventName,
                 $eventOfficeWindow,
                 $eventLocation,
-                $bibNumber,
-                $imageUrl
+                $bibNumber
             );
             $mail->AltBody = self::participantQrText(
                 $recipientName,
                 $eventName,
                 $eventOfficeWindow,
                 $eventLocation,
-                $bibNumber,
-                $imageUrl
+                $bibNumber
             );
             $mail->send();
         } catch (PHPMailerException $exception) {
@@ -228,15 +233,13 @@ HTML;
         string $eventName,
         string $eventOfficeWindow,
         string $eventLocation,
-        string $bibNumber,
-        string $imageUrl
+        string $bibNumber
     ): string {
         $safeName = htmlspecialchars($recipientName !== '' ? $recipientName : 'Zawodniku', ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
         $safeEventName = htmlspecialchars($eventName, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
         $safeEventOfficeWindow = htmlspecialchars($eventOfficeWindow, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
         $safeEventLocation = htmlspecialchars($eventLocation, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
         $safeBibNumber = htmlspecialchars($bibNumber !== '' ? $bibNumber : '-', ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
-        $safeImageUrl = htmlspecialchars($imageUrl, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
 
         return <<<HTML
 <div style="font-family:Arial,sans-serif;line-height:1.6;color:#111827;max-width:640px;margin:0 auto;padding:24px;">
@@ -250,8 +253,7 @@ HTML;
     <p style="margin:0 0 16px;font-size:18px;font-weight:700;">Numer startowy: #{$safeBibNumber}</p>
     <div style="text-align:center;background:#ffffff;padding:16px;border-radius:12px;">
       <img src="cid:participant-qr" alt="Kod QR uczestnika" style="max-width:280px;width:100%;height:auto;display:block;margin:0 auto 8px;" />
-      <p style="margin:0;font-size:12px;color:#6b7280;">Jeśli obraz nie jest widoczny, otwórz podgląd online:</p>
-      <p style="margin:8px 0 0;word-break:break-all;"><a href="{$safeImageUrl}">{$safeImageUrl}</a></p>
+      <p style="margin:0;font-size:12px;color:#6b7280;">Ten sam kod QR jest dołączony do wiadomości jako załącznik.</p>
     </div>
   </div>
   <p style="margin:0;color:#6b7280;">Zachowaj tę wiadomość i pokaż kod QR przy wejściu lub w biurze zawodów.</p>
@@ -264,8 +266,7 @@ HTML;
         string $eventName,
         string $eventOfficeWindow,
         string $eventLocation,
-        string $bibNumber,
-        string $imageUrl
+        string $bibNumber
     ): string {
         $name = $recipientName !== '' ? $recipientName : 'Zawodniku';
 
@@ -276,7 +277,7 @@ HTML;
             "Biuro zawodów: {$eventOfficeWindow}",
             "Miejsce: {$eventLocation}",
             "Numer startowy: #{$bibNumber}",
-            "Podgląd QR: {$imageUrl}",
+            'Kod QR jest dolaczony do tej wiadomosci jako zalacznik.',
         ]);
     }
 }
