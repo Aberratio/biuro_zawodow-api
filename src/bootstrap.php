@@ -1659,7 +1659,7 @@ function openApiDocument(): array
                 ],
                 'delete' => [
                     'tags' => ['Organizations'],
-                    'summary' => 'Delete organization when it has no events or assigned users',
+                    'summary' => 'Delete organization when it has no active/upcoming events or assigned users',
                     'security' => [
                         ['bearerAuth' => []],
                     ],

@@ -2872,11 +2872,11 @@ try {
             exit;
         }
 
-        $eventCountStmt = $pdo->prepare('SELECT COUNT(*) AS total FROM events WHERE organization_id = :organization_id AND deleted_at IS NULL');
+        $eventCountStmt = $pdo->prepare('SELECT COUNT(*) AS total FROM events WHERE organization_id = :organization_id AND archived_at IS NULL AND deleted_at IS NULL');
         $eventCountStmt->execute(['organization_id' => $organizationId]);
         $eventCount = (int)($eventCountStmt->fetch()['total'] ?? 0);
         if ($eventCount > 0) {
-            jsonResponse(422, ['error' => 'Nie można usunąć organizacji, która ma przypisane wydarzenia']);
+            jsonResponse(422, ['error' => 'Nie można usunąć organizacji, która ma aktywne lub nadchodzące wydarzenia']);
             exit;
         }
 
