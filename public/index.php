@@ -2689,6 +2689,400 @@ try {
         exit;
     }
 
+    if ($path === '/superadmin/audit' && $method === 'GET') {
+        requireAnyRole(['superadmin'], $resolveAuthenticatedUser);
+
+        $scope = trim((string)($_GET['scope'] ?? 'all'));
+        $entityId = trim((string)($_GET['id'] ?? ''));
+        $query = trim((string)($_GET['q'] ?? ''));
+        $limit = (int)($_GET['limit'] ?? 150);
+        $limit = max(25, min(500, $limit));
+
+        $allowedScopes = ['all', 'user', 'organization', 'event', 'participant'];
+        if (!in_array($scope, $allowedScopes, true)) {
+            jsonResponse(422, ['error' => 'Nieobslugiwany zakres audytu']);
+            exit;
+        }
+
+        $scopeSearchTerms = [];
+        if ($scope === 'user' && $entityId !== '') {
+            $targetUser = $loadUserById($pdo, $entityId);
+            if (is_array($targetUser)) {
+                $scopeSearchTerms = array_values(array_filter([
+                    trim((string)($targetUser['name'] ?? '')),
+                    trim((string)($targetUser['email'] ?? '')),
+                ], static fn(string $value): bool => $value !== ''));
+            }
+        }
+
+        $buildActivityWhere = static function (string $scope, string $entityId, string $query, array $scopeSearchTerms, array &$params): string {
+            $conditions = [];
+
+            if ($entityId !== '') {
+                if ($scope === 'user') {
+                    $userConditions = ['al.user_id = :activity_entity_id'];
+                    $params['activity_entity_id'] = $entityId;
+                    foreach ($scopeSearchTerms as $index => $term) {
+                        $placeholder = 'activity_scope_term_' . $index;
+                        $userConditions[] = 'al.action LIKE :' . $placeholder;
+                        $params[$placeholder] = '%' . $term . '%';
+                    }
+                    $conditions[] = '(' . implode(' OR ', $userConditions) . ')';
+                } elseif ($scope === 'organization') {
+                    $conditions[] = 'e.organization_id = :activity_entity_id';
+                    $params['activity_entity_id'] = $entityId;
+                } elseif ($scope === 'event') {
+                    $conditions[] = 'COALESCE(al.event_id, p.event_id) = :activity_entity_id';
+                    $params['activity_entity_id'] = $entityId;
+                } elseif ($scope === 'participant') {
+                    $conditions[] = 'al.participant_id = :activity_participant_id';
+                    $params['activity_participant_id'] = (int)$entityId;
+                }
+            }
+
+            if ($query !== '') {
+                $queryPlaceholders = [];
+                foreach (['action', 'event', 'organization', 'participant', 'snapshot', 'user', 'user_snapshot'] as $field) {
+                    $placeholder = 'activity_query_' . $field;
+                    $queryPlaceholders[$field] = ':' . $placeholder;
+                    $params[$placeholder] = '%' . $query . '%';
+                }
+                $conditions[] = '(
+                    al.action LIKE ' . $queryPlaceholders['action'] . '
+                    OR e.name LIKE ' . $queryPlaceholders['event'] . '
+                    OR o.name LIKE ' . $queryPlaceholders['organization'] . '
+                    OR p.display_name LIKE ' . $queryPlaceholders['participant'] . '
+                    OR al.participant_name_snapshot LIKE ' . $queryPlaceholders['snapshot'] . '
+                    OR u.name LIKE ' . $queryPlaceholders['user'] . '
+                    OR al.user_name_snapshot LIKE ' . $queryPlaceholders['user_snapshot'] . '
+                )';
+            }
+
+            return $conditions === [] ? '' : 'WHERE ' . implode(' AND ', $conditions);
+        };
+
+        $buildParticipantChangeWhere = static function (string $scope, string $entityId, string $query, array $scopeSearchTerms, array &$params): string {
+            $conditions = [];
+
+            if ($entityId !== '') {
+                if ($scope === 'user') {
+                    $userConditions = ['pcl.user_id = :change_entity_id'];
+                    $params['change_entity_id'] = $entityId;
+                    foreach ($scopeSearchTerms as $index => $term) {
+                        $placeholder = 'change_scope_term_' . $index;
+                        $userConditions[] = 'pcl.user_name_snapshot LIKE :' . $placeholder;
+                        $params[$placeholder] = '%' . $term . '%';
+                    }
+                    $conditions[] = '(' . implode(' OR ', $userConditions) . ')';
+                } elseif ($scope === 'organization') {
+                    $conditions[] = 'e.organization_id = :change_entity_id';
+                    $params['change_entity_id'] = $entityId;
+                } elseif ($scope === 'event') {
+                    $conditions[] = 'pcl.event_id = :change_entity_id';
+                    $params['change_entity_id'] = $entityId;
+                } elseif ($scope === 'participant') {
+                    $conditions[] = 'pcl.participant_id = :change_participant_id';
+                    $params['change_participant_id'] = (int)$entityId;
+                }
+            }
+
+            if ($query !== '') {
+                $queryPlaceholders = [];
+                foreach (['type', 'source', 'audit_key', 'event', 'organization', 'participant', 'user', 'user_snapshot', 'fields'] as $field) {
+                    $placeholder = 'change_query_' . $field;
+                    $queryPlaceholders[$field] = ':' . $placeholder;
+                    $params[$placeholder] = '%' . $query . '%';
+                }
+                $conditions[] = '(
+                    pcl.change_type LIKE ' . $queryPlaceholders['type'] . '
+                    OR pcl.change_source LIKE ' . $queryPlaceholders['source'] . '
+                    OR pcl.participant_audit_key LIKE ' . $queryPlaceholders['audit_key'] . '
+                    OR e.name LIKE ' . $queryPlaceholders['event'] . '
+                    OR o.name LIKE ' . $queryPlaceholders['organization'] . '
+                    OR p.display_name LIKE ' . $queryPlaceholders['participant'] . '
+                    OR u.name LIKE ' . $queryPlaceholders['user'] . '
+                    OR pcl.user_name_snapshot LIKE ' . $queryPlaceholders['user_snapshot'] . '
+                    OR pcl.changed_fields_json LIKE ' . $queryPlaceholders['fields'] . '
+                )';
+            }
+
+            return $conditions === [] ? '' : 'WHERE ' . implode(' AND ', $conditions);
+        };
+
+        $activityParams = [];
+        $activityWhere = $buildActivityWhere($scope, $entityId, $query, $scopeSearchTerms, $activityParams);
+        $activityStmt = $pdo->prepare("
+            SELECT
+                'activity' AS source,
+                al.id,
+                al.action,
+                DATE_FORMAT(al.created_at, '%Y-%m-%dT%H:%i:%s') AS timestamp,
+                COALESCE(al.event_id, p.event_id) AS event_id,
+                e.name AS event_name,
+                e.organization_id,
+                o.name AS organization_name,
+                al.participant_id,
+                COALESCE(p.display_name, al.participant_name_snapshot) AS participant_name,
+                al.user_id,
+                COALESCE(u.name, al.user_name_snapshot) AS user_name,
+                NULL AS change_type,
+                NULL AS change_source,
+                NULL AS changed_fields_json
+            FROM activity_logs al
+            LEFT JOIN participants p ON p.id = al.participant_id
+            LEFT JOIN events e ON e.id = COALESCE(al.event_id, p.event_id)
+            LEFT JOIN organizations o ON o.id = e.organization_id
+            LEFT JOIN users u ON u.id = al.user_id
+            $activityWhere
+            ORDER BY al.created_at DESC
+            LIMIT $limit
+        ");
+        $activityStmt->execute($activityParams);
+
+        $changeParams = [];
+        $changeWhere = $buildParticipantChangeWhere($scope, $entityId, $query, $scopeSearchTerms, $changeParams);
+        $changeStmt = $pdo->prepare("
+            SELECT
+                'participant_change' AS source,
+                pcl.id,
+                CONCAT('Zmiana uczestnika: ', pcl.change_type) AS action,
+                DATE_FORMAT(pcl.created_at, '%Y-%m-%dT%H:%i:%s') AS timestamp,
+                pcl.event_id,
+                e.name AS event_name,
+                e.organization_id,
+                o.name AS organization_name,
+                pcl.participant_id,
+                COALESCE(
+                    p.display_name,
+                    JSON_UNQUOTE(JSON_EXTRACT(pcl.after_state_json, '$.display_name')),
+                    JSON_UNQUOTE(JSON_EXTRACT(pcl.before_state_json, '$.display_name'))
+                ) AS participant_name,
+                pcl.user_id,
+                COALESCE(u.name, pcl.user_name_snapshot) AS user_name,
+                pcl.change_type,
+                pcl.change_source,
+                pcl.changed_fields_json
+            FROM event_participant_change_logs pcl
+            LEFT JOIN participants p ON p.id = pcl.participant_id
+            LEFT JOIN events e ON e.id = pcl.event_id
+            LEFT JOIN organizations o ON o.id = e.organization_id
+            LEFT JOIN users u ON u.id = pcl.user_id
+            $changeWhere
+            ORDER BY pcl.created_at DESC
+            LIMIT $limit
+        ");
+        $changeStmt->execute($changeParams);
+
+        $entries = array_merge($activityStmt->fetchAll(), $changeStmt->fetchAll());
+        usort($entries, static function (array $left, array $right): int {
+            return strcmp((string)($right['timestamp'] ?? ''), (string)($left['timestamp'] ?? ''));
+        });
+        $entries = array_slice($entries, 0, $limit);
+
+        foreach ($entries as &$entry) {
+            $changedFields = decodeJsonObject($entry['changed_fields_json'] ?? null);
+            $entry['changed_fields'] = array_values(array_filter(
+                array_map(static fn(mixed $field): string => trim((string)$field), $changedFields),
+                static fn(string $field): bool => $field !== ''
+            ));
+            unset($entry['changed_fields_json']);
+        }
+        unset($entry);
+
+        jsonResponse(200, ['data' => $entries]);
+        exit;
+    }
+
+    if (preg_match('#^/superadmin/admins/([^/]+)$#', $path, $matches) === 1 && $method === 'PATCH') {
+        $authUser = requireAnyRole(['superadmin'], $resolveAuthenticatedUser);
+        $userId = (string)$matches[1];
+        $input = readJsonBody();
+        $name = trim((string)($input['name'] ?? ''));
+        $email = normalizeEmailAddress((string)($input['email'] ?? ''));
+
+        if ($name === '' || $email === '') {
+            jsonResponse(422, ['error' => 'Nazwa i adres e-mail sa wymagane']);
+            exit;
+        }
+
+        if (!isValidEmailAddress($email)) {
+            jsonResponse(422, ['error' => 'Adres e-mail musi byc prawidlowy']);
+            exit;
+        }
+
+        $targetUser = $loadUserById($pdo, $userId);
+        if ($targetUser === false) {
+            jsonResponse(404, ['error' => 'Nie znaleziono uzytkownika']);
+            exit;
+        }
+
+        if ((string)($targetUser['role'] ?? '') !== 'admin') {
+            jsonResponse(422, ['error' => 'Ten endpoint obsluguje tylko konta adminow']);
+            exit;
+        }
+
+        $emailOwnerStmt = $pdo->prepare('
+            SELECT id
+            FROM users
+            WHERE email = :email
+              AND archived_at IS NULL
+              AND id <> :id
+            LIMIT 1
+        ');
+        $emailOwnerStmt->execute([
+            'email' => $email,
+            'id' => $userId,
+        ]);
+
+        if ($emailOwnerStmt->fetch() !== false) {
+            jsonResponse(409, ['error' => 'Uzytkownik z tym adresem e-mail juz istnieje']);
+            exit;
+        }
+
+        $pdo->beginTransaction();
+
+        try {
+            $updateStmt = $pdo->prepare('
+                UPDATE users
+                SET name = :name,
+                    email = :email
+                WHERE id = :id
+            ');
+            $updateStmt->execute([
+                'name' => $name,
+                'email' => $email,
+                'id' => $userId,
+            ]);
+
+            $addActivityLog(
+                $pdo,
+                sprintf('Zaktualizowano konto admina: %s', $name),
+                null,
+                null,
+                null,
+                (string)$authUser['id'],
+                (string)$authUser['name']
+            );
+
+            $pdo->commit();
+        } catch (Throwable $exception) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+
+            throw $exception;
+        }
+
+        jsonResponse(200, ['data' => $loadUserById($pdo, $userId)]);
+        exit;
+    }
+
+    if (preg_match('#^/superadmin/admins/([^/]+)/password-reset$#', $path, $matches) === 1 && $method === 'POST') {
+        $authUser = requireAnyRole(['superadmin'], $resolveAuthenticatedUser);
+        $userId = (string)$matches[1];
+
+        $targetUser = $loadUserById($pdo, $userId);
+        if ($targetUser === false) {
+            jsonResponse(404, ['error' => 'Nie znaleziono uzytkownika']);
+            exit;
+        }
+
+        if ((string)($targetUser['role'] ?? '') !== 'admin') {
+            jsonResponse(422, ['error' => 'Reset hasla z tego miejsca dotyczy tylko adminow']);
+            exit;
+        }
+
+        try {
+            $token = $createPasswordResetToken($pdo, (string)$targetUser['id']);
+            $resetUrl = appFrontendUrl() . '/reset-password?token=' . urlencode($token);
+            MailService::sendPasswordResetEmail((string)$targetUser['email'], (string)$targetUser['name'], $resetUrl);
+
+            $addActivityLog(
+                $pdo,
+                sprintf('Wyslano reset hasla dla admina: %s', (string)$targetUser['name']),
+                null,
+                null,
+                null,
+                (string)$authUser['id'],
+                (string)$authUser['name']
+            );
+        } catch (Throwable $exception) {
+            if ((getenv('APP_DEBUG') ?: 'false') === 'true') {
+                jsonResponse(500, ['error' => $exception->getMessage()]);
+                exit;
+            }
+
+            jsonResponse(500, ['error' => 'Nie udalo sie wyslac wiadomosci do resetu hasla']);
+            exit;
+        }
+
+        jsonResponse(200, ['success' => true]);
+        exit;
+    }
+
+    if (preg_match('#^/superadmin/admins/([^/]+)$#', $path, $matches) === 1 && $method === 'DELETE') {
+        $authUser = requireAnyRole(['superadmin'], $resolveAuthenticatedUser);
+        $userId = (string)$matches[1];
+
+        $targetUser = $loadUserById($pdo, $userId);
+        if ($targetUser === false) {
+            jsonResponse(404, ['error' => 'Nie znaleziono uzytkownika']);
+            exit;
+        }
+
+        if ((string)($targetUser['role'] ?? '') !== 'admin') {
+            jsonResponse(422, ['error' => 'Archiwizowac w tym miejscu mozna tylko konta adminow']);
+            exit;
+        }
+
+        $archivedEmail = (string)$targetUser['email'];
+        $archivedAlias = sprintf(
+            'archived+%s+%s@biurozawodow.local',
+            preg_replace('/[^a-zA-Z0-9_-]+/', '-', $userId) ?: 'admin',
+            bin2hex(random_bytes(6))
+        );
+
+        $pdo->beginTransaction();
+
+        try {
+            $archiveStmt = $pdo->prepare('
+                UPDATE users
+                SET email = :email,
+                    archived_email = :archived_email,
+                    archived_at = UTC_TIMESTAMP()
+                WHERE id = :id
+            ');
+            $archiveStmt->execute([
+                'email' => $archivedAlias,
+                'archived_email' => $archivedEmail,
+                'id' => $userId,
+            ]);
+
+            $invalidatePasswordResetTokensForUser($pdo, $userId);
+
+            $addActivityLog(
+                $pdo,
+                sprintf('Zarchiwizowano konto admina: %s', (string)$targetUser['name']),
+                null,
+                null,
+                null,
+                (string)$authUser['id'],
+                (string)$authUser['name']
+            );
+
+            $pdo->commit();
+        } catch (Throwable $exception) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+
+            throw $exception;
+        }
+
+        jsonResponse(200, ['success' => true]);
+        exit;
+    }
+
     if (preg_match('#^/organizations/([^/]+)$#', $path, $matches) === 1 && $method === 'GET') {
         $authUser = requireAuth($resolveAuthenticatedUser);
         $organizationId = (string)$matches[1];
