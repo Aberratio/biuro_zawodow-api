@@ -1333,6 +1333,105 @@ function openApiDocument(): array
                     ],
                 ],
             ],
+            '/events/{id}/participant-list' => [
+                'delete' => [
+                    'tags' => ['Events'],
+                    'summary' => 'Delete all participants and CSV mapping for event',
+                    'security' => [
+                        ['bearerAuth' => []],
+                    ],
+                    'parameters' => [
+                        [
+                            'name' => 'id',
+                            'in' => 'path',
+                            'required' => true,
+                            'schema' => ['type' => 'string'],
+                        ],
+                    ],
+                    'requestBody' => [
+                        'required' => false,
+                        'content' => [
+                            'application/json' => [
+                                'schema' => [
+                                    '$ref' => '#/components/schemas/ParticipantListResetRequest',
+                                ],
+                            ],
+                        ],
+                    ],
+                    'responses' => [
+                        '200' => [
+                            'description' => 'Participant list reset summary',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => [
+                                        '$ref' => '#/components/schemas/ParticipantListResetResponse',
+                                    ],
+                                ],
+                            ],
+                        ],
+                        '403' => [
+                            '$ref' => '#/components/responses/Brak uprawnieĹ„',
+                        ],
+                        '404' => [
+                            '$ref' => '#/components/responses/NotFound',
+                        ],
+                        '409' => [
+                            '$ref' => '#/components/responses/Conflict',
+                        ],
+                    ],
+                ],
+            ],
+            '/events/{id}/participant-imports/replace' => [
+                'post' => [
+                    'tags' => ['Events'],
+                    'summary' => 'Replace event participant list and mapping from CSV',
+                    'security' => [
+                        ['bearerAuth' => []],
+                    ],
+                    'parameters' => [
+                        [
+                            'name' => 'id',
+                            'in' => 'path',
+                            'required' => true,
+                            'schema' => ['type' => 'string'],
+                        ],
+                    ],
+                    'requestBody' => [
+                        'required' => true,
+                        'content' => [
+                            'application/json' => [
+                                'schema' => [
+                                    '$ref' => '#/components/schemas/ParticipantImportReplaceRequest',
+                                ],
+                            ],
+                        ],
+                    ],
+                    'responses' => [
+                        '200' => [
+                            'description' => 'Replacement import summary',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => [
+                                        '$ref' => '#/components/schemas/ParticipantImportRunResponse',
+                                    ],
+                                ],
+                            ],
+                        ],
+                        '403' => [
+                            '$ref' => '#/components/responses/Brak uprawnieĹ„',
+                        ],
+                        '404' => [
+                            '$ref' => '#/components/responses/NotFound',
+                        ],
+                        '409' => [
+                            '$ref' => '#/components/responses/Conflict',
+                        ],
+                        '422' => [
+                            '$ref' => '#/components/responses/BadRequest',
+                        ],
+                    ],
+                ],
+            ],
             '/events/{id}/participant-field-mappings' => [
                 'get' => [
                     'tags' => ['Events'],
@@ -3171,7 +3270,7 @@ function openApiDocument(): array
                     'properties' => [
                         'data' => [
                             'type' => 'object',
-                            'required' => ['headers', 'sample_rows', 'email_candidates', 'has_mapping', 'has_baseline_import', 'mappings', 'missing_required_columns', 'row_count'],
+                            'required' => ['headers', 'sample_rows', 'email_candidates', 'has_mapping', 'has_baseline_import', 'mappings', 'missing_required_columns', 'row_count', 'existing_participant_count', 'sent_qr_email_count', 'list_difference'],
                             'properties' => [
                                 'headers' => [
                                     'type' => 'array',
@@ -3206,8 +3305,28 @@ function openApiDocument(): array
                                     'items' => ['type' => 'string'],
                                 ],
                                 'row_count' => ['type' => 'integer'],
+                                'existing_participant_count' => ['type' => 'integer'],
+                                'sent_qr_email_count' => ['type' => 'integer'],
+                                'list_difference' => ['$ref' => '#/components/schemas/ParticipantImportListDifference'],
                             ],
                         ],
+                    ],
+                ],
+                'ParticipantImportListDifference' => [
+                    'type' => 'object',
+                    'required' => ['columns_differ', 'missing_columns', 'extra_columns', 'participant_difference_ratio', 'should_offer_replacement'],
+                    'properties' => [
+                        'columns_differ' => ['type' => 'boolean'],
+                        'missing_columns' => [
+                            'type' => 'array',
+                            'items' => ['type' => 'string'],
+                        ],
+                        'extra_columns' => [
+                            'type' => 'array',
+                            'items' => ['type' => 'string'],
+                        ],
+                        'participant_difference_ratio' => ['type' => 'number', 'format' => 'float'],
+                        'should_offer_replacement' => ['type' => 'boolean'],
                     ],
                 ],
                 'ParticipantImportConfirmFieldInput' => [
@@ -3233,6 +3352,37 @@ function openApiDocument(): array
                             'type' => 'array',
                             'items' => ['$ref' => '#/components/schemas/ParticipantImportConfirmFieldInput'],
                         ],
+                    ],
+                ],
+                'ParticipantListResetRequest' => [
+                    'type' => 'object',
+                    'properties' => [
+                        'confirm_qr_sent' => ['type' => 'boolean', 'default' => false],
+                    ],
+                ],
+                'ParticipantListResetResponse' => [
+                    'type' => 'object',
+                    'required' => ['data'],
+                    'properties' => [
+                        'data' => [
+                            'type' => 'object',
+                            'required' => ['deleted_participant_count', 'deleted_mapping_count', 'deleted_baseline_record_count', 'deleted_change_log_count'],
+                            'properties' => [
+                                'deleted_participant_count' => ['type' => 'integer'],
+                                'deleted_mapping_count' => ['type' => 'integer'],
+                                'deleted_baseline_record_count' => ['type' => 'integer'],
+                                'deleted_change_log_count' => ['type' => 'integer'],
+                            ],
+                        ],
+                    ],
+                ],
+                'ParticipantImportReplaceRequest' => [
+                    'type' => 'object',
+                    'required' => ['csv_content', 'mapping'],
+                    'properties' => [
+                        'csv_content' => ['type' => 'string'],
+                        'mapping' => ['$ref' => '#/components/schemas/ParticipantImportConfirmRequest'],
+                        'confirm_qr_sent' => ['type' => 'boolean', 'default' => false],
                     ],
                 ],
                 'ParticipantImportConfirmResponse' => [
