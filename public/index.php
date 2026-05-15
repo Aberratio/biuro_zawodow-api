@@ -2414,6 +2414,421 @@ try {
         return $loadParticipantById($pdo, $participantId) ?: [];
     };
 
+    $buildParticipantImportMappingsFromInput = static function (array $input): array {
+        $csvColumns = array_values(array_filter(
+            is_array($input['csv_columns'] ?? null) ? $input['csv_columns'] : [],
+            static fn(mixed $column): bool => is_string($column) && trim($column) !== ''
+        ));
+        $emailColumn = trim((string)($input['email_column'] ?? ''));
+        $fields = is_array($input['fields'] ?? null) ? $input['fields'] : [];
+
+        if ($csvColumns === [] || $emailColumn === '') {
+            return [null, 'Pola csv_columns i email_column są wymagane'];
+        }
+
+        if (!in_array($emailColumn, $csvColumns, true)) {
+            return [null, 'Pole email_column musi wskazywać istniejącą kolumnę CSV'];
+        }
+
+        $mappingsToSave = [[
+            'source_column_name' => $emailColumn,
+            'alias' => 'Email',
+            'field_role' => 'email',
+            'display_order' => 0,
+            'is_required' => true,
+            'is_active' => true,
+        ]];
+
+        $displayNamePartCount = 0;
+        $seenColumns = [$emailColumn => true];
+        $displayOrder = 1;
+
+        foreach ($fields as $field) {
+            if (!is_array($field)) {
+                continue;
+            }
+
+            $sourceColumnName = trim((string)($field['source_column_name'] ?? ''));
+            $alias = trim((string)($field['alias'] ?? ''));
+            $fieldRole = trim((string)($field['field_role'] ?? ''));
+            $isActive = (bool)($field['is_active'] ?? false);
+
+            if ($sourceColumnName === '' || !in_array($sourceColumnName, $csvColumns, true) || isset($seenColumns[$sourceColumnName])) {
+                continue;
+            }
+
+            $seenColumns[$sourceColumnName] = true;
+
+            if (!$isActive) {
+                continue;
+            }
+
+            if ($alias === '') {
+                return [null, sprintf('Alias jest wymagany dla aktywnej kolumny "%s"', $sourceColumnName)];
+            }
+
+            if (!in_array($fieldRole, ['display_name_part', 'bib_number', 'custom', 'important_custom'], true)) {
+                return [null, sprintf('Nieprawidłowa rola pola dla kolumny "%s"', $sourceColumnName)];
+            }
+
+            if ($fieldRole === 'display_name_part') {
+                $displayNamePartCount++;
+            }
+
+            $mappingsToSave[] = [
+                'source_column_name' => $sourceColumnName,
+                'alias' => $alias,
+                'field_role' => $fieldRole,
+                'display_order' => $displayOrder++,
+                'is_required' => $fieldRole === 'display_name_part',
+                'is_active' => true,
+            ];
+        }
+
+        if ($displayNamePartCount === 0) {
+            return [null, 'Wymagane jest co najmniej jedno aktywne mapowanie display_name_part'];
+        }
+
+        return [$mappingsToSave, null];
+    };
+
+    $insertParticipantImportMappings = static function (PDO $pdo, string $eventId, array $mappingsToSave): void {
+        $insertStmt = $pdo->prepare('
+            INSERT INTO event_participant_field_mappings (
+                event_id,
+                source_column_name,
+                alias,
+                field_role,
+                display_order,
+                is_required,
+                is_active
+            ) VALUES (
+                :event_id,
+                :source_column_name,
+                :alias,
+                :field_role,
+                :display_order,
+                :is_required,
+                :is_active
+            )
+        ');
+
+        foreach ($mappingsToSave as $mapping) {
+            $insertStmt->execute([
+                'event_id' => $eventId,
+                'source_column_name' => $mapping['source_column_name'],
+                'alias' => $mapping['alias'],
+                'field_role' => $mapping['field_role'],
+                'display_order' => $mapping['display_order'],
+                'is_required' => $mapping['is_required'] ? 1 : 0,
+                'is_active' => $mapping['is_active'] ? 1 : 0,
+            ]);
+        }
+    };
+
+    $findParticipantEmailMapping = static function (array $mappings): ?array {
+        foreach ($mappings as $mapping) {
+            if (($mapping['field_role'] ?? '') === 'email') {
+                return $mapping;
+            }
+        }
+
+        return null;
+    };
+
+    $buildParticipantListComparisonKey = static function (string $email, string $displayName, ?string $bibNumber): string {
+        $emailKey = strtolower(trim($email));
+        $bibKey = trim((string)$bibNumber);
+        if ($emailKey === '') {
+            return '';
+        }
+
+        if ($bibKey !== '') {
+            return $emailKey . '|bib|' . strtolower($bibKey);
+        }
+
+        $displayNameKey = strtolower(trim($displayName));
+        return $displayNameKey === '' ? '' : $emailKey . '|name|' . $displayNameKey;
+    };
+
+    $buildCsvParticipantComparisonKeys = static function (array $rows, array $mappings) use ($findParticipantEmailMapping, $buildDisplayNameFromMapping, $buildParticipantListComparisonKey): array {
+        $emailMapping = $findParticipantEmailMapping($mappings);
+        if ($emailMapping === null) {
+            return [];
+        }
+
+        $keys = [];
+        foreach ($rows as $row) {
+            $email = normalizeEmailAddress((string)($row[(string)$emailMapping['source_column_name']] ?? ''));
+            $displayName = $buildDisplayNameFromMapping($row, $mappings);
+            $bibNumber = null;
+            foreach ($mappings as $mapping) {
+                if (($mapping['field_role'] ?? '') === 'bib_number') {
+                    $candidateBib = trim((string)($row[(string)$mapping['source_column_name']] ?? ''));
+                    if ($candidateBib !== '') {
+                        $bibNumber = $candidateBib;
+                    }
+                    break;
+                }
+            }
+
+            $key = $buildParticipantListComparisonKey($email, $displayName, $bibNumber);
+            if ($key !== '') {
+                $keys[$key] = true;
+            }
+        }
+
+        return array_keys($keys);
+    };
+
+    $loadExistingParticipantComparisonKeys = static function (PDO $pdo, string $eventId) use ($buildParticipantListComparisonKey): array {
+        $stmt = $pdo->prepare('
+            SELECT email, display_name, bib_number
+            FROM participants
+            WHERE event_id = :event_id
+        ');
+        $stmt->execute(['event_id' => $eventId]);
+
+        $keys = [];
+        foreach ($stmt->fetchAll() as $row) {
+            $key = $buildParticipantListComparisonKey(
+                normalizeEmailAddress((string)($row['email'] ?? '')),
+                (string)($row['display_name'] ?? ''),
+                isset($row['bib_number']) ? (string)$row['bib_number'] : null
+            );
+            if ($key !== '') {
+                $keys[$key] = true;
+            }
+        }
+
+        return array_keys($keys);
+    };
+
+    $countEventParticipantListStats = static function (PDO $pdo, string $eventId): array {
+        $stmt = $pdo->prepare("
+            SELECT
+                COUNT(*) AS participant_count,
+                SUM(CASE WHEN email_status = 'sent' THEN 1 ELSE 0 END) AS sent_qr_email_count
+            FROM participants
+            WHERE event_id = :event_id
+        ");
+        $stmt->execute(['event_id' => $eventId]);
+        $row = $stmt->fetch() ?: [];
+
+        return [
+            'participant_count' => (int)($row['participant_count'] ?? 0),
+            'sent_qr_email_count' => (int)($row['sent_qr_email_count'] ?? 0),
+        ];
+    };
+
+    $buildParticipantListDifference = static function (PDO $pdo, string $eventId, array $headers, array $rows, array $mappings) use ($buildCsvParticipantComparisonKeys, $loadExistingParticipantComparisonKeys): array {
+        $mappedColumns = array_values(array_unique(array_map(
+            static fn(array $mapping): string => (string)$mapping['source_column_name'],
+            $mappings
+        )));
+        sort($mappedColumns);
+
+        $csvColumns = array_values(array_unique(array_map(static fn(mixed $header): string => (string)$header, $headers)));
+        sort($csvColumns);
+
+        $missingColumns = array_values(array_diff($mappedColumns, $csvColumns));
+        $extraColumns = array_values(array_diff($csvColumns, $mappedColumns));
+        $columnsDiffer = $missingColumns !== [] || $extraColumns !== [];
+
+        $existingKeys = $loadExistingParticipantComparisonKeys($pdo, $eventId);
+        $csvKeys = $buildCsvParticipantComparisonKeys($rows, $mappings);
+        $existingKeySet = array_fill_keys($existingKeys, true);
+        $csvKeySet = array_fill_keys($csvKeys, true);
+        $removedCount = count(array_diff_key($existingKeySet, $csvKeySet));
+        $addedCount = count(array_diff_key($csvKeySet, $existingKeySet));
+        $largerListCount = max(count($existingKeySet), count($csvKeySet));
+        $participantDifferenceRatio = $largerListCount === 0 ? 0.0 : ($addedCount + $removedCount) / $largerListCount;
+
+        return [
+            'columns_differ' => $columnsDiffer,
+            'missing_columns' => $missingColumns,
+            'extra_columns' => $extraColumns,
+            'participant_difference_ratio' => round($participantDifferenceRatio, 4),
+            'should_offer_replacement' => $largerListCount > 0 && ($columnsDiffer || $participantDifferenceRatio > 0.5),
+        ];
+    };
+
+    $deleteEventParticipantList = static function (PDO $pdo, string $eventId, array $authUser) use ($addActivityLog): array {
+        $deleteChangeLogsStmt = $pdo->prepare('DELETE FROM event_participant_change_logs WHERE event_id = :event_id');
+        $deleteChangeLogsStmt->execute(['event_id' => $eventId]);
+        $deletedChangeLogs = $deleteChangeLogsStmt->rowCount();
+
+        $deleteParticipantsStmt = $pdo->prepare('DELETE FROM participants WHERE event_id = :event_id');
+        $deleteParticipantsStmt->execute(['event_id' => $eventId]);
+        $deletedParticipants = $deleteParticipantsStmt->rowCount();
+
+        $deleteMappingsStmt = $pdo->prepare('DELETE FROM event_participant_field_mappings WHERE event_id = :event_id');
+        $deleteMappingsStmt->execute(['event_id' => $eventId]);
+        $deletedMappings = $deleteMappingsStmt->rowCount();
+
+        $deleteBaselineStmt = $pdo->prepare('DELETE FROM event_participant_import_baseline_records WHERE event_id = :event_id');
+        $deleteBaselineStmt->execute(['event_id' => $eventId]);
+        $deletedBaselineRecords = $deleteBaselineStmt->rowCount();
+
+        $addActivityLog(
+            $pdo,
+            sprintf('Usunieto liste uczestnikow wydarzenia: uczestnicy %d, mapowania %d', $deletedParticipants, $deletedMappings),
+            $eventId,
+            null,
+            null,
+            (string)$authUser['id'],
+            (string)$authUser['name']
+        );
+
+        return [
+            'deleted_participant_count' => $deletedParticipants,
+            'deleted_mapping_count' => $deletedMappings,
+            'deleted_baseline_record_count' => $deletedBaselineRecords,
+            'deleted_change_log_count' => $deletedChangeLogs,
+        ];
+    };
+
+    $importParticipantsFromRows = static function (
+        PDO $pdo,
+        string $eventId,
+        array $rows,
+        array $mappings,
+        array $authUser,
+        bool $hasBaselineImport
+    ) use (
+        $findParticipantEmailMapping,
+        $buildDisplayNameFromMapping,
+        $normalizeCustomFieldsFromMapping,
+        $insertParticipantRecord,
+        $normalizeParticipantChangeState,
+        $createParticipantImportBaselineRecord,
+        $attachParticipantBaselineRecord,
+        $addParticipantChangeLog
+    ): array {
+        $emailMapping = $findParticipantEmailMapping($mappings);
+        if ($emailMapping === null) {
+            return [null, 'Zapisane mapowanie jest nieprawidłowe: brak kolumny e-mail'];
+        }
+
+        $existingParticipantsStmt = $pdo->prepare('
+            SELECT email, display_name, bib_number
+            FROM participants
+            WHERE event_id = :event_id
+        ');
+        $existingParticipantsStmt->execute(['event_id' => $eventId]);
+        $existingBibKeys = [];
+        $existingFallbackKeys = [];
+        foreach ($existingParticipantsStmt->fetchAll() as $row) {
+            $emailKey = strtolower(trim((string)($row['email'] ?? '')));
+            $displayNameKey = strtolower(trim((string)($row['display_name'] ?? '')));
+            $bibKey = trim((string)($row['bib_number'] ?? ''));
+
+            if ($bibKey !== '') {
+                $existingBibKeys[$emailKey . '|' . $bibKey] = true;
+            }
+
+            if ($emailKey !== '' && $displayNameKey !== '') {
+                $existingFallbackKeys[$emailKey . '|' . $displayNameKey] = true;
+            }
+        }
+
+        $createdParticipants = [];
+        $duplicateCount = 0;
+        $invalidCount = 0;
+        $invalidRows = [];
+
+        foreach ($rows as $index => $row) {
+            $email = normalizeEmailAddress((string)($row[(string)$emailMapping['source_column_name']] ?? ''));
+            $displayName = $buildDisplayNameFromMapping($row, $mappings);
+
+            if ($email === '' || !isValidEmailAddress($email) || $displayName === '') {
+                $invalidCount++;
+                $invalidRows[] = $index + 2;
+                continue;
+            }
+
+            $normalizedEmail = strtolower($email);
+
+            $bibNumber = null;
+            foreach ($mappings as $mapping) {
+                if (($mapping['field_role'] ?? '') === 'bib_number') {
+                    $candidateBib = trim((string)($row[(string)$mapping['source_column_name']] ?? ''));
+                    if ($candidateBib !== '') {
+                        $bibNumber = $candidateBib;
+                    }
+                    break;
+                }
+            }
+
+            $fallbackKey = $normalizedEmail . '|' . strtolower($displayName);
+            $bibDuplicateKey = $bibNumber !== null ? $normalizedEmail . '|' . $bibNumber : null;
+
+            if (($bibDuplicateKey !== null && isset($existingBibKeys[$bibDuplicateKey])) || ($bibDuplicateKey === null && isset($existingFallbackKeys[$fallbackKey]))) {
+                $duplicateCount++;
+                continue;
+            }
+
+            $customFieldData = $normalizeCustomFieldsFromMapping($row, $mappings);
+            $participant = $insertParticipantRecord(
+                $pdo,
+                $eventId,
+                $displayName,
+                $email,
+                $bibNumber,
+                [
+                    'important_field_aliases' => $customFieldData['important_field_aliases'] ?? [],
+                    ...($customFieldData['custom_fields'] ?? []),
+                ]
+            );
+            if ($participant === []) {
+                continue;
+            }
+
+            $participantState = $normalizeParticipantChangeState($participant);
+            if (!$hasBaselineImport) {
+                $baselineRecordId = $createParticipantImportBaselineRecord(
+                    $pdo,
+                    $eventId,
+                    (string)$participant['participant_audit_key'],
+                    $participantState,
+                    $index + 2
+                );
+                $attachParticipantBaselineRecord($pdo, (int)$participant['id'], $baselineRecordId);
+                $participant['baseline_import_record_id'] = $baselineRecordId;
+            } else {
+                $addParticipantChangeLog(
+                    $pdo,
+                    $eventId,
+                    (string)$participant['participant_audit_key'],
+                    null,
+                    (int)$participant['id'],
+                    'added',
+                    'csv_import',
+                    [],
+                    $participantState,
+                    ['participant_record'],
+                    (string)$authUser['id'],
+                    (string)$authUser['name']
+                );
+            }
+
+            $createdParticipants[] = $participant;
+            $createdBibNumber = trim((string)($participant['bib_number'] ?? ''));
+            if ($createdBibNumber !== '') {
+                $existingBibKeys[$normalizedEmail . '|' . $createdBibNumber] = true;
+            }
+            $existingFallbackKeys[$fallbackKey] = true;
+        }
+
+        return [[
+            'created_count' => count($createdParticipants),
+            'duplicate_count' => $duplicateCount,
+            'invalid_count' => $invalidCount,
+            'invalid_rows' => $invalidRows,
+            'participants' => $createdParticipants,
+        ], null];
+    };
+
     if (preg_match('#^/qr-images/([A-Za-z0-9_%-]+)\.svg$#', $path, $matches) === 1 && $method === 'GET') {
         $qrCode = rawurldecode((string)$matches[1]);
         $participant = $loadParticipantByQrCode($pdo, $qrCode);
@@ -4293,6 +4708,16 @@ try {
             array_filter($existingMappings, static fn(array $mapping): bool => (bool)$mapping['is_required'])
         ));
         $missingColumns = array_values(array_diff($requiredColumns, $cleaned['headers']));
+        $participantListStats = $countEventParticipantListStats($pdo, $eventId);
+        $listDifference = $existingMappings !== []
+            ? $buildParticipantListDifference($pdo, $eventId, $cleaned['headers'], $cleaned['rows'], $existingMappings)
+            : [
+                'columns_differ' => false,
+                'missing_columns' => [],
+                'extra_columns' => [],
+                'participant_difference_ratio' => 0.0,
+                'should_offer_replacement' => false,
+            ];
 
         jsonResponse(200, [
             'data' => [
@@ -4304,6 +4729,9 @@ try {
                 'mappings' => $existingMappings,
                 'missing_required_columns' => $missingColumns,
                 'row_count' => count($cleaned['rows']),
+                'existing_participant_count' => $participantListStats['participant_count'],
+                'sent_qr_email_count' => $participantListStats['sent_qr_email_count'],
+                'list_difference' => $listDifference,
             ],
         ]);
         exit;
@@ -4330,119 +4758,16 @@ try {
         }
 
         $input = readJsonBody();
-        $csvColumns = array_values(array_filter(
-            is_array($input['csv_columns'] ?? null) ? $input['csv_columns'] : [],
-            static fn(mixed $column): bool => is_string($column) && trim($column) !== ''
-        ));
-        $emailColumn = trim((string)($input['email_column'] ?? ''));
-        $fields = is_array($input['fields'] ?? null) ? $input['fields'] : [];
-
-        if ($csvColumns === [] || $emailColumn === '') {
-            jsonResponse(422, ['error' => 'Pola csv_columns i email_column są wymagane']);
-            exit;
-        }
-
-        if (!in_array($emailColumn, $csvColumns, true)) {
-            jsonResponse(422, ['error' => 'Pole email_column musi wskazywać istniejącą kolumnę CSV']);
-            exit;
-        }
-
-        $mappingsToSave = [[
-            'source_column_name' => $emailColumn,
-            'alias' => 'Email',
-            'field_role' => 'email',
-            'display_order' => 0,
-            'is_required' => true,
-            'is_active' => true,
-        ]];
-
-        $displayNamePartCount = 0;
-        $seenColumns = [$emailColumn => true];
-        $displayOrder = 1;
-
-        foreach ($fields as $field) {
-            if (!is_array($field)) {
-                continue;
-            }
-
-            $sourceColumnName = trim((string)($field['source_column_name'] ?? ''));
-            $alias = trim((string)($field['alias'] ?? ''));
-            $fieldRole = trim((string)($field['field_role'] ?? ''));
-            $isActive = (bool)($field['is_active'] ?? false);
-
-            if ($sourceColumnName === '' || !in_array($sourceColumnName, $csvColumns, true) || isset($seenColumns[$sourceColumnName])) {
-                continue;
-            }
-
-            $seenColumns[$sourceColumnName] = true;
-
-            if (!$isActive) {
-                continue;
-            }
-
-            if ($alias === '') {
-                jsonResponse(422, ['error' => sprintf('Alias jest wymagany dla aktywnej kolumny "%s"', $sourceColumnName)]);
-                exit;
-            }
-
-            if (!in_array($fieldRole, ['display_name_part', 'bib_number', 'custom', 'important_custom'], true)) {
-                jsonResponse(422, ['error' => sprintf('Nieprawidłowa rola pola dla kolumny "%s"', $sourceColumnName)]);
-                exit;
-            }
-
-            if ($fieldRole === 'display_name_part') {
-                $displayNamePartCount++;
-            }
-
-            $mappingsToSave[] = [
-                'source_column_name' => $sourceColumnName,
-                'alias' => $alias,
-                'field_role' => $fieldRole,
-                'display_order' => $displayOrder++,
-                'is_required' => $fieldRole === 'display_name_part',
-                'is_active' => true,
-            ];
-        }
-
-        if ($displayNamePartCount === 0) {
-            jsonResponse(422, ['error' => 'Wymagane jest co najmniej jedno aktywne mapowanie display_name_part']);
+        [$mappingsToSave, $mappingError] = $buildParticipantImportMappingsFromInput($input);
+        if ($mappingError !== null || $mappingsToSave === null) {
+            jsonResponse(422, ['error' => $mappingError ?? 'Nieprawidłowe mapowanie CSV']);
             exit;
         }
 
         $pdo->beginTransaction();
 
         try {
-            $insertStmt = $pdo->prepare('
-                INSERT INTO event_participant_field_mappings (
-                    event_id,
-                    source_column_name,
-                    alias,
-                    field_role,
-                    display_order,
-                    is_required,
-                    is_active
-                ) VALUES (
-                    :event_id,
-                    :source_column_name,
-                    :alias,
-                    :field_role,
-                    :display_order,
-                    :is_required,
-                    :is_active
-                )
-            ');
-
-            foreach ($mappingsToSave as $mapping) {
-                $insertStmt->execute([
-                    'event_id' => $eventId,
-                    'source_column_name' => $mapping['source_column_name'],
-                    'alias' => $mapping['alias'],
-                    'field_role' => $mapping['field_role'],
-                    'display_order' => $mapping['display_order'],
-                    'is_required' => $mapping['is_required'] ? 1 : 0,
-                    'is_active' => $mapping['is_active'] ? 1 : 0,
-                ]);
-            }
+            $insertParticipantImportMappings($pdo, $eventId, $mappingsToSave);
 
             $pdo->commit();
         } catch (Throwable $exception) {
@@ -4667,6 +4992,155 @@ try {
                 'invalid_count' => $invalidCount,
                 'invalid_rows' => $invalidRows,
                 'participants' => $createdParticipants,
+            ],
+        ]);
+        exit;
+    }
+
+    if (preg_match('#^/events/([^/]+)/participant-list$#', $path, $matches) === 1 && $method === 'DELETE') {
+        $authUser = requireAnyRole(['superadmin', 'admin', 'editor'], $resolveAuthenticatedUser);
+        $eventId = (string)$matches[1];
+        $event = $loadEventById($pdo, $eventId);
+
+        if ($event === false) {
+            jsonResponse(404, ['error' => 'Nie znaleziono wydarzenia']);
+            exit;
+        }
+
+        if (!$canManageEventParticipants($authUser, $event)) {
+            jsonResponse(403, ['error' => 'Brak uprawnień']);
+            exit;
+        }
+
+        $input = readJsonBody();
+        $confirmQrSent = (bool)($input['confirm_qr_sent'] ?? false);
+        $participantListStats = $countEventParticipantListStats($pdo, $eventId);
+        if ($participantListStats['sent_qr_email_count'] > 0 && !$confirmQrSent) {
+            jsonResponse(409, [
+                'error' => 'Dla tego wydarzenia wysłano już wiadomości z kodami QR. Potwierdź, że mimo tego chcesz usunąć listę uczestników.',
+                'code' => 'qr_emails_sent',
+                'data' => $participantListStats,
+            ]);
+            exit;
+        }
+
+        $pdo->beginTransaction();
+
+        try {
+            $summary = $deleteEventParticipantList($pdo, $eventId, $authUser);
+            $pdo->commit();
+        } catch (Throwable $exception) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+
+            throw $exception;
+        }
+
+        jsonResponse(200, ['data' => $summary]);
+        exit;
+    }
+
+    if (preg_match('#^/events/([^/]+)/participant-imports/replace$#', $path, $matches) === 1 && $method === 'POST') {
+        $authUser = requireAnyRole(['superadmin', 'admin', 'editor'], $resolveAuthenticatedUser);
+        $eventId = (string)$matches[1];
+        $event = $loadEventById($pdo, $eventId);
+
+        if ($event === false) {
+            jsonResponse(404, ['error' => 'Nie znaleziono wydarzenia']);
+            exit;
+        }
+
+        if (!$canManageEventParticipants($authUser, $event)) {
+            jsonResponse(403, ['error' => 'Brak uprawnień']);
+            exit;
+        }
+
+        $input = readJsonBody(10485760);
+        $csvContent = (string)($input['csv_content'] ?? '');
+        $mappingInput = is_array($input['mapping'] ?? null) ? $input['mapping'] : [];
+        $confirmQrSent = (bool)($input['confirm_qr_sent'] ?? false);
+
+        if (trim($csvContent) === '') {
+            jsonResponse(422, ['error' => 'Pole csv_content jest wymagane']);
+            exit;
+        }
+
+        $participantListStats = $countEventParticipantListStats($pdo, $eventId);
+        if ($participantListStats['sent_qr_email_count'] > 0 && !$confirmQrSent) {
+            jsonResponse(409, [
+                'error' => 'Dla tego wydarzenia wysłano już wiadomości z kodami QR. Potwierdź, że mimo tego chcesz usunąć starą listę i wgrać nową.',
+                'code' => 'qr_emails_sent',
+                'data' => $participantListStats,
+            ]);
+            exit;
+        }
+
+        $parsed = $parseCsvContent($csvContent);
+        $cleaned = $cleanupCsvDataset($parsed['headers'], $parsed['rows']);
+        if ($cleaned['headers'] === []) {
+            jsonResponse(422, ['error' => 'Plik CSV nie zawiera żadnych niepustych kolumn danych']);
+            exit;
+        }
+
+        [$mappingsToSave, $mappingError] = $buildParticipantImportMappingsFromInput($mappingInput);
+        if ($mappingError !== null || $mappingsToSave === null) {
+            jsonResponse(422, ['error' => $mappingError ?? 'Nieprawidłowe mapowanie CSV']);
+            exit;
+        }
+
+        $requiredColumns = array_values(array_map(
+            static fn(array $mapping): string => (string)$mapping['source_column_name'],
+            array_filter($mappingsToSave, static fn(array $mapping): bool => (bool)$mapping['is_required'])
+        ));
+        $missingColumns = array_values(array_diff($requiredColumns, $cleaned['headers']));
+        if ($missingColumns !== []) {
+            jsonResponse(422, [
+                'error' => 'W pliku CSV brakuje wymaganych kolumn z nowego mapowania',
+                'missing_columns' => $missingColumns,
+            ]);
+            exit;
+        }
+
+        $pdo->beginTransaction();
+
+        try {
+            $resetSummary = $deleteEventParticipantList($pdo, $eventId, $authUser);
+            $insertParticipantImportMappings($pdo, $eventId, $mappingsToSave);
+            [$importSummary, $importError] = $importParticipantsFromRows($pdo, $eventId, $cleaned['rows'], $mappingsToSave, $authUser, false);
+            if ($importError !== null || $importSummary === null) {
+                jsonResponse(500, ['error' => $importError ?? 'Nie udało się zaimportować uczestników']);
+                exit;
+            }
+
+            $addActivityLog(
+                $pdo,
+                sprintf(
+                    'Podmieniono liste uczestnikow z CSV: dodano %d, duplikaty %d, niepoprawne %d',
+                    (int)$importSummary['created_count'],
+                    (int)$importSummary['duplicate_count'],
+                    (int)$importSummary['invalid_count']
+                ),
+                $eventId,
+                null,
+                null,
+                (string)$authUser['id'],
+                (string)$authUser['name']
+            );
+
+            $pdo->commit();
+        } catch (Throwable $exception) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+
+            throw $exception;
+        }
+
+        jsonResponse(200, [
+            'data' => [
+                'reset' => $resetSummary,
+                ...$importSummary,
             ],
         ]);
         exit;
