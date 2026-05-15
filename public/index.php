@@ -3111,8 +3111,12 @@ try {
         $scope = trim((string)($_GET['scope'] ?? 'all'));
         $entityId = trim((string)($_GET['id'] ?? ''));
         $query = trim((string)($_GET['q'] ?? ''));
-        $limit = (int)($_GET['limit'] ?? 150);
-        $limit = max(25, min(500, $limit));
+        $page = (int)($_GET['page'] ?? 1);
+        $page = max(1, $page);
+        $limit = (int)($_GET['limit'] ?? 50);
+        $limit = max(1, min(50, $limit));
+        $offset = ($page - 1) * $limit;
+        $sourceLimit = $offset + $limit;
 
         $allowedScopes = ['all', 'user', 'organization', 'event', 'participant'];
         if (!in_array($scope, $allowedScopes, true)) {
@@ -3227,6 +3231,18 @@ try {
 
         $activityParams = [];
         $activityWhere = $buildActivityWhere($scope, $entityId, $query, $scopeSearchTerms, $activityParams);
+        $activityCountStmt = $pdo->prepare("
+            SELECT COUNT(*) AS total
+            FROM activity_logs al
+            LEFT JOIN participants p ON p.id = al.participant_id
+            LEFT JOIN events e ON e.id = COALESCE(al.event_id, p.event_id)
+            LEFT JOIN organizations o ON o.id = e.organization_id
+            LEFT JOIN users u ON u.id = al.user_id
+            $activityWhere
+        ");
+        $activityCountStmt->execute($activityParams);
+        $activityTotal = (int)($activityCountStmt->fetch()['total'] ?? 0);
+
         $activityStmt = $pdo->prepare("
             SELECT
                 'activity' AS source,
@@ -3251,12 +3267,24 @@ try {
             LEFT JOIN users u ON u.id = al.user_id
             $activityWhere
             ORDER BY al.created_at DESC
-            LIMIT $limit
+            LIMIT $sourceLimit
         ");
         $activityStmt->execute($activityParams);
 
         $changeParams = [];
         $changeWhere = $buildParticipantChangeWhere($scope, $entityId, $query, $scopeSearchTerms, $changeParams);
+        $changeCountStmt = $pdo->prepare("
+            SELECT COUNT(*) AS total
+            FROM event_participant_change_logs pcl
+            LEFT JOIN participants p ON p.id = pcl.participant_id
+            LEFT JOIN events e ON e.id = pcl.event_id
+            LEFT JOIN organizations o ON o.id = e.organization_id
+            LEFT JOIN users u ON u.id = pcl.user_id
+            $changeWhere
+        ");
+        $changeCountStmt->execute($changeParams);
+        $changeTotal = (int)($changeCountStmt->fetch()['total'] ?? 0);
+
         $changeStmt = $pdo->prepare("
             SELECT
                 'participant_change' AS source,
@@ -3285,7 +3313,7 @@ try {
             LEFT JOIN users u ON u.id = pcl.user_id
             $changeWhere
             ORDER BY pcl.created_at DESC
-            LIMIT $limit
+            LIMIT $sourceLimit
         ");
         $changeStmt->execute($changeParams);
 
@@ -3293,7 +3321,7 @@ try {
         usort($entries, static function (array $left, array $right): int {
             return strcmp((string)($right['timestamp'] ?? ''), (string)($left['timestamp'] ?? ''));
         });
-        $entries = array_slice($entries, 0, $limit);
+        $entries = array_slice($entries, $offset, $limit);
 
         foreach ($entries as &$entry) {
             $changedFields = decodeJsonObject($entry['changed_fields_json'] ?? null);
@@ -3305,7 +3333,18 @@ try {
         }
         unset($entry);
 
-        jsonResponse(200, ['data' => $entries]);
+        $total = $activityTotal + $changeTotal;
+        $totalPages = max(1, (int)ceil($total / $limit));
+
+        jsonResponse(200, [
+            'data' => $entries,
+            'meta' => [
+                'page' => $page,
+                'per_page' => $limit,
+                'total' => $total,
+                'total_pages' => $totalPages,
+            ],
+        ]);
         exit;
     }
 
