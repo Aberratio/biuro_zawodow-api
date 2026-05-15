@@ -2959,6 +2959,15 @@ try {
         $user['assigned_events'] = $isScannerRole((string)$user['role'])
             ? $loadAssignedEvents($pdo, (string)$user['id'])
             : [];
+        $addActivityLog(
+            $pdo,
+            sprintf('Zalogowano użytkownika: %s (%s)', (string)$user['name'], (string)$user['email']),
+            null,
+            null,
+            null,
+            (string)$user['id'],
+            (string)$user['name']
+        );
         unset($user['password']);
         $clearRateLimitBucket($pdo, 'auth_login', $email);
 
