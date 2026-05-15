@@ -570,6 +570,81 @@ try {
     $scannerRoles = ['scanner', 'scanner_plus'];
     $isScannerRole = static fn(string $role): bool => in_array($role, $scannerRoles, true);
 
+    $csvDelimiter = ';';
+    $writeCsvRow = static function ($stream, array $row) use ($csvDelimiter): void {
+        fputcsv($stream, $row, $csvDelimiter);
+    };
+
+    $buildExportFilename = static function (array $event, string $exportType): string {
+        $eventName = trim((string)($event['name'] ?? 'wydarzenie'));
+        $eventName = strtr($eventName, ['ą' => 'a', 'ć' => 'c', 'ę' => 'e', 'ł' => 'l', 'ń' => 'n', 'ó' => 'o', 'ś' => 's', 'ź' => 'z', 'ż' => 'z', 'Ą' => 'A', 'Ć' => 'C', 'Ę' => 'E', 'Ł' => 'L', 'Ń' => 'N', 'Ó' => 'O', 'Ś' => 'S', 'Ź' => 'Z', 'Ż' => 'Z']);
+        $asciiName = function_exists('iconv') ? iconv('UTF-8', 'ASCII//TRANSLIT//IGNORE', $eventName) : false;
+        $normalizedName = $asciiName !== false ? (string)$asciiName : $eventName;
+        $slug = strtolower((string)preg_replace('/[^a-zA-Z0-9]+/', '-', $normalizedName));
+        $slug = trim((string)preg_replace('/-+/', '-', $slug), '-');
+        if ($slug === '') {
+            $slug = 'wydarzenie';
+        }
+
+        $slug = trim(substr($slug, 0, 48), '-');
+        $date = gmdate('Ymd');
+
+        return sprintf('bz-%s-%s-%s.csv', $exportType, $slug === '' ? 'wydarzenie' : $slug, $date);
+    };
+
+    $setCsvDownloadHeaders = static function (string $filename): void {
+        header('Content-Type: text/csv; charset=UTF-8');
+        header(sprintf(
+            'Content-Disposition: attachment; filename="%s"; filename*=UTF-8\'\'%s',
+            addcslashes($filename, '\\"'),
+            rawurlencode($filename)
+        ));
+    };
+
+    $translateExportValue = static function (string $value, string $type) use ($participantStatuses): string {
+        $maps = [
+            'participant_status' => array_map(
+                static fn(array $status): string => (string)$status['label'],
+                $participantStatuses
+            ),
+            'email_status' => [
+                'not_sent' => 'Niewysłany',
+                'sent' => 'Wysłany',
+            ],
+            'change_type' => [
+                'added' => 'Dodano',
+                'updated' => 'Zmieniono',
+                'deleted' => 'Usunięto',
+                'added_then_deleted' => 'Dodano, a następnie usunięto',
+            ],
+            'change_source' => [
+                'csv_import' => 'Import CSV',
+                'manual' => 'Dodanie ręczne',
+                'participant_edit' => 'Edycja uczestnika',
+                'participant_delete' => 'Usunięcie uczestnika',
+                'bib_conflict_resolution' => 'Rozwiązanie konfliktu numeru startowego',
+            ],
+            'current_state' => [
+                'active' => 'Aktywny',
+                'deleted' => 'Usunięty',
+            ],
+            'changed_field' => [
+                'participant_record' => 'rekord uczestnika',
+                'display_name' => 'imię i nazwisko',
+                'first_name' => 'imię',
+                'last_name' => 'nazwisko',
+                'email' => 'e-mail',
+                'organization' => 'organizacja',
+                'bib_number' => 'numer startowy',
+                'status' => 'status',
+                'email_status' => 'status e-maila',
+                'checked_in_at' => 'czas odprawy',
+            ],
+        ];
+
+        return $maps[$type][$value] ?? $value;
+    };
+
     $loadUserById = static function (PDO $pdo, string $userId) use ($loadAssignedEvents, $isScannerRole): array|false {
         $stmt = $pdo->prepare('
             SELECT id, name, email, role, organization_id
@@ -2672,7 +2747,7 @@ try {
 
         $addActivityLog(
             $pdo,
-            sprintf('Usunieto liste uczestnikow wydarzenia: uczestnicy %d, mapowania %d', $deletedParticipants, $deletedMappings),
+            sprintf('Usunięto listę uczestników wydarzenia: uczestnicy %d, mapowania %d', $deletedParticipants, $deletedMappings),
             $eventId,
             null,
             null,
@@ -2854,7 +2929,7 @@ try {
         $loginRateLimit = $consumeRateLimitAttempt($pdo, 'auth_login', 5, 900, $email);
         if (!$loginRateLimit['allowed']) {
             jsonResponse(429, [
-                'error' => 'Too many login attempts. Please try again later.',
+                'error' => 'Zbyt wiele prób logowania. Spróbuj ponownie później.',
                 'retry_after' => (int)$loginRateLimit['retry_after'],
             ]);
             exit;
@@ -2939,7 +3014,7 @@ try {
         $resetRateLimit = $consumeRateLimitAttempt($pdo, 'auth_reset_password', 8, 900, $token);
         if (!$resetRateLimit['allowed']) {
             jsonResponse(429, [
-                'error' => 'Too many password reset attempts. Please try again later.',
+                'error' => 'Zbyt wiele prób resetu hasła. Spróbuj ponownie później.',
                 'retry_after' => (int)$resetRateLimit['retry_after'],
             ]);
             exit;
@@ -3467,7 +3542,7 @@ try {
                 exit;
             }
 
-            jsonResponse(500, ['error' => 'Nie udalo sie wyslac wiadomosci do resetu hasla']);
+            jsonResponse(500, ['error' => 'Nie udało się wysłać wiadomości do resetu hasła']);
             exit;
         }
 
@@ -4078,7 +4153,7 @@ try {
             }
             $addActivityLog(
                 $pdo,
-                sprintf('Zarchiwizowano wydarzenie: %s (%d uczestnikow)', (string)$event['name'], $participantCount),
+                sprintf('Zarchiwizowano wydarzenie: %s (%d uczestników)', (string)$event['name'], $participantCount),
                 $eventId,
                 null,
                 null,
@@ -4141,7 +4216,7 @@ try {
         try {
             $addActivityLog(
                 $pdo,
-                sprintf('Zarchiwizowano wydarzenie: %s (%d uczestnikow)', (string)$event['name'], $participantCount),
+                sprintf('Zarchiwizowano wydarzenie: %s (%d uczestników)', (string)$event['name'], $participantCount),
                 $eventId,
                 null,
                 null,
@@ -4278,26 +4353,30 @@ try {
         }
 
         $columns = array_merge([
-            'participant_id',
-            'event_id',
-            'event_name',
-            'event_location',
-            'event_office_open_at',
-            'event_office_close_at',
-            'organization_id',
-            'display_name',
-            'first_name',
-            'last_name',
-            'email',
-            'organization',
-            'bib_number',
-            'status',
-            'email_status',
-            'checked_in_at',
-            'qr_code',
-            'created_at',
-            'updated_at',
-        ], $customFieldColumns);
+            'participant_id' => 'ID uczestnika',
+            'event_id' => 'ID wydarzenia',
+            'event_name' => 'Nazwa wydarzenia',
+            'event_location' => 'Lokalizacja wydarzenia',
+            'event_office_open_at' => 'Otwarcie biura zawodów',
+            'event_office_close_at' => 'Zamknięcie biura zawodów',
+            'organization_id' => 'ID organizacji',
+            'display_name' => 'Imię i nazwisko',
+            'first_name' => 'Imię',
+            'last_name' => 'Nazwisko',
+            'email' => 'E-mail',
+            'organization' => 'Organizacja',
+            'bib_number' => 'Numer startowy',
+            'status' => 'Status',
+            'email_status' => 'Status e-maila',
+            'checked_in_at' => 'Czas odprawy',
+            'qr_code' => 'Kod QR',
+            'created_at' => 'Utworzono',
+            'updated_at' => 'Zaktualizowano',
+        ], array_fill_keys($customFieldColumns, null));
+        foreach ($customFieldColumns as $customFieldColumn) {
+            $columns[$customFieldColumn] = $customFieldColumn;
+        }
+        $columnKeys = array_keys($columns);
 
         $stream = fopen('php://temp', 'r+');
         if ($stream === false) {
@@ -4305,7 +4384,7 @@ try {
             exit;
         }
 
-        fputcsv($stream, $columns);
+        $writeCsvRow($stream, array_values($columns));
 
         foreach ($participants as $participant) {
             $row = [
@@ -4322,8 +4401,8 @@ try {
                 'email' => (string)($participant['email'] ?? ''),
                 'organization' => (string)($participant['organization'] ?? ''),
                 'bib_number' => (string)($participant['bib_number'] ?? ''),
-                'status' => (string)($participant['status'] ?? ''),
-                'email_status' => (string)($participant['email_status'] ?? ''),
+                'status' => $translateExportValue((string)($participant['status'] ?? ''), 'participant_status'),
+                'email_status' => $translateExportValue((string)($participant['email_status'] ?? ''), 'email_status'),
                 'checked_in_at' => (string)($participant['checked_in_at'] ?? ''),
                 'qr_code' => (string)($participant['qr_code'] ?? ''),
                 'created_at' => (string)($participant['created_at'] ?? ''),
@@ -4334,9 +4413,9 @@ try {
                 $row[$columnName] = (string)(($participant['custom_fields'] ?? [])[$columnName] ?? '');
             }
 
-            fputcsv($stream, array_map(
+            $writeCsvRow($stream, array_map(
                 static fn(string $columnName): string => (string)($row[$columnName] ?? ''),
-                $columns
+                $columnKeys
             ));
         }
 
@@ -4346,7 +4425,7 @@ try {
 
         $addActivityLog(
             $pdo,
-            'Wyeksportowano dane uczestnikow do CSV',
+            'Wyeksportowano dane uczestników do CSV',
             $eventId,
             null,
             null,
@@ -4359,9 +4438,7 @@ try {
             exit;
         }
 
-        $safeEventName = preg_replace('/[^a-zA-Z0-9_-]+/', '-', (string)$event['name']) ?: 'event';
-        header('Content-Type: text/csv; charset=UTF-8');
-        header(sprintf('Content-Disposition: attachment; filename="%s-participants.csv"', trim($safeEventName, '-')));
+        $setCsvDownloadHeaders($buildExportFilename($event, 'uczestnicy'));
         echo "\xEF\xBB\xBF";
         echo $csvContent;
         exit;
@@ -4406,9 +4483,9 @@ try {
             exit;
         }
 
-        fputcsv($stream, ['log_id', 'event_id', 'event_name', 'user_id', 'user_name', 'participant_id', 'participant_name', 'action', 'timestamp']);
+        $writeCsvRow($stream, ['ID logu', 'ID wydarzenia', 'Nazwa wydarzenia', 'ID użytkownika', 'Użytkownik', 'ID uczestnika', 'Uczestnik', 'Akcja', 'Data i godzina']);
         foreach ($logs as $log) {
-            fputcsv($stream, [
+            $writeCsvRow($stream, [
                 (string)($log['id'] ?? ''),
                 (string)($log['event_id'] ?? ''),
                 (string)$event['name'],
@@ -4440,9 +4517,7 @@ try {
             exit;
         }
 
-        $safeEventName = preg_replace('/[^a-zA-Z0-9_-]+/', '-', (string)$event['name']) ?: 'event';
-        header('Content-Type: text/csv; charset=UTF-8');
-        header(sprintf('Content-Disposition: attachment; filename="%s-logs.csv"', trim($safeEventName, '-')));
+        $setCsvDownloadHeaders($buildExportFilename($event, 'logi'));
         echo "\xEF\xBB\xBF";
         echo $csvContent;
         exit;
@@ -4459,12 +4534,12 @@ try {
         }
 
         if (!$canManageEventParticipants($authUser, $event)) {
-            jsonResponse(403, ['error' => 'Brak uprawnieĹ„']);
+            jsonResponse(403, ['error' => 'Brak uprawnień']);
             exit;
         }
 
         if (!$eventHasParticipantImportBaseline($pdo, $eventId)) {
-            jsonResponse(422, ['error' => 'Eksport zmian uczestnikĂłw jest dostÄ™pny dopiero po pierwszym udanym imporcie CSV dla wydarzenia']);
+            jsonResponse(422, ['error' => 'Eksport zmian uczestników jest dostępny dopiero po pierwszym udanym imporcie CSV dla wydarzenia']);
             exit;
         }
 
@@ -4601,14 +4676,17 @@ try {
             }
 
             $row = [
-                'change_type' => $rowChangeType,
-                'change_source' => $changeSource,
+                'change_type' => $translateExportValue($rowChangeType, 'change_type'),
+                'change_source' => $translateExportValue($changeSource, 'change_source'),
                 'event_id' => $eventId,
                 'event_name' => (string)$event['name'],
                 'baseline_record_id' => $baselineRecord !== null ? (string)$baselineRecord['id'] : '',
                 'current_participant_id' => $currentParticipant !== null ? (string)$currentParticipant['id'] : '',
-                'current_state' => $currentStateLabel,
-                'changed_fields' => implode('|', $changedFields),
+                'current_state' => $translateExportValue($currentStateLabel, 'current_state'),
+                'changed_fields' => implode('|', array_map(
+                    static fn(string $field): string => $translateExportValue($field, 'changed_field'),
+                    $changedFields
+                )),
                 'change_count' => (string)count($logs),
                 'first_changed_at' => (string)($firstLog['created_at'] ?? ''),
                 'last_changed_at' => (string)($lastLog['created_at'] ?? ''),
@@ -4641,41 +4719,42 @@ try {
         });
 
         $columns = [
-            'change_type',
-            'change_source',
-            'event_id',
-            'event_name',
-            'baseline_record_id',
-            'current_participant_id',
-            'current_state',
-            'changed_fields',
-            'change_count',
-            'first_changed_at',
-            'last_changed_at',
-            'last_changed_by',
-            'original_display_name',
-            'current_display_name',
-            'original_email',
-            'current_email',
-            'original_bib_number',
-            'current_bib_number',
+            'change_type' => 'Typ zmiany',
+            'change_source' => 'Źródło zmiany',
+            'event_id' => 'ID wydarzenia',
+            'event_name' => 'Nazwa wydarzenia',
+            'baseline_record_id' => 'ID rekordu bazowego',
+            'current_participant_id' => 'Aktualne ID uczestnika',
+            'current_state' => 'Aktualny stan',
+            'changed_fields' => 'Zmienione pola',
+            'change_count' => 'Liczba zmian',
+            'first_changed_at' => 'Pierwsza zmiana',
+            'last_changed_at' => 'Ostatnia zmiana',
+            'last_changed_by' => 'Ostatnio zmienił',
+            'original_display_name' => 'Poprzednie imię i nazwisko',
+            'current_display_name' => 'Aktualne imię i nazwisko',
+            'original_email' => 'Poprzedni e-mail',
+            'current_email' => 'Aktualny e-mail',
+            'original_bib_number' => 'Poprzedni numer startowy',
+            'current_bib_number' => 'Aktualny numer startowy',
         ];
         foreach ($customFieldColumns as $columnName) {
-            $columns[] = 'original__' . $columnName;
-            $columns[] = 'current__' . $columnName;
+            $columns['original__' . $columnName] = 'Poprzednio: ' . $columnName;
+            $columns['current__' . $columnName] = 'Aktualnie: ' . $columnName;
         }
+        $columnKeys = array_keys($columns);
 
         $stream = fopen('php://temp', 'r+');
         if ($stream === false) {
-            jsonResponse(500, ['error' => 'Nie udaĹ‚o siÄ™ rozpoczÄ…Ä‡ eksportu CSV']);
+            jsonResponse(500, ['error' => 'Nie udało się rozpocząć eksportu CSV']);
             exit;
         }
 
-        fputcsv($stream, $columns);
+        $writeCsvRow($stream, array_values($columns));
         foreach ($rows as $row) {
-            fputcsv($stream, array_map(
+            $writeCsvRow($stream, array_map(
                 static fn(string $columnName): string => (string)($row[$columnName] ?? ''),
-                $columns
+                $columnKeys
             ));
         }
 
@@ -4685,7 +4764,7 @@ try {
 
         $addActivityLog(
             $pdo,
-            'Wyeksportowano zmiany uczestnikow do CSV',
+            'Wyeksportowano zmiany uczestników do CSV',
             $eventId,
             null,
             null,
@@ -4694,13 +4773,11 @@ try {
         );
 
         if ($csvContent === false) {
-            jsonResponse(500, ['error' => 'Nie udaĹ‚o siÄ™ przygotowaÄ‡ eksportu CSV']);
+            jsonResponse(500, ['error' => 'Nie udało się przygotować eksportu CSV']);
             exit;
         }
 
-        $safeEventName = preg_replace('/[^a-zA-Z0-9_-]+/', '-', (string)$event['name']) ?: 'event';
-        header('Content-Type: text/csv; charset=UTF-8');
-        header(sprintf('Content-Disposition: attachment; filename="%s-participant-changes.csv"', trim($safeEventName, '-')));
+        $setCsvDownloadHeaders($buildExportFilename($event, 'zmiany'));
         echo "\xEF\xBB\xBF";
         echo $csvContent;
         exit;
@@ -5013,7 +5090,7 @@ try {
         $addActivityLog(
             $pdo,
             sprintf(
-                'Zaimportowano CSV uczestnikow: dodano %d, duplikaty %d, niepoprawne %d',
+                'Zaimportowano CSV uczestników: dodano %d, duplikaty %d, niepoprawne %d',
                 count($createdParticipants),
                 $duplicateCount,
                 $invalidCount
@@ -5155,7 +5232,7 @@ try {
             $addActivityLog(
                 $pdo,
                 sprintf(
-                    'Podmieniono liste uczestnikow z CSV: dodano %d, duplikaty %d, niepoprawne %d',
+                    'Podmieniono listę uczestników z CSV: dodano %d, duplikaty %d, niepoprawne %d',
                     (int)$importSummary['created_count'],
                     (int)$importSummary['duplicate_count'],
                     (int)$importSummary['invalid_count']
