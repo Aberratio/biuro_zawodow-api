@@ -2811,14 +2811,41 @@ try {
         $duplicateCount = 0;
         $invalidCount = 0;
         $invalidRows = [];
+        $invalidRowDetails = [];
+        $duplicateRowDetails = [];
 
         foreach ($rows as $index => $row) {
-            $email = normalizeEmailAddress((string)($row[(string)$emailMapping['source_column_name']] ?? ''));
+            $rowNumber = $index + 2;
+            $emailColumnName = (string)$emailMapping['source_column_name'];
+            $rawEmail = trim((string)($row[$emailColumnName] ?? ''));
+            $email = normalizeEmailAddress($rawEmail);
             $displayName = $buildDisplayNameFromMapping($row, $mappings);
+            $rowErrors = [];
 
-            if ($email === '' || !isValidEmailAddress($email) || $displayName === '') {
+            if ($rawEmail === '') {
+                $rowErrors[] = sprintf('Brak adresu e-mail w kolumnie "%s".', $emailColumnName);
+            } elseif (!isValidEmailAddress($email)) {
+                $rowErrors[] = sprintf('Nieprawidłowy adres e-mail w kolumnie "%s".', $emailColumnName);
+            }
+
+            if ($displayName === '') {
+                $displayNameColumns = array_values(array_map(
+                    static fn(array $mapping): string => (string)$mapping['source_column_name'],
+                    array_filter($mappings, static fn(array $mapping): bool => ($mapping['field_role'] ?? '') === 'display_name_part' && (bool)($mapping['is_active'] ?? true))
+                ));
+                $rowErrors[] = $displayNameColumns === []
+                    ? 'Brak aktywnej kolumny budującej nazwę uczestnika.'
+                    : sprintf('Brak danych budujących nazwę uczestnika w kolumnach: %s.', implode(', ', $displayNameColumns));
+            }
+
+            if ($rowErrors !== []) {
                 $invalidCount++;
-                $invalidRows[] = $index + 2;
+                $invalidRows[] = $rowNumber;
+                $invalidRowDetails[] = [
+                    'row_number' => $rowNumber,
+                    'reasons' => $rowErrors,
+                    'row' => $row,
+                ];
                 continue;
             }
 
@@ -2840,6 +2867,16 @@ try {
 
             if (($bibDuplicateKey !== null && isset($existingBibKeys[$bibDuplicateKey])) || ($bibDuplicateKey === null && isset($existingFallbackKeys[$fallbackKey]))) {
                 $duplicateCount++;
+                $duplicateRowDetails[] = [
+                    'row_number' => $rowNumber,
+                    'reasons' => [
+                        $bibDuplicateKey !== null
+                            ? 'Uczestnik z tym samym adresem e-mail i numerem startowym już istnieje w wydarzeniu.'
+                            : 'Uczestnik z tym samym adresem e-mail i nazwą już istnieje w wydarzeniu.',
+                    ],
+                    'row' => $row,
+                    'matched_by' => $bibDuplicateKey !== null ? 'email_bib_number' : 'email_display_name',
+                ];
                 continue;
             }
 
@@ -2856,6 +2893,13 @@ try {
                 ]
             );
             if ($participant === []) {
+                $invalidCount++;
+                $invalidRows[] = $rowNumber;
+                $invalidRowDetails[] = [
+                    'row_number' => $rowNumber,
+                    'reasons' => ['Nie udało się zapisać uczestnika w bazie danych.'],
+                    'row' => $row,
+                ];
                 continue;
             }
 
@@ -2900,6 +2944,8 @@ try {
             'duplicate_count' => $duplicateCount,
             'invalid_count' => $invalidCount,
             'invalid_rows' => $invalidRows,
+            'invalid_row_details' => $invalidRowDetails,
+            'duplicate_row_details' => $duplicateRowDetails,
             'participants' => $createdParticipants,
         ], null];
     };
@@ -4065,11 +4111,14 @@ try {
             exit;
         }
 
+        $existingOfficeOpenAt = normalizeLocalDateTimeString((string)($event['office_open_at'] ?? ''));
         $isCurrentlyOpen = $isEventOfficeOpenNow($event);
+        $isKeepingExistingOfficeOpenAt = $existingOfficeOpenAt !== null
+            && $normalizedOfficeOpenAt === $existingOfficeOpenAt;
         $officeWindowValidationError = $validateEventOfficeWindow(
             $normalizedOfficeOpenAt,
             $normalizedOfficeCloseAt,
-            $isCurrentlyOpen
+            $isCurrentlyOpen || $isKeepingExistingOfficeOpenAt
         );
         if ($officeWindowValidationError !== null) {
             jsonResponse(422, ['error' => $officeWindowValidationError]);
@@ -4973,118 +5022,15 @@ try {
             exit;
         }
 
-        $existingParticipantsStmt = $pdo->prepare('
-            SELECT email, display_name, bib_number
-            FROM participants
-            WHERE event_id = :event_id
-        ');
-        $existingParticipantsStmt->execute(['event_id' => $eventId]);
-        $existingBibKeys = [];
-        $existingFallbackKeys = [];
-        foreach ($existingParticipantsStmt->fetchAll() as $row) {
-            $emailKey = strtolower(trim((string)($row['email'] ?? '')));
-            $displayNameKey = strtolower(trim((string)($row['display_name'] ?? '')));
-            $bibKey = trim((string)($row['bib_number'] ?? ''));
-
-            if ($bibKey !== '') {
-                $existingBibKeys[$emailKey . '|' . $bibKey] = true;
-            }
-
-            if ($emailKey !== '' && $displayNameKey !== '') {
-                $existingFallbackKeys[$emailKey . '|' . $displayNameKey] = true;
-            }
-        }
-
         $hasBaselineImport = $eventHasParticipantImportBaseline($pdo, $eventId);
-        $createdParticipants = [];
-        $duplicateCount = 0;
-        $invalidCount = 0;
-        $invalidRows = [];
+        $importSummary = null;
 
         $pdo->beginTransaction();
 
         try {
-            foreach ($cleaned['rows'] as $index => $row) {
-                $email = trim((string)($row[(string)$emailMapping['source_column_name']] ?? ''));
-                $displayName = $buildDisplayNameFromMapping($row, $mappings);
-
-                if ($email === '' || !isValidEmailAddress($email) || $displayName === '') {
-                    $invalidCount++;
-                    $invalidRows[] = $index + 2;
-                    continue;
-                }
-
-                $normalizedEmail = strtolower($email);
-
-                $bibNumber = null;
-                foreach ($mappings as $mapping) {
-                    if ($mapping['field_role'] === 'bib_number') {
-                        $candidateBib = trim((string)($row[(string)$mapping['source_column_name']] ?? ''));
-                        if ($candidateBib !== '') {
-                            $bibNumber = $candidateBib;
-                        }
-                        break;
-                    }
-                }
-
-                $fallbackKey = $normalizedEmail . '|' . strtolower($displayName);
-                $bibDuplicateKey = $bibNumber !== null ? $normalizedEmail . '|' . $bibNumber : null;
-
-                if (($bibDuplicateKey !== null && isset($existingBibKeys[$bibDuplicateKey])) || ($bibDuplicateKey === null && isset($existingFallbackKeys[$fallbackKey]))) {
-                    $duplicateCount++;
-                    continue;
-                }
-
-                $customFieldData = $normalizeCustomFieldsFromMapping($row, $mappings);
-                $participant = $insertParticipantRecord(
-                    $pdo,
-                    $eventId,
-                    $displayName,
-                    $email,
-                    $bibNumber,
-                    [
-                        'important_field_aliases' => $customFieldData['important_field_aliases'] ?? [],
-                        ...($customFieldData['custom_fields'] ?? []),
-                    ]
-                );
-                if ($participant === []) {
-                    continue;
-                }
-
-                $participantState = $normalizeParticipantChangeState($participant);
-                if (!$hasBaselineImport) {
-                    $baselineRecordId = $createParticipantImportBaselineRecord(
-                        $pdo,
-                        $eventId,
-                        (string)$participant['participant_audit_key'],
-                        $participantState,
-                        $index + 2
-                    );
-                    $attachParticipantBaselineRecord($pdo, (int)$participant['id'], $baselineRecordId);
-                    $participant['baseline_import_record_id'] = $baselineRecordId;
-                } else {
-                    $addParticipantChangeLog(
-                        $pdo,
-                        $eventId,
-                        (string)$participant['participant_audit_key'],
-                        null,
-                        (int)$participant['id'],
-                        'added',
-                        'csv_import',
-                        [],
-                        $participantState,
-                        ['participant_record'],
-                        (string)$authUser['id'],
-                        (string)$authUser['name']
-                    );
-                }
-
-                $createdParticipants[] = $participant;
-                $createdBibNumber = trim((string)($participant['bib_number'] ?? ''));
-                if ($createdBibNumber !== '') {
-                    $existingBibKeys[$normalizedEmail . '|' . $createdBibNumber] = true;
-                }
-                $existingFallbackKeys[$fallbackKey] = true;
+            [$importSummary, $importError] = $importParticipantsFromRows($pdo, $eventId, $cleaned['rows'], $mappings, $authUser, $hasBaselineImport);
+            if ($importError !== null || $importSummary === null) {
+                throw new RuntimeException($importError ?? 'Nie udało się zaimportować uczestników');
             }
 
             $pdo->commit();
@@ -5100,9 +5046,9 @@ try {
             $pdo,
             sprintf(
                 'Zaimportowano CSV uczestników: dodano %d, duplikaty %d, niepoprawne %d',
-                count($createdParticipants),
-                $duplicateCount,
-                $invalidCount
+                (int)$importSummary['created_count'],
+                (int)$importSummary['duplicate_count'],
+                (int)$importSummary['invalid_count']
             ),
             $eventId,
             null,
@@ -5111,13 +5057,7 @@ try {
             (string)$authUser['name']
         );
         jsonResponse(200, [
-            'data' => [
-                'created_count' => count($createdParticipants),
-                'duplicate_count' => $duplicateCount,
-                'invalid_count' => $invalidCount,
-                'invalid_rows' => $invalidRows,
-                'participants' => $createdParticipants,
-            ],
+            'data' => $importSummary,
         ]);
         exit;
     }

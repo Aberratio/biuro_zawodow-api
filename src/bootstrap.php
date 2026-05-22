@@ -149,6 +149,66 @@ function normalizeLocalDateTimeString(string $value): ?string
     return $dateTime?->format('Y-m-d H:i:s');
 }
 
+function corsOriginFromUrl(string $url): ?string
+{
+    $trimmedUrl = trim($url);
+    if ($trimmedUrl === '') {
+        return null;
+    }
+
+    $parts = parse_url($trimmedUrl);
+    if (!is_array($parts) || empty($parts['scheme']) || empty($parts['host'])) {
+        return null;
+    }
+
+    $origin = strtolower((string)$parts['scheme']) . '://' . strtolower((string)$parts['host']);
+    if (isset($parts['port'])) {
+        $origin .= ':' . (int)$parts['port'];
+    }
+
+    return $origin;
+}
+
+function configuredCorsOrigins(string $allowedOriginsRaw): array
+{
+    $origins = [];
+    foreach (explode(',', $allowedOriginsRaw) as $origin) {
+        $normalizedOrigin = corsOriginFromUrl($origin) ?? trim($origin);
+        if ($normalizedOrigin !== '') {
+            $origins[] = $normalizedOrigin;
+        }
+    }
+
+    foreach (['APP_FRONTEND_URL', 'APP_URL'] as $envKey) {
+        $origin = corsOriginFromUrl((string)(getenv($envKey) ?: ''));
+        if ($origin !== null) {
+            $origins[] = $origin;
+        }
+    }
+
+    return array_values(array_unique($origins));
+}
+
+function isLocalDevelopmentCorsOrigin(string $origin): bool
+{
+    $host = parse_url($origin, PHP_URL_HOST);
+    if (!is_string($host) || $host === '') {
+        return false;
+    }
+
+    $normalizedHost = strtolower(trim($host, '[]'));
+    if ($normalizedHost === 'localhost' || str_ends_with($normalizedHost, '.localhost')) {
+        return true;
+    }
+
+    $ip = filter_var($normalizedHost, FILTER_VALIDATE_IP);
+    if ($ip === false) {
+        return false;
+    }
+
+    return filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE) === false;
+}
+
 function setCorsHeaders(): void
 {
     $allowedOriginsRaw = getenv('APP_CORS_ORIGIN') ?: '*';
@@ -157,11 +217,14 @@ function setCorsHeaders(): void
     if ($allowedOriginsRaw === '*') {
         header('Access-Control-Allow-Origin: *');
     } else {
-        $allowedOrigins = array_map('trim', explode(',', $allowedOriginsRaw));
-        $allowOrigin = in_array($requestOrigin, $allowedOrigins, true)
+        $allowedOrigins = configuredCorsOrigins($allowedOriginsRaw);
+        $fallbackOrigin = $allowedOrigins[0] ?? '';
+        $allowOrigin = in_array($requestOrigin, $allowedOrigins, true) || (isLocalEnvironment() && isLocalDevelopmentCorsOrigin($requestOrigin))
             ? $requestOrigin
-            : $allowedOrigins[0];
-        header('Access-Control-Allow-Origin: ' . $allowOrigin);
+            : $fallbackOrigin;
+        if ($allowOrigin !== '') {
+            header('Access-Control-Allow-Origin: ' . $allowOrigin);
+        }
     }
 
     header('Access-Control-Allow-Methods: GET, POST, PATCH, DELETE, OPTIONS');
@@ -172,6 +235,9 @@ function setCorsHeaders(): void
     header('X-Content-Type-Options: nosniff');
     header('X-Frame-Options: DENY');
     header('Permissions-Policy: camera=(), microphone=(), geolocation=()');
+    if (isLocalEnvironment()) {
+        header('Access-Control-Allow-Private-Network: true');
+    }
 }
 
 function appEnvironment(): string
