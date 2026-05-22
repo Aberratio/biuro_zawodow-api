@@ -5966,7 +5966,9 @@ try {
                 eventOfficeWindow: $formatEventOfficeWindow($event),
                 eventLocation: (string)$event['location'],
                 bibNumber: (string)($participant['bib_number'] ?? ''),
-                qrToken: (string)$participant['qr_code']
+                qrToken: (string)$participant['qr_code'],
+                participantCustomFields: is_array($participant['custom_fields'] ?? null) ? $participant['custom_fields'] : [],
+                participantImportantFieldAliases: is_array($participant['important_field_aliases'] ?? null) ? $participant['important_field_aliases'] : []
             );
 
             $updateStmt = $pdo->prepare('UPDATE participants SET email_status = :email_status WHERE id = :id');
@@ -6070,7 +6072,9 @@ try {
                     eventOfficeWindow: $formatEventOfficeWindow($event),
                     eventLocation: (string)$event['location'],
                     bibNumber: (string)($participantRow['bib_number'] ?? ''),
-                    qrToken: (string)$participantRow['qr_code']
+                    qrToken: (string)$participantRow['qr_code'],
+                    participantCustomFields: is_array($participantRow['custom_fields'] ?? null) ? $participantRow['custom_fields'] : [],
+                    participantImportantFieldAliases: is_array($participantRow['important_field_aliases'] ?? null) ? $participantRow['important_field_aliases'] : []
                 );
 
                 $updateSentEmailStatusStmt->execute([
