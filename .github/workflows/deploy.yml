@@ -120,8 +120,9 @@ jobs:
           BACKEND_ALLOWED_PATH_FRAGMENT: ${{ secrets.BACKEND_ALLOWED_PATH_FRAGMENT }}
         run: |
           set -Eeuo pipefail
-          REMOTE_ZIP="$BACKEND_REMOTE_DIR/.deploy/api-${TARGET_ENV}-${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}.zip"
-          printf -v REMOTE_ENV 'BACKEND_REMOTE_DIR=%q BACKEND_ALLOWED_PATH_FRAGMENT=%q REMOTE_ZIP=%q TARGET_ENV=%q MIGRATION_MODE=%q' "$BACKEND_REMOTE_DIR" "$BACKEND_ALLOWED_PATH_FRAGMENT" "$REMOTE_ZIP" "$TARGET_ENV" "$MIGRATION_MODE"
+          DEPLOY_ID="${TARGET_ENV}-${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}"
+          REMOTE_ZIP="$BACKEND_REMOTE_DIR/.deploy/api-${DEPLOY_ID}.zip"
+          printf -v REMOTE_ENV 'BACKEND_REMOTE_DIR=%q BACKEND_ALLOWED_PATH_FRAGMENT=%q REMOTE_ZIP=%q TARGET_ENV=%q MIGRATION_MODE=%q DEPLOY_ID=%q' "$BACKEND_REMOTE_DIR" "$BACKEND_ALLOWED_PATH_FRAGMENT" "$REMOTE_ZIP" "$TARGET_ENV" "$MIGRATION_MODE" "$DEPLOY_ID"
 
           ssh -i ~/.ssh/deploy_key -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "$REMOTE_ENV bash -s" <<'REMOTE'
           set -Eeuo pipefail
@@ -225,7 +226,7 @@ jobs:
           fi
 
           if [ "$MIGRATION_MODE" = "dry-run" ] || [ "$MIGRATION_MODE" = "baseline" ]; then
-            CHECK_DIR="$BACKEND_REMOTE_DIR/.deploy/check-${TARGET_ENV}-${GITHUB_RUN_NUMBER}-${GITHUB_SHA:-manual}"
+            CHECK_DIR="$BACKEND_REMOTE_DIR/.deploy/check-${DEPLOY_ID}"
             rm -rf "$CHECK_DIR"
             mkdir -p "$CHECK_DIR"
             unzip -o -q "$REMOTE_ZIP" -d "$CHECK_DIR"
