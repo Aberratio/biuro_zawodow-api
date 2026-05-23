@@ -1,0 +1,216 @@
+name: Deploy API
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      deploy_target:
+        description: "Where should the API be deployed?"
+        required: true
+        default: production
+        type: choice
+        options:
+          - staging
+          - production
+      migration_mode:
+        description: "How should database migrations be handled?"
+        required: true
+        default: run
+        type: choice
+        options:
+          - run
+          - dry-run
+          - skip
+
+permissions:
+  contents: read
+
+concurrency:
+  group: api-${{ github.event_name == 'workflow_dispatch' && inputs.deploy_target || 'staging' }}
+  cancel-in-progress: false
+
+env:
+  TARGET_ENV: ${{ github.event_name == 'workflow_dispatch' && inputs.deploy_target || 'staging' }}
+  MIGRATION_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.migration_mode || 'run' }}
+
+jobs:
+  deploy:
+    name: Deploy API ${{ github.event_name == 'workflow_dispatch' && inputs.deploy_target || 'staging' }}
+    runs-on: ubuntu-latest
+    environment: ${{ github.event_name == 'workflow_dispatch' && inputs.deploy_target || 'staging' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.2"
+          extensions: pdo_mysql, zlib
+          tools: composer:v2
+
+      - name: Build API artifact
+        run: |
+          set -Eeuo pipefail
+          composer validate --no-check-publish
+          composer install --no-dev --prefer-dist --optimize-autoloader --no-interaction
+          find public src scripts database/migrations -name '*.php' -print0 | xargs -0 -n1 php -l
+          mkdir -p artifact
+          rsync -a ./ artifact/api/ \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='.env' \
+            --exclude='.env.*' \
+            --exclude='artifact' \
+            --exclude='serv.zip' \
+            --exclude='server.zip'
+          cd artifact/api
+          zip -r ../api.zip .
+
+      - name: Configure SSH
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          set -Eeuo pipefail
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -p "$SSH_PORT" -H "$SSH_HOST" >> ~/.ssh/known_hosts
+
+      - name: Upload and deploy API
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          BACKEND_REMOTE_DIR: ${{ secrets.BACKEND_REMOTE_DIR }}
+        run: |
+          set -Eeuo pipefail
+          REMOTE_ZIP="$BACKEND_REMOTE_DIR/.deploy/api-${TARGET_ENV}-${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}.zip"
+          printf -v REMOTE_ENV 'BACKEND_REMOTE_DIR=%q REMOTE_ZIP=%q TARGET_ENV=%q MIGRATION_MODE=%q' "$BACKEND_REMOTE_DIR" "$REMOTE_ZIP" "$TARGET_ENV" "$MIGRATION_MODE"
+
+          ssh -i ~/.ssh/deploy_key -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "$REMOTE_ENV bash -s" <<'REMOTE'
+          set -Eeuo pipefail
+
+          if [ -z "$BACKEND_REMOTE_DIR" ]; then
+            echo "BACKEND_REMOTE_DIR is required."
+            exit 10
+          fi
+
+          case "$BACKEND_REMOTE_DIR" in
+            *..*)
+              echo "BACKEND_REMOTE_DIR cannot contain '..'."
+              exit 11
+              ;;
+          esac
+
+          if [ ! -f "$BACKEND_REMOTE_DIR/.biuro-zawodow-api-root" ]; then
+            echo "Missing deploy marker: $BACKEND_REMOTE_DIR/.biuro-zawodow-api-root"
+            exit 12
+          fi
+
+          if [ ! -f "$BACKEND_REMOTE_DIR/.env" ]; then
+            echo "Missing backend env file: $BACKEND_REMOTE_DIR/.env"
+            exit 13
+          fi
+
+          mkdir -p "$BACKEND_REMOTE_DIR/.deploy" "$BACKEND_REMOTE_DIR/backups/db"
+
+          command -v php >/dev/null
+          command -v unzip >/dev/null
+          command -v mysqldump >/dev/null
+          REMOTE
+
+          scp -i ~/.ssh/deploy_key -P "$SSH_PORT" artifact/api.zip "$SSH_USER@$SSH_HOST:$REMOTE_ZIP"
+
+          ssh -i ~/.ssh/deploy_key -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "$REMOTE_ENV bash -s" <<'REMOTE'
+          set -Eeuo pipefail
+          umask 077
+
+          get_env() {
+            local key="$1"
+            local line
+            line="$(grep -E "^${key}=" "$BACKEND_REMOTE_DIR/.env" | tail -n 1 || true)"
+            line="${line#*=}"
+            line="${line%\"}"
+            line="${line#\"}"
+            line="${line%\'}"
+            line="${line#\'}"
+            printf '%s' "$line"
+          }
+
+          DB_HOST="$(get_env DB_HOST)"
+          DB_PORT="$(get_env DB_PORT)"
+          DB_DATABASE="$(get_env DB_DATABASE)"
+          DB_USERNAME="$(get_env DB_USERNAME)"
+          DB_PASSWORD="$(get_env DB_PASSWORD)"
+
+          if [ -z "$DB_HOST" ] || [ -z "$DB_PORT" ] || [ -z "$DB_DATABASE" ] || [ -z "$DB_USERNAME" ]; then
+            echo "Database settings are incomplete in $BACKEND_REMOTE_DIR/.env"
+            exit 20
+          fi
+
+          MYSQL_CNF="$(mktemp)"
+          trap 'rm -f "$MYSQL_CNF"' EXIT
+          chmod 600 "$MYSQL_CNF"
+          cat > "$MYSQL_CNF" <<MYSQLCNF
+          [client]
+          host=$DB_HOST
+          port=$DB_PORT
+          user=$DB_USERNAME
+          password=$DB_PASSWORD
+          default-character-set=utf8mb4
+          MYSQLCNF
+
+          BACKUP_FILE="$BACKEND_REMOTE_DIR/backups/db/predeploy-$TARGET_ENV-$(date +%Y%m%d-%H%M%S).sql.gz"
+          mysqldump --defaults-extra-file="$MYSQL_CNF" --single-transaction --routines --triggers "$DB_DATABASE" | gzip -c > "$BACKUP_FILE"
+          chmod 600 "$BACKUP_FILE"
+          echo "Database backup created: $BACKUP_FILE"
+
+          if ! gzip -t "$BACKUP_FILE"; then
+            echo "Database backup is invalid: $BACKUP_FILE"
+            exit 21
+          fi
+
+          if [ "$MIGRATION_MODE" = "dry-run" ]; then
+            DRY_RUN_DIR="$BACKEND_REMOTE_DIR/.deploy/dry-run-${TARGET_ENV}-${GITHUB_RUN_NUMBER}-${GITHUB_SHA:-manual}"
+            rm -rf "$DRY_RUN_DIR"
+            mkdir -p "$DRY_RUN_DIR"
+            unzip -o -q "$REMOTE_ZIP" -d "$DRY_RUN_DIR"
+            cp "$BACKEND_REMOTE_DIR/.env" "$DRY_RUN_DIR/.env"
+            php "$DRY_RUN_DIR/scripts/run-migrations.php" --dry-run
+            rm -rf "$DRY_RUN_DIR"
+            rm -f "$REMOTE_ZIP"
+            echo "Migration dry-run finished. API files were not changed."
+            exit 0
+          fi
+
+          unzip -o -q "$REMOTE_ZIP" -d "$BACKEND_REMOTE_DIR"
+          rm -f "$REMOTE_ZIP"
+
+          case "$MIGRATION_MODE" in
+            run)
+              php "$BACKEND_REMOTE_DIR/scripts/run-migrations.php"
+              ;;
+            skip)
+              echo "Migrations skipped by workflow input."
+              ;;
+            *)
+              echo "Unsupported MIGRATION_MODE: $MIGRATION_MODE"
+              exit 22
+              ;;
+          esac
+          echo "API unpacked into $BACKEND_REMOTE_DIR"
+          REMOTE
+
+      - name: Health check
+        env:
+          API_URL: ${{ secrets.API_URL }}
+        run: |
+          set -Eeuo pipefail
+          curl --fail --show-error --location "${API_URL%/}/health"
