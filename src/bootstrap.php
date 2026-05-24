@@ -250,6 +250,11 @@ function isLocalEnvironment(): bool
     return in_array(appEnvironment(), ['local', 'development', 'dev', 'test'], true);
 }
 
+function isApiDocumentationEnabled(): bool
+{
+    return appEnvironment() !== 'production';
+}
+
 function clientIpAddress(): string
 {
     $ip = trim((string)($_SERVER['REMOTE_ADDR'] ?? ''));

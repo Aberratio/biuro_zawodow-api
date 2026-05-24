@@ -10,7 +10,7 @@ PHP 8.2 API for the `biuro_zawodow` project. It serves the React frontend, expos
 - Participant CSV import with column mapping
 - QR preview, single send and bulk send for event participants
 - CSV export for event data and event activity logs
-- Swagger UI at `/docs` and OpenAPI JSON at `/openapi.json`
+- Swagger UI at `/docs` and OpenAPI JSON at `/openapi.json` on non-production environments
 - Basic API hardening:
   - strict CORS configuration
   - JSON body validation and size limits
@@ -120,9 +120,20 @@ Main seeded accounts:
 
 ## Database setup notes
 
-For a fresh local setup, importing `database/init/001_init.sql` is enough.
+For a fresh local setup, importing `database/init/001_init.sql` is enough. If that database will later be managed by the migration runner, mark the current migration set as already applied:
 
-If you are upgrading an older local database, review the scripts in `database/migrations/` and run only the ones that your existing schema still needs. The directory currently contains:
+```powershell
+php scripts/run-migrations.php --baseline
+```
+
+If you are upgrading an older local database, run the migration runner instead of relying on API requests to patch the schema:
+
+```powershell
+php scripts/run-migrations.php --dry-run
+php scripts/run-migrations.php
+```
+
+The directory currently contains:
 
 - `002_hash_user_passwords.php`
 - `003_add_admin_id_to_users.php`
@@ -140,13 +151,16 @@ If you are upgrading an older local database, review the scripts in `database/mi
 - `015_allow_duplicate_participant_bib_numbers.php`
 - `016_add_important_participant_field_role.php`
 - `017_add_event_participant_change_audit.php`
+- `018_add_request_rate_limits_and_activity_event.php`
+- `019_add_user_archiving_and_event_soft_delete.php`
+- `020_add_event_sync_tables.php`
 
 ## Auth and access model
 
 Public endpoints:
 
-- `GET /docs`
-- `GET /openapi.json`
+- `GET /docs` (non-production only)
+- `GET /openapi.json` (non-production only)
 - `GET /health`
 - `GET /qr-images/{token}.svg`
 - `POST /auth/login`
@@ -249,6 +263,8 @@ php -l public/index.php
 
 - UI: `GET /docs`
 - JSON: `GET /openapi.json`
+
+Swagger endpoints are enabled only when `APP_ENV` is not `production`.
 
 Use Swagger as the source of truth for request and response payloads.
 
