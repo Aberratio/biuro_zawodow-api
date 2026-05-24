@@ -361,6 +361,7 @@ jobs:
           REMOTE
 
       - name: Health check
+        if: env.MIGRATION_MODE == 'run' || env.MIGRATION_MODE == 'skip'
         env:
           API_URL: ${{ secrets.API_URL }}
         run: |
