@@ -10,7 +10,7 @@ on:
       deploy_target:
         description: "Where should the API be deployed?"
         required: true
-        default: production
+        default: staging
         type: choice
         options:
           - staging
@@ -25,6 +25,10 @@ on:
           - baseline
           - dry-run
           - skip
+      confirm_production:
+        description: "Type DEPLOY_PRODUCTION to confirm production deploy."
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -36,6 +40,7 @@ concurrency:
 env:
   TARGET_ENV: ${{ github.event_name == 'workflow_dispatch' && inputs.deploy_target || 'staging' }}
   MIGRATION_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.migration_mode || 'run' }}
+  CONFIRM_PRODUCTION: ${{ github.event_name == 'workflow_dispatch' && inputs.confirm_production || '' }}
 
 jobs:
   deploy:
@@ -77,10 +82,11 @@ jobs:
           SSH_HOST: ${{ secrets.SSH_HOST }}
           SSH_PORT: ${{ secrets.SSH_PORT }}
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
         run: |
           set -Eeuo pipefail
-          if [ -z "$SSH_HOST" ] || [ -z "$SSH_PORT" ] || [ -z "$SSH_PRIVATE_KEY" ]; then
-            echo "SSH_HOST, SSH_PORT and SSH_PRIVATE_KEY are required."
+          if [ -z "$SSH_HOST" ] || [ -z "$SSH_PORT" ] || [ -z "$SSH_PRIVATE_KEY" ] || [ -z "$SSH_KNOWN_HOSTS" ]; then
+            echo "SSH_HOST, SSH_PORT, SSH_PRIVATE_KEY and SSH_KNOWN_HOSTS are required."
             exit 30
           fi
 
@@ -101,13 +107,10 @@ jobs:
           install -m 700 -d ~/.ssh
           printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          if ! ssh-keyscan -T 15 -p "$SSH_PORT" -H "$SSH_HOST" > ~/.ssh/known_hosts; then
-            echo "Could not read SSH host key. Check SSH_HOST and SSH_PORT, and verify that SSH is enabled for this hosting account."
-            exit 33
-          fi
-
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
           if [ ! -s ~/.ssh/known_hosts ]; then
-            echo "ssh-keyscan returned no host keys. Check SSH_HOST and SSH_PORT."
+            echo "SSH_KNOWN_HOSTS is empty."
             exit 34
           fi
 
@@ -117,12 +120,18 @@ jobs:
           SSH_PORT: ${{ secrets.SSH_PORT }}
           SSH_USER: ${{ secrets.SSH_USER }}
           BACKEND_REMOTE_DIR: ${{ secrets.BACKEND_REMOTE_DIR }}
-          BACKEND_ALLOWED_PATH_FRAGMENT: ${{ secrets.BACKEND_ALLOWED_PATH_FRAGMENT }}
+          BACKEND_ALLOWED_ROOT: ${{ secrets.BACKEND_ALLOWED_ROOT }}
+          BACKEND_BACKUP_DIR: ${{ secrets.BACKEND_BACKUP_DIR }}
         run: |
           set -Eeuo pipefail
+          if [ "$TARGET_ENV" = "production" ] && [ "$CONFIRM_PRODUCTION" != "DEPLOY_PRODUCTION" ]; then
+            echo "Production deploy requires confirm_production=DEPLOY_PRODUCTION."
+            exit 50
+          fi
+
           DEPLOY_ID="${TARGET_ENV}-${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}"
           REMOTE_ZIP="$BACKEND_REMOTE_DIR/.deploy/api-${DEPLOY_ID}.zip"
-          printf -v REMOTE_ENV 'BACKEND_REMOTE_DIR=%q BACKEND_ALLOWED_PATH_FRAGMENT=%q REMOTE_ZIP=%q TARGET_ENV=%q MIGRATION_MODE=%q DEPLOY_ID=%q' "$BACKEND_REMOTE_DIR" "$BACKEND_ALLOWED_PATH_FRAGMENT" "$REMOTE_ZIP" "$TARGET_ENV" "$MIGRATION_MODE" "$DEPLOY_ID"
+          printf -v REMOTE_ENV 'BACKEND_REMOTE_DIR=%q BACKEND_ALLOWED_ROOT=%q BACKEND_BACKUP_DIR=%q REMOTE_ZIP=%q TARGET_ENV=%q MIGRATION_MODE=%q DEPLOY_ID=%q' "$BACKEND_REMOTE_DIR" "$BACKEND_ALLOWED_ROOT" "$BACKEND_BACKUP_DIR" "$REMOTE_ZIP" "$TARGET_ENV" "$MIGRATION_MODE" "$DEPLOY_ID"
 
           ssh -i ~/.ssh/deploy_key -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "$REMOTE_ENV bash -s" <<'REMOTE'
           set -Eeuo pipefail
@@ -132,46 +141,91 @@ jobs:
             exit 10
           fi
 
-          if [ -z "$BACKEND_ALLOWED_PATH_FRAGMENT" ]; then
-            echo "BACKEND_ALLOWED_PATH_FRAGMENT is required."
+          if [ -z "$BACKEND_ALLOWED_ROOT" ]; then
+            echo "BACKEND_ALLOWED_ROOT is required."
             exit 11
+          fi
+
+          case "$BACKEND_ALLOWED_ROOT" in
+            /*) ;;
+            *)
+              echo "BACKEND_ALLOWED_ROOT must be an absolute path."
+              exit 27
+              ;;
+          esac
+
+          if [ -z "$BACKEND_BACKUP_DIR" ]; then
+            echo "BACKEND_BACKUP_DIR is required."
+            exit 12
           fi
 
           if [ "$BACKEND_REMOTE_DIR" = "/" ] || [ "$BACKEND_REMOTE_DIR" = "." ] || [ "$BACKEND_REMOTE_DIR" = "$HOME" ] || [ "$BACKEND_REMOTE_DIR" = "~" ]; then
             echo "BACKEND_REMOTE_DIR points to an unsafe location: $BACKEND_REMOTE_DIR"
-            exit 12
+            exit 13
           fi
 
           case "$BACKEND_REMOTE_DIR" in
             *..*)
               echo "BACKEND_REMOTE_DIR cannot contain '..'."
-              exit 13
-              ;;
-          esac
-
-          case "$BACKEND_REMOTE_DIR" in
-            *"$BACKEND_ALLOWED_PATH_FRAGMENT"*) ;;
-            *)
-              echo "BACKEND_REMOTE_DIR must contain BACKEND_ALLOWED_PATH_FRAGMENT."
               exit 14
               ;;
           esac
 
-          if [ ! -f "$BACKEND_REMOTE_DIR/.biuro-zawodow-api-root" ]; then
-            echo "Missing deploy marker: $BACKEND_REMOTE_DIR/.biuro-zawodow-api-root"
-            exit 15
-          fi
+          case "$BACKEND_BACKUP_DIR" in
+            /*) ;;
+            *)
+              echo "BACKEND_BACKUP_DIR must be an absolute path."
+              exit 15
+              ;;
+          esac
 
-          if [ ! -f "$BACKEND_REMOTE_DIR/.env" ]; then
-            echo "Missing backend env file: $BACKEND_REMOTE_DIR/.env"
-            exit 16
-          fi
-
-          mkdir -p "$BACKEND_REMOTE_DIR/.deploy" "$BACKEND_REMOTE_DIR/backups/db"
-
+          command -v realpath >/dev/null
           command -v php >/dev/null
           command -v unzip >/dev/null
           command -v mysqldump >/dev/null
+
+          BACKEND_REMOTE_DIR_REAL="$(realpath -e "$BACKEND_REMOTE_DIR")"
+          BACKEND_ALLOWED_ROOT_REAL="$(realpath -e "$BACKEND_ALLOWED_ROOT")"
+
+          case "$BACKEND_REMOTE_DIR_REAL" in
+            /|.|"$HOME")
+              echo "BACKEND_REMOTE_DIR points to an unsafe location: $BACKEND_REMOTE_DIR_REAL"
+              exit 16
+              ;;
+          esac
+
+          case "$BACKEND_REMOTE_DIR_REAL/" in
+            "$BACKEND_ALLOWED_ROOT_REAL"/*|"$BACKEND_ALLOWED_ROOT_REAL/") ;;
+            *)
+              echo "BACKEND_REMOTE_DIR is outside BACKEND_ALLOWED_ROOT."
+              echo "BACKEND_REMOTE_DIR_REAL=$BACKEND_REMOTE_DIR_REAL"
+              echo "BACKEND_ALLOWED_ROOT_REAL=$BACKEND_ALLOWED_ROOT_REAL"
+              exit 17
+              ;;
+          esac
+
+          if [ ! -f "$BACKEND_REMOTE_DIR_REAL/.biuro-zawodow-api-root" ]; then
+            echo "Missing deploy marker: $BACKEND_REMOTE_DIR_REAL/.biuro-zawodow-api-root"
+            exit 18
+          fi
+
+          if [ ! -f "$BACKEND_REMOTE_DIR_REAL/.env" ]; then
+            echo "Missing backend env file: $BACKEND_REMOTE_DIR_REAL/.env"
+            exit 19
+          fi
+
+          mkdir -p "$BACKEND_REMOTE_DIR_REAL/.deploy" "$BACKEND_BACKUP_DIR"
+          chmod 700 "$BACKEND_BACKUP_DIR"
+          BACKEND_BACKUP_DIR_REAL="$(cd "$BACKEND_BACKUP_DIR" && pwd -P)"
+
+          case "$BACKEND_BACKUP_DIR_REAL/" in
+            "$BACKEND_REMOTE_DIR_REAL"/*|"$BACKEND_REMOTE_DIR_REAL/")
+              echo "BACKEND_BACKUP_DIR must be outside BACKEND_REMOTE_DIR."
+              echo "BACKEND_BACKUP_DIR_REAL=$BACKEND_BACKUP_DIR_REAL"
+              echo "BACKEND_REMOTE_DIR_REAL=$BACKEND_REMOTE_DIR_REAL"
+              exit 24
+              ;;
+          esac
           REMOTE
 
           scp -i ~/.ssh/deploy_key -P "$SSH_PORT" artifact/api.zip "$SSH_USER@$SSH_HOST:$REMOTE_ZIP"
@@ -180,10 +234,33 @@ jobs:
           set -Eeuo pipefail
           umask 077
 
+          BACKEND_REMOTE_DIR_REAL="$(realpath -e "$BACKEND_REMOTE_DIR")"
+          BACKEND_ALLOWED_ROOT_REAL="$(realpath -e "$BACKEND_ALLOWED_ROOT")"
+          BACKEND_BACKUP_DIR_REAL="$(cd "$BACKEND_BACKUP_DIR" && pwd -P)"
+          ENV_FILE="$BACKEND_REMOTE_DIR_REAL/.env"
+          REMOTE_ZIP="$BACKEND_REMOTE_DIR_REAL/.deploy/api-${DEPLOY_ID}.zip"
+
+          case "$BACKEND_REMOTE_DIR_REAL/" in
+            "$BACKEND_ALLOWED_ROOT_REAL"/*|"$BACKEND_ALLOWED_ROOT_REAL/") ;;
+            *)
+              echo "BACKEND_REMOTE_DIR is outside BACKEND_ALLOWED_ROOT."
+              echo "BACKEND_REMOTE_DIR_REAL=$BACKEND_REMOTE_DIR_REAL"
+              echo "BACKEND_ALLOWED_ROOT_REAL=$BACKEND_ALLOWED_ROOT_REAL"
+              exit 17
+              ;;
+          esac
+
+          case "$BACKEND_BACKUP_DIR_REAL/" in
+            "$BACKEND_REMOTE_DIR_REAL"/*|"$BACKEND_REMOTE_DIR_REAL/")
+              echo "BACKEND_BACKUP_DIR must be outside BACKEND_REMOTE_DIR."
+              exit 24
+              ;;
+          esac
+
           get_env() {
             local key="$1"
             local line
-            line="$(grep -E "^${key}=" "$BACKEND_REMOTE_DIR/.env" | tail -n 1 || true)"
+            line="$(grep -E "^${key}=" "$ENV_FILE" | tail -n 1 || true)"
             line="${line#*=}"
             line="${line%\"}"
             line="${line#\"}"
@@ -197,10 +274,21 @@ jobs:
           DB_DATABASE="$(get_env DB_DATABASE)"
           DB_USERNAME="$(get_env DB_USERNAME)"
           DB_PASSWORD="$(get_env DB_PASSWORD)"
+          APP_ENV="$(get_env APP_ENV)"
+
+          if [ "$TARGET_ENV" != "$APP_ENV" ]; then
+            echo "TARGET_ENV=$TARGET_ENV but APP_ENV=$APP_ENV in $ENV_FILE"
+            exit 25
+          fi
 
           if [ -z "$DB_HOST" ] || [ -z "$DB_PORT" ] || [ -z "$DB_DATABASE" ] || [ -z "$DB_USERNAME" ]; then
-            echo "Database settings are incomplete in $BACKEND_REMOTE_DIR/.env"
+            echo "Database settings are incomplete in $ENV_FILE"
             exit 20
+          fi
+
+          if [ "$TARGET_ENV" = "production" ] && [ -z "$DB_PASSWORD" ]; then
+            echo "DB_PASSWORD is empty; refusing production deploy."
+            exit 26
           fi
 
           MYSQL_CNF="$(mktemp)"
@@ -215,7 +303,7 @@ jobs:
           default-character-set=utf8mb4
           MYSQLCNF
 
-          BACKUP_FILE="$BACKEND_REMOTE_DIR/backups/db/predeploy-$TARGET_ENV-$(date +%Y%m%d-%H%M%S).sql.gz"
+          BACKUP_FILE="$BACKEND_BACKUP_DIR_REAL/predeploy-$TARGET_ENV-$(date +%Y%m%d-%H%M%S).sql.gz"
           mysqldump --defaults-extra-file="$MYSQL_CNF" --single-transaction --routines --triggers "$DB_DATABASE" | gzip -c > "$BACKUP_FILE"
           chmod 600 "$BACKUP_FILE"
           echo "Database backup created: $BACKUP_FILE"
@@ -226,11 +314,17 @@ jobs:
           fi
 
           if [ "$MIGRATION_MODE" = "dry-run" ] || [ "$MIGRATION_MODE" = "baseline" ]; then
-            CHECK_DIR="$BACKEND_REMOTE_DIR/.deploy/check-${DEPLOY_ID}"
-            rm -rf "$CHECK_DIR"
-            mkdir -p "$CHECK_DIR"
+            CHECK_DIR="$(mktemp -d "$BACKEND_REMOTE_DIR_REAL/.deploy/check-${DEPLOY_ID}.XXXXXX")"
+            cleanup_check_dir() {
+              case "$CHECK_DIR" in
+                "$BACKEND_REMOTE_DIR_REAL/.deploy/check-"*) rm -rf -- "$CHECK_DIR" ;;
+                *) echo "Refusing to remove unsafe CHECK_DIR: $CHECK_DIR" ;;
+              esac
+            }
+            trap 'rm -f "$MYSQL_CNF"; cleanup_check_dir' EXIT
+
             unzip -o -q "$REMOTE_ZIP" -d "$CHECK_DIR"
-            cp "$BACKEND_REMOTE_DIR/.env" "$CHECK_DIR/.env"
+            cp "$ENV_FILE" "$CHECK_DIR/.env"
 
             if [ "$MIGRATION_MODE" = "dry-run" ]; then
               php "$CHECK_DIR/scripts/run-migrations.php" --dry-run
@@ -240,17 +334,16 @@ jobs:
               echo "Migration baseline finished. API files were not changed."
             fi
 
-            rm -rf "$CHECK_DIR"
             rm -f "$REMOTE_ZIP"
             exit 0
           fi
 
-          unzip -o -q "$REMOTE_ZIP" -d "$BACKEND_REMOTE_DIR"
+          unzip -o -q "$REMOTE_ZIP" -d "$BACKEND_REMOTE_DIR_REAL"
           rm -f "$REMOTE_ZIP"
 
           case "$MIGRATION_MODE" in
             run)
-              php "$BACKEND_REMOTE_DIR/scripts/run-migrations.php"
+              php "$BACKEND_REMOTE_DIR_REAL/scripts/run-migrations.php"
               ;;
             skip)
               echo "Migrations skipped by workflow input."
@@ -264,7 +357,7 @@ jobs:
               exit 23
               ;;
           esac
-          echo "API unpacked into $BACKEND_REMOTE_DIR"
+          echo "API unpacked into $BACKEND_REMOTE_DIR_REAL"
           REMOTE
 
       - name: Health check
