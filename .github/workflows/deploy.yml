@@ -342,6 +342,24 @@ jobs:
           unzip -o -q "$REMOTE_ZIP" -d "$BACKEND_REMOTE_DIR_REAL"
           rm -f "$REMOTE_ZIP"
 
+          if [ "$TARGET_ENV" = "staging" ]; then
+            PUBLIC_INDEX="$BACKEND_REMOTE_DIR_REAL/public/index.php"
+            STAGING_PUBLIC_HTML="$BACKEND_REMOTE_DIR_REAL/public_html"
+
+            if [ ! -f "$PUBLIC_INDEX" ]; then
+              echo "Missing staging public index: $PUBLIC_INDEX"
+              exit 28
+            fi
+
+            if [ ! -d "$STAGING_PUBLIC_HTML" ]; then
+              echo "Missing staging public_html directory: $STAGING_PUBLIC_HTML"
+              exit 29
+            fi
+
+            cp "$PUBLIC_INDEX" "$STAGING_PUBLIC_HTML/index.php"
+            echo "Copied staging public index to $STAGING_PUBLIC_HTML/index.php"
+          fi
+
           case "$MIGRATION_MODE" in
             run)
               php "$BACKEND_REMOTE_DIR_REAL/scripts/run-migrations.php"
