@@ -34,6 +34,19 @@ final class MailService
         );
     }
 
+    public static function sendPasswordSetupEmail(string $recipientEmail, string $recipientName, string $resetUrl): void
+    {
+        self::sendActionEmail(
+            recipientEmail: $recipientEmail,
+            recipientName: $recipientName,
+            subject: 'Ustaw hasło do Biura Zawodów',
+            introText: 'Administrator wysłał link do ustawienia hasła do Twojego konta.',
+            validityText: 'Link do ustawienia hasła jest ważny przez 7 dni.',
+            actionLabel: 'Ustaw hasło',
+            actionUrl: $resetUrl
+        );
+    }
+
     public static function sendParticipantQrEmail(
         string $recipientEmail,
         string $recipientName,

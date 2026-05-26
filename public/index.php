@@ -354,7 +354,7 @@ try {
         $stmt->execute(['user_id' => $userId]);
     };
 
-    $createPasswordResetToken = static function (PDO $pdo, string $userId, int $ttlSeconds = 3600) use ($invalidatePasswordResetTokensForUser): string {
+    $createPasswordResetToken = static function (PDO $pdo, string $userId, int $ttlSeconds = PASSWORD_RESET_TTL_SECONDS) use ($invalidatePasswordResetTokensForUser): string {
         $token = bin2hex(random_bytes(32));
         $invalidatePasswordResetTokensForUser($pdo, $userId);
 
@@ -3224,9 +3224,9 @@ try {
         }
 
         try {
-            $token = $createPasswordResetToken($pdo, (string)$targetUser['id']);
+            $token = $createPasswordResetToken($pdo, (string)$targetUser['id'], ACCOUNT_SETUP_TTL_SECONDS);
             $resetUrl = appFrontendUrl() . '/reset-password?token=' . urlencode($token);
-            MailService::sendPasswordResetEmail((string)$targetUser['email'], (string)$targetUser['name'], $resetUrl);
+            MailService::sendPasswordSetupEmail((string)$targetUser['email'], (string)$targetUser['name'], $resetUrl);
 
             $addActivityLog(
                 $pdo,
@@ -5167,7 +5167,7 @@ try {
                 'user_name_snapshot' => $authUser['name'],
             ]);
 
-            $setupToken = $createPasswordResetToken($pdo, $userId, 7 * 24 * 60 * 60);
+            $setupToken = $createPasswordResetToken($pdo, $userId, ACCOUNT_SETUP_TTL_SECONDS);
             $setupUrl = appFrontendUrl() . '/reset-password?token=' . urlencode($setupToken);
             MailService::sendAccountSetupEmail($email, $name, $setupUrl);
 
@@ -5467,9 +5467,9 @@ try {
         }
 
         try {
-            $token = $createPasswordResetToken($pdo, (string)$targetUser['id']);
+            $token = $createPasswordResetToken($pdo, (string)$targetUser['id'], ACCOUNT_SETUP_TTL_SECONDS);
             $resetUrl = appFrontendUrl() . '/reset-password?token=' . urlencode($token);
-            MailService::sendPasswordResetEmail((string)$targetUser['email'], (string)$targetUser['name'], $resetUrl);
+            MailService::sendPasswordSetupEmail((string)$targetUser['email'], (string)$targetUser['name'], $resetUrl);
 
             $addActivityLog(
                 $pdo,

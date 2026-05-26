@@ -13,6 +13,9 @@ if (is_file($composerAutoloadPath)) {
 
 loadEnv(__DIR__ . '/../.env');
 
+const PASSWORD_RESET_TTL_SECONDS = 60 * 60;
+const ACCOUNT_SETUP_TTL_SECONDS = 7 * 24 * 60 * 60;
+
 function loadEnv(string $path): void
 {
     if (!is_file($path) || !is_readable($path)) {
@@ -456,7 +459,7 @@ function passwordResetTokenHash(string $token): string
     return hash_hmac('sha256', $token, authSecret());
 }
 
-function passwordResetExpiresAt(int $ttlSeconds = 3600): string
+function passwordResetExpiresAt(int $ttlSeconds = PASSWORD_RESET_TTL_SECONDS): string
 {
     return gmdate('Y-m-d H:i:s', time() + $ttlSeconds);
 }

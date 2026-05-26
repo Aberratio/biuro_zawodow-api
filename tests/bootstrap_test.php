@@ -80,6 +80,8 @@ test('builds app URLs and password reset helpers from environment', function ():
     assertSame('https://api.example.com', appUrl());
     assertSame('https://panel.example.com', appFrontendUrl());
     assertSame('https://api.example.com/qr-images/pqr_abc.svg', qrCodeImageUrl('pqr_abc'));
+    assertSame(3600, PASSWORD_RESET_TTL_SECONDS);
+    assertSame(604800, ACCOUNT_SETUP_TTL_SECONDS);
     assertSame(hash_hmac('sha256', 'token-1', '0123456789abcdef0123456789abcdef'), passwordResetTokenHash('token-1'));
     assertMatches('/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/', passwordResetExpiresAt(60));
 });
