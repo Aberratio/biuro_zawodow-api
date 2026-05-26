@@ -65,6 +65,7 @@ jobs:
           composer validate --no-check-publish
           composer install --no-dev --prefer-dist --optimize-autoloader --no-interaction
           find public src scripts database/migrations -name '*.php' -print0 | xargs -0 -n1 php -l
+          php scripts/run-tests.php
           mkdir -p artifact
           rsync -a ./ artifact/api/ \
             --exclude='.git' \

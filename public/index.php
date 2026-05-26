@@ -3734,6 +3734,7 @@ try {
         $location = trim((string)($input['location'] ?? ''));
         $officeOpenAt = trim((string)($input['office_open_at'] ?? ''));
         $officeCloseAt = trim((string)($input['office_close_at'] ?? ''));
+        $reopenOffice = (bool)($input['reopen_office'] ?? false);
 
         if ($name === '' || $location === '' || $officeOpenAt === '' || $officeCloseAt === '') {
             jsonResponse(422, ['error' => 'Nazwa, lokalizacja, office_open_at i office_close_at są wymagane']);
@@ -3761,10 +3762,11 @@ try {
         $isCurrentlyOpen = $isEventOfficeOpenNow($event);
         $isKeepingExistingOfficeOpenAt = $existingOfficeOpenAt !== null
             && $normalizedOfficeOpenAt === $existingOfficeOpenAt;
+        $isReopeningFinishedEvent = $reopenOffice && $isEventFinished($event);
         $officeWindowValidationError = $validateEventOfficeWindow(
             $normalizedOfficeOpenAt,
             $normalizedOfficeCloseAt,
-            $isCurrentlyOpen || $isKeepingExistingOfficeOpenAt
+            $isCurrentlyOpen || $isKeepingExistingOfficeOpenAt || $isReopeningFinishedEvent
         );
         if ($officeWindowValidationError !== null) {
             jsonResponse(422, ['error' => $officeWindowValidationError]);
