@@ -2881,6 +2881,129 @@ try {
         exit;
     }
 
+    if ($path === '/superadmin/database' && $method === 'GET') {
+        requireAnyRole(['superadmin'], $resolveAuthenticatedUser);
+
+        $databaseNameRow = $pdo->query('SELECT DATABASE() AS database_name')->fetch();
+        $databaseName = trim((string)($databaseNameRow['database_name'] ?? ''));
+        if ($databaseName === '') {
+            jsonResponse(500, ['error' => 'Nie udało się ustalić aktywnej bazy danych']);
+            exit;
+        }
+
+        $tablesStmt = $pdo->prepare('
+            SELECT
+                TABLE_NAME AS name,
+                TABLE_ROWS AS row_estimate
+            FROM information_schema.TABLES
+            WHERE TABLE_SCHEMA = :schema
+              AND TABLE_TYPE = :table_type
+            ORDER BY TABLE_NAME ASC
+        ');
+        $tablesStmt->execute([
+            'schema' => $databaseName,
+            'table_type' => 'BASE TABLE',
+        ]);
+        $tables = array_map(static function (array $row): array {
+            return [
+                'name' => (string)$row['name'],
+                'row_estimate' => isset($row['row_estimate']) ? (int)$row['row_estimate'] : null,
+            ];
+        }, $tablesStmt->fetchAll());
+
+        $tableNames = array_map(static fn(array $table): string => (string)$table['name'], $tables);
+        $selectedTable = trim((string)($_GET['table'] ?? ''));
+        $page = max(1, (int)($_GET['page'] ?? 1));
+        $limit = max(1, min(500, (int)($_GET['limit'] ?? 100)));
+
+        if ($selectedTable === '') {
+            jsonResponse(200, [
+                'database' => $databaseName,
+                'tables' => $tables,
+                'columns' => [],
+                'rows' => [],
+                'meta' => [
+                    'selected_table' => null,
+                    'page' => 1,
+                    'per_page' => $limit,
+                    'total' => 0,
+                    'total_pages' => 1,
+                ],
+            ]);
+            exit;
+        }
+
+        if (!in_array($selectedTable, $tableNames, true)) {
+            jsonResponse(404, ['error' => 'Nie znaleziono tabeli']);
+            exit;
+        }
+
+        $columnsStmt = $pdo->prepare('
+            SELECT
+                COLUMN_NAME AS name,
+                COLUMN_TYPE AS type,
+                IS_NULLABLE AS is_nullable,
+                COLUMN_KEY AS column_key,
+                COLUMN_DEFAULT AS column_default,
+                EXTRA AS extra
+            FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = :schema
+              AND TABLE_NAME = :table_name
+            ORDER BY ORDINAL_POSITION ASC
+        ');
+        $columnsStmt->execute([
+            'schema' => $databaseName,
+            'table_name' => $selectedTable,
+        ]);
+        $columns = array_map(static function (array $row): array {
+            return [
+                'name' => (string)$row['name'],
+                'type' => (string)$row['type'],
+                'nullable' => (string)$row['is_nullable'] === 'YES',
+                'key' => (string)($row['column_key'] ?? ''),
+                'default' => isset($row['column_default']) ? (string)$row['column_default'] : null,
+                'extra' => (string)($row['extra'] ?? ''),
+            ];
+        }, $columnsStmt->fetchAll());
+
+        $quoteIdentifier = static fn(string $identifier): string => '`' . str_replace('`', '``', $identifier) . '`';
+        $quotedTable = $quoteIdentifier($selectedTable);
+        $totalRows = (int)(($pdo->query("SELECT COUNT(*) AS total FROM {$quotedTable}")->fetch()['total'] ?? 0));
+        $totalPages = max(1, (int)ceil($totalRows / $limit));
+        $page = min($page, $totalPages);
+        $offset = ($page - 1) * $limit;
+
+        $primaryKeyColumns = array_values(array_filter(
+            $columns,
+            static fn(array $column): bool => (string)($column['key'] ?? '') === 'PRI'
+        ));
+        $orderSql = '';
+        if ($primaryKeyColumns !== []) {
+            $orderColumns = array_map(
+                static fn(array $column): string => $quoteIdentifier((string)$column['name']) . ' ASC',
+                $primaryKeyColumns
+            );
+            $orderSql = ' ORDER BY ' . implode(', ', $orderColumns);
+        }
+
+        $rowsStmt = $pdo->query("SELECT * FROM {$quotedTable}{$orderSql} LIMIT {$limit} OFFSET {$offset}");
+
+        jsonResponse(200, [
+            'database' => $databaseName,
+            'tables' => $tables,
+            'columns' => $columns,
+            'rows' => $rowsStmt->fetchAll(),
+            'meta' => [
+                'selected_table' => $selectedTable,
+                'page' => $page,
+                'per_page' => $limit,
+                'total' => $totalRows,
+                'total_pages' => $totalPages,
+            ],
+        ]);
+        exit;
+    }
+
     if ($path === '/superadmin/audit' && $method === 'GET') {
         requireAnyRole(['superadmin'], $resolveAuthenticatedUser);
 
