@@ -5149,6 +5149,14 @@ try {
             is_array($input['assigned_events'] ?? null) ? $input['assigned_events'] : [],
             static fn(mixed $eventId): bool => is_string($eventId) && trim($eventId) !== ''
         ));
+        $manualPassword = $input['password'] ?? null;
+
+        if ($manualPassword !== null && !is_string($manualPassword)) {
+            jsonResponse(422, ['error' => 'Haslo musi byc tekstem']);
+            exit;
+        }
+
+        $manualPassword = is_string($manualPassword) ? $manualPassword : '';
 
         if ($name === '' || $email === '' || $role === '') {
             jsonResponse(422, ['error' => 'Nazwa, adres e-mail i rola są wymagane']);
@@ -5158,6 +5166,14 @@ try {
         if (!isValidEmailAddress($email)) {
             jsonResponse(422, ['error' => 'Adres e-mail musi być prawidłowy']);
             exit;
+        }
+
+        if ($manualPassword !== '') {
+            $passwordValidationError = validatePasswordRules($manualPassword);
+            if ($passwordValidationError !== null) {
+                jsonResponse(422, ['error' => $passwordValidationError]);
+                exit;
+            }
         }
 
         $allowedRolesByCreator = [
@@ -5223,7 +5239,10 @@ try {
         }
 
         $userId = 'u-' . bin2hex(random_bytes(8));
-        $passwordHash = password_hash(bin2hex(random_bytes(24)), PASSWORD_DEFAULT);
+        $passwordHash = password_hash(
+            $manualPassword !== '' ? $manualPassword : bin2hex(random_bytes(24)),
+            PASSWORD_DEFAULT
+        );
 
         $pdo->beginTransaction();
 
@@ -5290,9 +5309,11 @@ try {
                 'user_name_snapshot' => $authUser['name'],
             ]);
 
-            $setupToken = $createPasswordResetToken($pdo, $userId, ACCOUNT_SETUP_TTL_SECONDS);
-            $setupUrl = appFrontendUrl() . '/reset-password?token=' . urlencode($setupToken);
-            MailService::sendAccountSetupEmail($email, $name, $setupUrl);
+            if ($manualPassword === '') {
+                $setupToken = $createPasswordResetToken($pdo, $userId, ACCOUNT_SETUP_TTL_SECONDS);
+                $setupUrl = appFrontendUrl() . '/reset-password?token=' . urlencode($setupToken);
+                MailService::sendAccountSetupEmail($email, $name, $setupUrl);
+            }
 
             $pdo->commit();
         } catch (Throwable $exception) {
@@ -5555,6 +5576,72 @@ try {
                     (string)$authUser['name']
                 );
             }
+
+            $pdo->commit();
+        } catch (Throwable $exception) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+
+            throw $exception;
+        }
+
+        jsonResponse(200, ['data' => $loadUserById($pdo, $userId)]);
+        exit;
+    }
+
+    if (preg_match('#^/users/([^/]+)/password$#', $path, $matches) === 1 && $method === 'PATCH') {
+        $authUser = requireAnyRole(['superadmin', 'admin'], $resolveAuthenticatedUser);
+        $userId = (string)$matches[1];
+        $input = readJsonBody();
+        $password = $input['password'] ?? null;
+
+        if (!is_string($password) || $password === '') {
+            jsonResponse(422, ['error' => 'Hasło jest wymagane']);
+            exit;
+        }
+
+        $passwordValidationError = validatePasswordRules($password);
+        if ($passwordValidationError !== null) {
+            jsonResponse(422, ['error' => $passwordValidationError]);
+            exit;
+        }
+
+        $targetUser = $loadUserById($pdo, $userId);
+        if ($targetUser === false) {
+            jsonResponse(404, ['error' => 'Nie znaleziono użytkownika']);
+            exit;
+        }
+
+        if (!$canManageTargetUser($authUser, $targetUser)) {
+            jsonResponse(403, ['error' => 'Brak uprawnień']);
+            exit;
+        }
+
+        if (!in_array((string)($targetUser['role'] ?? ''), ['editor', 'scanner', 'scanner_plus'], true)) {
+            jsonResponse(422, ['error' => 'Hasło można ustawić ręcznie tylko dla kont organizatorów i operatorów']);
+            exit;
+        }
+
+        $pdo->beginTransaction();
+
+        try {
+            $updatePasswordStmt = $pdo->prepare('UPDATE users SET password = :password WHERE id = :id');
+            $updatePasswordStmt->execute([
+                'password' => password_hash($password, PASSWORD_DEFAULT),
+                'id' => $userId,
+            ]);
+
+            $invalidatePasswordResetTokensForUser($pdo, $userId);
+            $addActivityLog(
+                $pdo,
+                sprintf('Ustawiono haslo recznie dla uzytkownika: %s', (string)$targetUser['name']),
+                null,
+                null,
+                null,
+                (string)$authUser['id'],
+                (string)$authUser['name']
+            );
 
             $pdo->commit();
         } catch (Throwable $exception) {
