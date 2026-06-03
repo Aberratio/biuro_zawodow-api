@@ -2247,6 +2247,263 @@ try {
         }
     };
 
+    $normalizeMappingDisplayOrder = static function (mixed $value, int $fallback): int {
+        if (is_int($value)) {
+            return max(0, $value);
+        }
+
+        if (is_string($value) && preg_match('/^\d+$/', $value) === 1) {
+            return max(0, (int)$value);
+        }
+
+        return $fallback;
+    };
+
+    $encodeRenamedCustomFields = static function (?string $customFieldsJson, string $oldAlias, string $newAlias) use ($participantImportantFieldsMetaKey, $normalizeParticipantImportantFieldAliases): array {
+        $decodedCustomFields = decodeJsonObject($customFieldsJson);
+        if ($decodedCustomFields === [] || $oldAlias === $newAlias) {
+            return [$customFieldsJson, false, null];
+        }
+
+        $changed = false;
+        if (array_key_exists($oldAlias, $decodedCustomFields)) {
+            if (array_key_exists($newAlias, $decodedCustomFields)) {
+                return [null, false, sprintf('Nie można zmienić aliasu "%s" na "%s", bo uczestnik ma już dane pod nową nazwą.', $oldAlias, $newAlias)];
+            }
+
+            $decodedCustomFields[$newAlias] = $decodedCustomFields[$oldAlias];
+            unset($decodedCustomFields[$oldAlias]);
+            $changed = true;
+        }
+
+        $importantAliases = $normalizeParticipantImportantFieldAliases(
+            is_array($decodedCustomFields[$participantImportantFieldsMetaKey] ?? null)
+                ? $decodedCustomFields[$participantImportantFieldsMetaKey]
+                : []
+        );
+        if ($importantAliases !== []) {
+            $renamedAliases = array_values(array_unique(array_map(
+                static fn(string $alias): string => $alias === $oldAlias ? $newAlias : $alias,
+                $importantAliases
+            )));
+            if ($renamedAliases !== $importantAliases) {
+                $changed = true;
+            }
+
+            if ($renamedAliases !== []) {
+                $decodedCustomFields[$participantImportantFieldsMetaKey] = $renamedAliases;
+            } else {
+                unset($decodedCustomFields[$participantImportantFieldsMetaKey]);
+            }
+        }
+
+        if (!$changed) {
+            return [$customFieldsJson, false, null];
+        }
+
+        return [$decodedCustomFields !== [] ? encodeJsonValue($decodedCustomFields) : null, true, null];
+    };
+
+    $renameParticipantMappingAliasReferences = static function (PDO $pdo, string $eventId, string $oldAlias, string $newAlias) use ($encodeRenamedCustomFields): ?string {
+        if ($oldAlias === $newAlias) {
+            return null;
+        }
+
+        $participantStmt = $pdo->prepare('
+            SELECT id, custom_fields_json
+            FROM participants
+            WHERE event_id = :event_id
+        ');
+        $participantStmt->execute(['event_id' => $eventId]);
+        $participantUpdates = [];
+        foreach ($participantStmt->fetchAll() as $participantRow) {
+            [$encodedCustomFields, $changed, $error] = $encodeRenamedCustomFields(
+                isset($participantRow['custom_fields_json']) ? (string)$participantRow['custom_fields_json'] : null,
+                $oldAlias,
+                $newAlias
+            );
+            if ($error !== null) {
+                return $error;
+            }
+
+            if ($changed) {
+                $participantUpdates[] = [
+                    'id' => (int)$participantRow['id'],
+                    'custom_fields_json' => $encodedCustomFields,
+                ];
+            }
+        }
+
+        $baselineStmt = $pdo->prepare('
+            SELECT id, custom_fields_json
+            FROM event_participant_import_baseline_records
+            WHERE event_id = :event_id
+        ');
+        $baselineStmt->execute(['event_id' => $eventId]);
+        $baselineUpdates = [];
+        foreach ($baselineStmt->fetchAll() as $baselineRow) {
+            [$encodedCustomFields, $changed, $error] = $encodeRenamedCustomFields(
+                isset($baselineRow['custom_fields_json']) ? (string)$baselineRow['custom_fields_json'] : null,
+                $oldAlias,
+                $newAlias
+            );
+            if ($error !== null) {
+                return $error;
+            }
+
+            if ($changed) {
+                $baselineUpdates[] = [
+                    'id' => (int)$baselineRow['id'],
+                    'custom_fields_json' => $encodedCustomFields,
+                ];
+            }
+        }
+
+        $updateParticipantStmt = $pdo->prepare('
+            UPDATE participants
+            SET custom_fields_json = :custom_fields_json
+            WHERE id = :id
+        ');
+        foreach ($participantUpdates as $update) {
+            $updateParticipantStmt->bindValue(':id', $update['id'], PDO::PARAM_INT);
+            $updateParticipantStmt->bindValue(':custom_fields_json', $update['custom_fields_json'], $update['custom_fields_json'] === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
+            $updateParticipantStmt->execute();
+        }
+
+        $updateBaselineStmt = $pdo->prepare('
+            UPDATE event_participant_import_baseline_records
+            SET custom_fields_json = :custom_fields_json
+            WHERE id = :id
+        ');
+        foreach ($baselineUpdates as $update) {
+            $updateBaselineStmt->bindValue(':id', $update['id'], PDO::PARAM_INT);
+            $updateBaselineStmt->bindValue(':custom_fields_json', $update['custom_fields_json'], $update['custom_fields_json'] === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
+            $updateBaselineStmt->execute();
+        }
+
+        return null;
+    };
+
+    $buildParticipantFieldMappingUpdatesFromInput = static function (array $existingMappings, array $input) use ($normalizeMappingDisplayOrder): array {
+        $inputMappings = is_array($input['mappings'] ?? null) ? $input['mappings'] : [];
+        if ($inputMappings === []) {
+            return [null, 'Pole mappings jest wymagane'];
+        }
+
+        $existingBySourceColumn = [];
+        foreach ($existingMappings as $mapping) {
+            $existingBySourceColumn[(string)$mapping['source_column_name']] = $mapping;
+        }
+
+        $updatesBySourceColumn = [];
+        $seenInputSourceColumns = [];
+        foreach ($inputMappings as $index => $inputMapping) {
+            if (!is_array($inputMapping)) {
+                continue;
+            }
+
+            $sourceColumnName = trim((string)($inputMapping['source_column_name'] ?? ''));
+            if ($sourceColumnName === '' || !isset($existingBySourceColumn[$sourceColumnName])) {
+                return [null, sprintf('Nie można dodać ani zmienić kolumny źródłowej "%s"', $sourceColumnName)];
+            }
+
+            if (isset($seenInputSourceColumns[$sourceColumnName])) {
+                return [null, sprintf('Kolumna "%s" występuje w żądaniu więcej niż raz', $sourceColumnName)];
+            }
+            $seenInputSourceColumns[$sourceColumnName] = true;
+
+            $existingMapping = $existingBySourceColumn[$sourceColumnName];
+            $currentRole = (string)$existingMapping['field_role'];
+            $nextRole = trim((string)($inputMapping['field_role'] ?? $currentRole));
+            $nextAlias = trim((string)($inputMapping['alias'] ?? $existingMapping['alias']));
+            $nextIsActive = array_key_exists('is_active', $inputMapping)
+                ? (bool)$inputMapping['is_active']
+                : (bool)$existingMapping['is_active'];
+            $nextIsRequired = array_key_exists('is_required', $inputMapping)
+                ? (bool)$inputMapping['is_required']
+                : (bool)$existingMapping['is_required'];
+            $nextDisplayOrder = $normalizeMappingDisplayOrder($inputMapping['display_order'] ?? null, $index + 1);
+
+            if ($currentRole === 'email') {
+                if ($nextRole !== 'email' || $nextAlias !== (string)$existingMapping['alias'] || !$nextIsActive || !$nextIsRequired) {
+                    return [null, 'Mapowanie e-mail jest systemowe i nie może być zmieniane'];
+                }
+
+                $updatesBySourceColumn[$sourceColumnName] = [
+                    ...$existingMapping,
+                    'display_order' => 0,
+                    'is_required' => true,
+                    'is_active' => true,
+                ];
+                continue;
+            }
+
+            if ($nextAlias === '') {
+                return [null, sprintf('Alias jest wymagany dla kolumny "%s"', $sourceColumnName)];
+            }
+
+            if (strlen($nextAlias) > 190) {
+                return [null, sprintf('Alias dla kolumny "%s" jest zbyt długi', $sourceColumnName)];
+            }
+
+            if (in_array($currentRole, ['custom', 'important_custom'], true)) {
+                if (!in_array($nextRole, ['custom', 'important_custom'], true)) {
+                    return [null, sprintf('Kolumnę "%s" można przełączać tylko między rolą pola dodatkowego i wyróżnionego pola dodatkowego', $sourceColumnName)];
+                }
+            } elseif ($nextRole !== $currentRole) {
+                return [null, sprintf('Rola systemowa kolumny "%s" nie może być zmieniana', $sourceColumnName)];
+            }
+
+            if (!$nextIsActive) {
+                $nextIsRequired = false;
+            } elseif ($nextRole === 'display_name_part') {
+                $nextIsRequired = true;
+            }
+
+            $updatesBySourceColumn[$sourceColumnName] = [
+                'source_column_name' => $sourceColumnName,
+                'alias' => $nextAlias,
+                'field_role' => $nextRole,
+                'display_order' => $nextDisplayOrder,
+                'is_required' => $nextIsRequired,
+                'is_active' => $nextIsActive,
+            ];
+        }
+
+        foreach ($existingMappings as $existingMapping) {
+            $sourceColumnName = (string)$existingMapping['source_column_name'];
+            if (!isset($updatesBySourceColumn[$sourceColumnName])) {
+                $updatesBySourceColumn[$sourceColumnName] = $existingMapping;
+            }
+        }
+
+        $activeDisplayNamePartCount = 0;
+        $activeAliases = [];
+        foreach ($updatesBySourceColumn as $mapping) {
+            if (!($mapping['is_active'] ?? false) || ($mapping['field_role'] ?? '') === 'email') {
+                continue;
+            }
+
+            if (($mapping['field_role'] ?? '') === 'display_name_part') {
+                $activeDisplayNamePartCount++;
+            }
+
+            $normalizedAlias = strtolower(trim((string)$mapping['alias']));
+            if ($normalizedAlias !== '') {
+                if (isset($activeAliases[$normalizedAlias])) {
+                    return [null, sprintf('Alias "%s" jest użyty więcej niż raz w aktywnym mapowaniu', (string)$mapping['alias'])];
+                }
+                $activeAliases[$normalizedAlias] = true;
+            }
+        }
+
+        if ($activeDisplayNamePartCount === 0) {
+            return [null, 'Mapowanie musi zawierać co najmniej jedną aktywną kolumnę budującą nazwę uczestnika'];
+        }
+
+        return [array_values($updatesBySourceColumn), null];
+    };
+
     $findParticipantEmailMapping = static function (array $mappings): ?array {
         foreach ($mappings as $mapping) {
             if (($mapping['field_role'] ?? '') === 'email') {
@@ -5100,6 +5357,115 @@ try {
         if (!$canManageEventParticipants($authUser, $event)) {
             jsonResponse(403, ['error' => 'Brak uprawnień']);
             exit;
+        }
+
+        $mappings = $loadParticipantFieldMappings($pdo, $eventId);
+        $mappingState = $loadParticipantFieldMappingState($pdo, $eventId);
+        jsonResponse(200, [
+            'data' => [
+                'has_mapping' => $mappingState['has_mapping'],
+                'has_baseline_import' => $mappingState['has_baseline_import'],
+                'mappings' => $mappings,
+            ],
+        ]);
+        exit;
+    }
+
+    if (preg_match('#^/events/([^/]+)/participant-field-mappings$#', $path, $matches) === 1 && $method === 'PATCH') {
+        $authUser = requireAnyRole(['superadmin'], $resolveAuthenticatedUser);
+        $eventId = (string)$matches[1];
+        $event = $loadEventById($pdo, $eventId);
+
+        if ($event === false) {
+            jsonResponse(404, ['error' => 'Nie znaleziono wydarzenia']);
+            exit;
+        }
+
+        if ($isDeletedEvent($event)) {
+            jsonResponse(403, ['error' => 'Nie można zmieniać mapowania usuniętego wydarzenia']);
+            exit;
+        }
+
+        $existingMappings = $loadParticipantFieldMappings($pdo, $eventId);
+        if ($existingMappings === []) {
+            jsonResponse(404, ['error' => 'To wydarzenie nie ma jeszcze zapisanego mapowania pól uczestnika']);
+            exit;
+        }
+
+        $input = readJsonBody();
+        [$mappingUpdates, $mappingError] = $buildParticipantFieldMappingUpdatesFromInput($existingMappings, $input);
+        if ($mappingError !== null || $mappingUpdates === null) {
+            jsonResponse(422, ['error' => $mappingError ?? 'Nieprawidłowe mapowanie pól uczestnika']);
+            exit;
+        }
+
+        $existingMappingsBySourceColumn = [];
+        foreach ($existingMappings as $mapping) {
+            $existingMappingsBySourceColumn[(string)$mapping['source_column_name']] = $mapping;
+        }
+
+        $pdo->beginTransaction();
+
+        try {
+            foreach ($mappingUpdates as $mappingUpdate) {
+                $sourceColumnName = (string)$mappingUpdate['source_column_name'];
+                $existingMapping = $existingMappingsBySourceColumn[$sourceColumnName] ?? null;
+                if (is_array($existingMapping)) {
+                    $aliasError = $renameParticipantMappingAliasReferences(
+                        $pdo,
+                        $eventId,
+                        (string)$existingMapping['alias'],
+                        (string)$mappingUpdate['alias']
+                    );
+                    if ($aliasError !== null) {
+                        $pdo->rollBack();
+                        jsonResponse(409, ['error' => $aliasError]);
+                        exit;
+                    }
+                }
+            }
+
+            $updateMappingStmt = $pdo->prepare('
+                UPDATE event_participant_field_mappings
+                SET
+                    alias = :alias,
+                    field_role = :field_role,
+                    display_order = :display_order,
+                    is_required = :is_required,
+                    is_active = :is_active
+                WHERE event_id = :event_id
+                  AND source_column_name = :source_column_name
+            ');
+
+            foreach ($mappingUpdates as $mappingUpdate) {
+                $updateMappingStmt->execute([
+                    'event_id' => $eventId,
+                    'source_column_name' => $mappingUpdate['source_column_name'],
+                    'alias' => $mappingUpdate['alias'],
+                    'field_role' => $mappingUpdate['field_role'],
+                    'display_order' => (int)$mappingUpdate['display_order'],
+                    'is_required' => $mappingUpdate['is_required'] ? 1 : 0,
+                    'is_active' => $mappingUpdate['is_active'] ? 1 : 0,
+                ]);
+            }
+
+            $addActivityLog(
+                $pdo,
+                'Zaktualizowano mapowanie pól uczestników dla wydarzenia',
+                $eventId,
+                null,
+                null,
+                (string)$authUser['id'],
+                (string)$authUser['name']
+            );
+
+            $pdo->commit();
+        } catch (Throwable $exception) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+
+            throw $exception;
         }
 
         $mappings = $loadParticipantFieldMappings($pdo, $eventId);

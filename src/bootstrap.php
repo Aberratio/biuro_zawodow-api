@@ -1192,7 +1192,7 @@ function openApiDocument(): array
                             ],
                         ],
                         '403' => [
-                            '$ref' => '#/components/responses/Brak uprawnieĹ„',
+                            '$ref' => '#/components/responses/Brak uprawnień',
                         ],
                         '404' => [
                             '$ref' => '#/components/responses/NotFound',
@@ -1444,7 +1444,7 @@ function openApiDocument(): array
                             ],
                         ],
                         '403' => [
-                            '$ref' => '#/components/responses/Brak uprawnieĹ„',
+                            '$ref' => '#/components/responses/Brak uprawnień',
                         ],
                         '404' => [
                             '$ref' => '#/components/responses/NotFound',
@@ -1492,7 +1492,7 @@ function openApiDocument(): array
                             ],
                         ],
                         '403' => [
-                            '$ref' => '#/components/responses/Brak uprawnieĹ„',
+                            '$ref' => '#/components/responses/Brak uprawnień',
                         ],
                         '404' => [
                             '$ref' => '#/components/responses/NotFound',
@@ -1542,6 +1542,60 @@ function openApiDocument(): array
                         ],
                         '401' => [
                             '$ref' => '#/components/responses/Brak autoryzacji',
+                        ],
+                    ],
+                ],
+                'patch' => [
+                    'tags' => ['Events'],
+                    'summary' => 'Update saved participant field mapping for event',
+                    'security' => [
+                        ['bearerAuth' => []],
+                    ],
+                    'parameters' => [
+                        [
+                            'name' => 'id',
+                            'in' => 'path',
+                            'required' => true,
+                            'schema' => [
+                                'type' => 'string',
+                            ],
+                        ],
+                    ],
+                    'requestBody' => [
+                        'required' => true,
+                        'content' => [
+                            'application/json' => [
+                                'schema' => [
+                                    '$ref' => '#/components/schemas/ParticipantFieldMappingsUpdateRequest',
+                                ],
+                            ],
+                        ],
+                    ],
+                    'responses' => [
+                        '200' => [
+                            'description' => 'Updated mapping',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => [
+                                        '$ref' => '#/components/schemas/ParticipantFieldMappingsResponse',
+                                    ],
+                                ],
+                            ],
+                        ],
+                        '401' => [
+                            '$ref' => '#/components/responses/Brak autoryzacji',
+                        ],
+                        '403' => [
+                            '$ref' => '#/components/responses/Brak uprawnień',
+                        ],
+                        '404' => [
+                            '$ref' => '#/components/responses/NotFound',
+                        ],
+                        '409' => [
+                            '$ref' => '#/components/responses/Conflict',
+                        ],
+                        '422' => [
+                            '$ref' => '#/components/responses/BadRequest',
                         ],
                     ],
                 ],
@@ -3507,6 +3561,16 @@ function openApiDocument(): array
                                     'items' => ['$ref' => '#/components/schemas/ParticipantFieldMapping'],
                                 ],
                             ],
+                        ],
+                    ],
+                ],
+                'ParticipantFieldMappingsUpdateRequest' => [
+                    'type' => 'object',
+                    'required' => ['mappings'],
+                    'properties' => [
+                        'mappings' => [
+                            'type' => 'array',
+                            'items' => ['$ref' => '#/components/schemas/ParticipantFieldMapping'],
                         ],
                     ],
                 ],

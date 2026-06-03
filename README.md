@@ -212,6 +212,7 @@ The full and current contract lives in Swagger. The most important route groups 
   - `POST /events/{id}/participant-imports/confirm`
   - `POST /events/{id}/participant-imports/run`
   - `GET /events/{id}/participant-field-mappings`
+  - `PATCH /events/{id}/participant-field-mappings`
   - `POST /events/{id}/participants/manual`
   - `POST /events/{id}/send-qr-emails`
 - users:

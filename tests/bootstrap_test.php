@@ -96,6 +96,7 @@ test('documents critical API paths in the generated OpenAPI document', function 
         '/bootstrap',
         '/events/{id}/participant-imports/analyze',
         '/events/{id}/participant-imports/run',
+        '/events/{id}/participant-field-mappings',
         '/participants/scan',
         '/participants/{id}/check-in',
         '/participants/{id}/undo-check-in',
