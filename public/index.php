@@ -3374,6 +3374,111 @@ try {
         exit;
     }
 
+    if (preg_match('#^/superadmin/users/([^/]+)/role$#', $path, $matches) === 1 && $method === 'PATCH') {
+        $authUser = requireAnyRole(['superadmin'], $resolveAuthenticatedUser);
+        $userId = (string)$matches[1];
+        $input = readJsonBody();
+        $role = trim((string)($input['role'] ?? ''));
+        $organizationId = trim((string)($input['organization_id'] ?? ''));
+
+        if ($role === '') {
+            jsonResponse(422, ['error' => 'Rola jest wymagana']);
+            exit;
+        }
+
+        if (!in_array($role, ['admin', 'editor', 'scanner', 'scanner_plus'], true)) {
+            jsonResponse(422, ['error' => 'Nieprawidlowa rola']);
+            exit;
+        }
+
+        $targetUser = $loadUserById($pdo, $userId);
+        if ($targetUser === false) {
+            jsonResponse(404, ['error' => 'Nie znaleziono uzytkownika']);
+            exit;
+        }
+
+        if ((string)($targetUser['role'] ?? '') === 'superadmin') {
+            jsonResponse(422, ['error' => 'Nie mozna zmienic roli superadmina']);
+            exit;
+        }
+
+        if (!$canManageTargetUser($authUser, $targetUser)) {
+            jsonResponse(403, ['error' => 'Brak uprawnien']);
+            exit;
+        }
+
+        if ($role !== 'admin') {
+            if ($organizationId === '') {
+                jsonResponse(422, ['error' => 'Dla tej roli pole organization_id jest wymagane']);
+                exit;
+            }
+
+            if ($loadOrganizationById($pdo, $organizationId) === false) {
+                jsonResponse(422, ['error' => 'Nie znaleziono organizacji']);
+                exit;
+            }
+        } else {
+            $organizationId = '';
+        }
+
+        $currentRole = (string)($targetUser['role'] ?? '');
+        $currentOrganizationId = trim((string)($targetUser['organization_id'] ?? ''));
+        $preserveScannerAssignments =
+            $isScannerRole($currentRole)
+            && $isScannerRole($role)
+            && $currentOrganizationId !== ''
+            && $currentOrganizationId === $organizationId;
+
+        $pdo->beginTransaction();
+
+        try {
+            $updateStmt = $pdo->prepare('
+                UPDATE users
+                SET role = :role,
+                    organization_id = :organization_id
+                WHERE id = :id
+            ');
+            $updateStmt->execute([
+                'role' => $role,
+                'organization_id' => $role === 'admin' ? null : $organizationId,
+                'id' => $userId,
+            ]);
+
+            if (!$preserveScannerAssignments || !$isScannerRole($role)) {
+                $deleteAssignmentsStmt = $pdo->prepare('DELETE FROM user_event_assignments WHERE user_id = :user_id');
+                $deleteAssignmentsStmt->execute(['user_id' => $userId]);
+            }
+
+            if ($currentRole !== $role || $currentOrganizationId !== $organizationId) {
+                $addActivityLog(
+                    $pdo,
+                    sprintf(
+                        'Zmieniono role uzytkownika %s z %s na %s',
+                        (string)$targetUser['name'],
+                        $currentRole,
+                        $role
+                    ),
+                    null,
+                    null,
+                    null,
+                    (string)$authUser['id'],
+                    (string)$authUser['name']
+                );
+            }
+
+            $pdo->commit();
+        } catch (Throwable $exception) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+
+            throw $exception;
+        }
+
+        jsonResponse(200, ['data' => $loadUserById($pdo, $userId)]);
+        exit;
+    }
+
     if (preg_match('#^/superadmin/admins/([^/]+)$#', $path, $matches) === 1 && $method === 'DELETE') {
         $authUser = requireAnyRole(['superadmin'], $resolveAuthenticatedUser);
         $userId = (string)$matches[1];
