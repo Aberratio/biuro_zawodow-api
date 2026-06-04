@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 require_once __DIR__ . '/../src/bootstrap.php';
 
+registerApplicationLogging();
 setCorsHeaders();
 validateServerSecurityConfiguration();
 
@@ -828,6 +829,20 @@ try {
             'participant_name_snapshot' => $participantName,
             'user_id' => $userId,
             'user_name_snapshot' => $userName,
+        ]);
+
+        addAuditLog($pdo, [
+            'action' => $action,
+            'actor_user_id' => $userId,
+            'actor_name' => $userName,
+            'event_id' => $eventId,
+            'participant_id' => $participantId,
+            'target_type' => $participantId !== null ? 'participant' : ($eventId !== null ? 'event' : null),
+            'target_id' => $participantId !== null ? (string)$participantId : $eventId,
+            'metadata' => [
+                'participant_name' => $participantName,
+                'legacy_activity_log' => true,
+            ],
         ]);
     };
 
@@ -1705,9 +1720,26 @@ try {
         ?string $userId = null,
         ?string $userName = null
     ): void {
+        $auditLogId = addAuditLog($pdo, [
+            'category' => 'participants',
+            'action_code' => 'participant.change.' . $changeType,
+            'action' => 'Zmiana uczestnika: ' . $changeType,
+            'actor_user_id' => $userId,
+            'actor_name' => $userName,
+            'target_type' => 'participant',
+            'target_id' => $participantId !== null ? (string)$participantId : $participantAuditKey,
+            'event_id' => $eventId,
+            'participant_id' => $participantId,
+            'metadata' => [
+                'change_source' => $changeSource,
+                'changed_fields' => array_values($changedFields),
+                'participant_audit_key' => $participantAuditKey,
+            ],
+        ]);
         $stmt = $pdo->prepare('
             INSERT INTO event_participant_change_logs (
                 id,
+                audit_log_id,
                 event_id,
                 participant_audit_key,
                 baseline_record_id,
@@ -1721,6 +1753,7 @@ try {
                 user_name_snapshot
             ) VALUES (
                 :id,
+                :audit_log_id,
                 :event_id,
                 :participant_audit_key,
                 :baseline_record_id,
@@ -1735,6 +1768,7 @@ try {
             )
         ');
         $stmt->bindValue(':id', 'pcl-' . bin2hex(random_bytes(8)));
+        $stmt->bindValue(':audit_log_id', $auditLogId);
         $stmt->bindValue(':event_id', $eventId);
         $stmt->bindValue(':participant_audit_key', $participantAuditKey);
         $stmt->bindValue(':baseline_record_id', $baselineRecordId, $baselineRecordId === null ? PDO::PARAM_NULL : PDO::PARAM_INT);
@@ -2877,6 +2911,16 @@ try {
         $password = (string)($input['password'] ?? '');
         $loginRateLimit = $consumeRateLimitAttempt($pdo, 'auth_login', 5, 900, $email);
         if (!$loginRateLimit['allowed']) {
+            addAuditLog($pdo, [
+                'category' => 'authentication',
+                'action_code' => 'auth.login.rate_limited',
+                'action' => 'Zablokowano probe logowania przez limit',
+                'outcome' => 'blocked',
+                'severity' => 'warning',
+                'target_type' => 'user_email',
+                'target_id' => $email !== '' ? hash_hmac('sha256', $email, authSecret()) : null,
+                'metadata' => ['retry_after' => (int)$loginRateLimit['retry_after']],
+            ]);
             jsonResponse(429, [
                 'error' => 'Zbyt wiele prób logowania. Spróbuj ponownie później.',
                 'retry_after' => (int)$loginRateLimit['retry_after'],
@@ -2892,6 +2936,15 @@ try {
         $user = $loadUserWithPasswordByEmail($pdo, $email);
 
         if ($user === false || !passwordMatches($password, (string)$user['password'])) {
+            addAuditLog($pdo, [
+                'category' => 'authentication',
+                'action_code' => 'auth.login.failed',
+                'action' => 'Nieudana proba logowania',
+                'outcome' => 'failure',
+                'severity' => 'warning',
+                'target_type' => 'user_email',
+                'target_id' => $email !== '' ? hash_hmac('sha256', $email, authSecret()) : null,
+            ]);
             jsonResponse(401, ['error' => 'Nieprawidłowy adres e-mail lub hasło']);
             exit;
         }
@@ -2908,6 +2961,7 @@ try {
         $user['assigned_events'] = $isScannerRole((string)$user['role'])
             ? $loadAssignedEvents($pdo, (string)$user['id'])
             : [];
+        RequestContext::setUser($user);
         $addActivityLog(
             $pdo,
             sprintf('Zalogowano użytkownika: %s (%s)', (string)$user['name'], (string)$user['email']),
@@ -3010,6 +3064,15 @@ try {
             ]);
 
             $markPasswordResetTokensUsed($pdo, (string)$passwordReset['user_id']);
+            addAuditLog($pdo, [
+                'category' => 'authentication',
+                'action_code' => 'auth.password_reset.completed',
+                'action' => 'Zmieniono haslo przez link resetu',
+                'actor_user_id' => $passwordReset['user_id'],
+                'actor_name' => $passwordReset['name'] ?? null,
+                'target_type' => 'user',
+                'target_id' => $passwordReset['user_id'],
+            ]);
             $pdo->commit();
         } catch (Throwable $exception) {
             if ($pdo->inTransaction()) {
@@ -3066,6 +3129,16 @@ try {
             ]);
 
             $markPasswordResetTokensUsed($pdo, (string)$authUser['id']);
+            addAuditLog($pdo, [
+                'category' => 'authentication',
+                'action_code' => 'auth.password_change.completed',
+                'action' => 'Uzytkownik zmienil swoje haslo',
+                'actor_user_id' => $authUser['id'],
+                'actor_name' => $authUser['name'],
+                'actor_role' => $authUser['role'],
+                'target_type' => 'user',
+                'target_id' => $authUser['id'],
+            ]);
             $pdo->commit();
         } catch (Throwable $exception) {
             if ($pdo->inTransaction()) {
@@ -3137,6 +3210,568 @@ try {
         ]);
         exit;
     }
+
+    if ($path === '/superadmin/operations' && $method === 'GET') {
+        requireAnyRole(['superadmin'], $resolveAuthenticatedUser);
+
+        $alerts = [];
+        $qualityIssues = [];
+        $addIssue = static function (
+            array &$target,
+            string $id,
+            string $severity,
+            string $category,
+            string $title,
+            string $description,
+            int $count,
+            array $context = []
+        ): void {
+            $target[] = array_merge([
+                'id' => $id,
+                'severity' => $severity,
+                'category' => $category,
+                'title' => $title,
+                'description' => $description,
+                'count' => $count,
+                'organization_id' => null,
+                'organization_name' => null,
+                'event_id' => null,
+                'event_name' => null,
+            ], $context);
+        };
+
+        $upcomingEventsStmt = $pdo->query("
+            SELECT
+                e.id AS event_id,
+                e.name AS event_name,
+                e.organization_id,
+                o.name AS organization_name,
+                DATE_FORMAT(e.office_open_at, '%Y-%m-%dT%H:%i:%s') AS office_open_at,
+                COALESCE(pc.participant_count, 0) AS participant_count,
+                COALESCE(pc.unsent_email_count, 0) AS unsent_email_count,
+                COALESCE(oc.operator_count, 0) AS operator_count
+            FROM events e
+            INNER JOIN organizations o ON o.id = e.organization_id
+            LEFT JOIN (
+                SELECT
+                    event_id,
+                    COUNT(*) AS participant_count,
+                    SUM(CASE WHEN email_status = 'not_sent' THEN 1 ELSE 0 END) AS unsent_email_count
+                FROM participants
+                WHERE event_id IS NOT NULL
+                GROUP BY event_id
+            ) pc ON pc.event_id = e.id
+            LEFT JOIN (
+                SELECT
+                    uea.event_id,
+                    COUNT(DISTINCT uea.user_id) AS operator_count
+                FROM user_event_assignments uea
+                INNER JOIN users u ON u.id = uea.user_id
+                WHERE u.archived_at IS NULL
+                  AND u.role IN ('scanner', 'scanner_plus')
+                GROUP BY uea.event_id
+            ) oc ON oc.event_id = e.id
+            WHERE e.archived_at IS NULL
+              AND e.deleted_at IS NULL
+              AND e.office_close_at >= UTC_TIMESTAMP()
+              AND e.office_open_at <= DATE_ADD(UTC_TIMESTAMP(), INTERVAL 7 DAY)
+            ORDER BY e.office_open_at ASC
+        ");
+
+        foreach ($upcomingEventsStmt->fetchAll() as $eventRow) {
+            $eventId = (string)$eventRow['event_id'];
+            $eventName = (string)$eventRow['event_name'];
+            $context = [
+                'organization_id' => (string)$eventRow['organization_id'],
+                'organization_name' => (string)$eventRow['organization_name'],
+                'event_id' => $eventId,
+                'event_name' => $eventName,
+            ];
+            $participantCount = (int)$eventRow['participant_count'];
+            $operatorCount = (int)$eventRow['operator_count'];
+            $unsentEmailCount = (int)$eventRow['unsent_email_count'];
+
+            if ($participantCount === 0) {
+                $addIssue(
+                    $alerts,
+                    'event-no-participants-' . $eventId,
+                    'critical',
+                    'event_no_participants',
+                    'Wydarzenie bez uczestników',
+                    sprintf('%s rozpoczyna pracę biura w ciągu 7 dni i nie ma uczestników.', $eventName),
+                    1,
+                    $context
+                );
+            }
+
+            if ($operatorCount === 0) {
+                $addIssue(
+                    $alerts,
+                    'event-no-operators-' . $eventId,
+                    'critical',
+                    'event_no_operators',
+                    'Wydarzenie bez operatorów',
+                    sprintf('%s rozpoczyna pracę biura w ciągu 7 dni i nie ma przypisanych operatorów.', $eventName),
+                    1,
+                    $context
+                );
+            }
+
+            if ($participantCount > 0 && $unsentEmailCount > 0) {
+                $addIssue(
+                    $alerts,
+                    'event-unsent-emails-' . $eventId,
+                    'warning',
+                    'event_unsent_emails',
+                    'Niewysłane kody QR',
+                    sprintf('%s ma %d uczestników bez wysłanego kodu QR.', $eventName, $unsentEmailCount),
+                    $unsentEmailCount,
+                    $context
+                );
+            }
+        }
+
+        $organizationLimitsStmt = $pdo->query("
+            SELECT
+                o.id AS organization_id,
+                o.name AS organization_name,
+                o.event_limit,
+                COUNT(e.id) AS event_count
+            FROM organizations o
+            LEFT JOIN events e
+                ON e.organization_id = o.id
+               AND e.deleted_at IS NULL
+            GROUP BY o.id, o.name, o.event_limit
+            HAVING o.event_limit > 0
+               AND COUNT(e.id) >= o.event_limit
+            ORDER BY o.name ASC
+        ");
+
+        foreach ($organizationLimitsStmt->fetchAll() as $organizationRow) {
+            $organizationId = (string)$organizationRow['organization_id'];
+            $eventCount = (int)$organizationRow['event_count'];
+            $eventLimit = (int)$organizationRow['event_limit'];
+            $addIssue(
+                $alerts,
+                'organization-limit-' . $organizationId,
+                'warning',
+                'organization_event_limit',
+                'Osiągnięty limit wydarzeń',
+                sprintf(
+                    '%s wykorzystuje %d z %d dostępnych wydarzeń.',
+                    (string)$organizationRow['organization_name'],
+                    $eventCount,
+                    $eventLimit
+                ),
+                $eventCount,
+                [
+                    'organization_id' => $organizationId,
+                    'organization_name' => (string)$organizationRow['organization_name'],
+                ]
+            );
+        }
+
+        $blockedRateLimitRow = $pdo->query("
+            SELECT COUNT(*) AS total
+            FROM request_rate_limits
+            WHERE blocked_until IS NOT NULL
+              AND blocked_until > UTC_TIMESTAMP()
+        ")->fetch();
+        $blockedRateLimitCount = (int)($blockedRateLimitRow['total'] ?? 0);
+        if ($blockedRateLimitCount > 0) {
+            $addIssue(
+                $alerts,
+                'active-rate-limit-blocks',
+                'warning',
+                'active_rate_limit_blocks',
+                'Aktywne blokady logowania',
+                sprintf('System ma %d aktywnych blokad po przekroczeniu limitu prób.', $blockedRateLimitCount),
+                $blockedRateLimitCount
+            );
+        }
+
+        $syncEventsStmt = $pdo->query("
+            SELECT
+                e.id AS event_id,
+                e.name AS event_name,
+                e.organization_id,
+                o.name AS organization_name,
+                ess.sync_mode,
+                ess.sync_status,
+                ess.conflicts_count,
+                DATE_FORMAT(ess.last_exported_at, '%Y-%m-%dT%H:%i:%s') AS last_exported_at,
+                DATE_FORMAT(ess.last_synced_at, '%Y-%m-%dT%H:%i:%s') AS last_synced_at,
+                COALESCE(ob.pending_count, 0) AS pending_count,
+                COALESCE(ob.conflict_count, 0) AS outbox_conflict_count,
+                COALESCE(ob.error_count, 0) AS error_count,
+                ob.last_error
+            FROM event_sync_state ess
+            INNER JOIN events e ON e.id = ess.event_id
+            INNER JOIN organizations o ON o.id = e.organization_id
+            LEFT JOIN (
+                SELECT
+                    event_id,
+                    SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending_count,
+                    SUM(CASE WHEN status = 'conflict' THEN 1 ELSE 0 END) AS conflict_count,
+                    SUM(CASE WHEN last_error IS NOT NULL AND last_error <> '' THEN 1 ELSE 0 END) AS error_count,
+                    MAX(last_error) AS last_error
+                FROM sync_outbox
+                GROUP BY event_id
+            ) ob ON ob.event_id = ess.event_id
+            WHERE e.deleted_at IS NULL
+            ORDER BY
+                CASE ess.sync_status WHEN 'conflict' THEN 0 WHEN 'pending' THEN 1 WHEN 'syncing' THEN 2 ELSE 3 END,
+                e.name ASC
+        ");
+
+        $syncEvents = array_map(static function (array $row): array {
+            return [
+                'event_id' => (string)$row['event_id'],
+                'event_name' => (string)$row['event_name'],
+                'organization_id' => (string)$row['organization_id'],
+                'organization_name' => (string)$row['organization_name'],
+                'sync_mode' => (string)$row['sync_mode'],
+                'sync_status' => (string)$row['sync_status'],
+                'conflicts_count' => (int)$row['conflicts_count'],
+                'last_exported_at' => $row['last_exported_at'] ?? null,
+                'last_synced_at' => $row['last_synced_at'] ?? null,
+                'pending_count' => (int)$row['pending_count'],
+                'outbox_conflict_count' => (int)$row['outbox_conflict_count'],
+                'error_count' => (int)$row['error_count'],
+                'last_error' => $row['last_error'] ?? null,
+            ];
+        }, $syncEventsStmt->fetchAll());
+
+        foreach ($syncEvents as $syncEvent) {
+            $conflictCount = (int)$syncEvent['conflicts_count'] + (int)$syncEvent['outbox_conflict_count'];
+            $errorCount = (int)$syncEvent['error_count'];
+            if ($syncEvent['sync_status'] !== 'conflict' && $conflictCount === 0 && $errorCount === 0) {
+                continue;
+            }
+
+            $eventId = (string)$syncEvent['event_id'];
+            $addIssue(
+                $alerts,
+                'sync-problem-' . $eventId,
+                'critical',
+                'sync_problem',
+                'Problem synchronizacji',
+                sprintf(
+                    '%s ma %d konfliktów i %d operacji z błędem.',
+                    (string)$syncEvent['event_name'],
+                    $conflictCount,
+                    $errorCount
+                ),
+                $conflictCount + $errorCount,
+                [
+                    'organization_id' => (string)$syncEvent['organization_id'],
+                    'organization_name' => (string)$syncEvent['organization_name'],
+                    'event_id' => $eventId,
+                    'event_name' => (string)$syncEvent['event_name'],
+                ]
+            );
+        }
+
+        $duplicateBibStmt = $pdo->query("
+            SELECT
+                e.id AS event_id,
+                e.name AS event_name,
+                e.organization_id,
+                o.name AS organization_name,
+                COUNT(*) AS duplicate_group_count,
+                SUM(duplicates.group_count) AS affected_count
+            FROM (
+                SELECT event_id, bib_number, COUNT(*) AS group_count
+                FROM participants
+                WHERE event_id IS NOT NULL
+                  AND bib_number IS NOT NULL
+                  AND TRIM(bib_number) <> ''
+                GROUP BY event_id, bib_number
+                HAVING COUNT(*) > 1
+            ) duplicates
+            INNER JOIN events e ON e.id = duplicates.event_id
+            INNER JOIN organizations o ON o.id = e.organization_id
+            WHERE e.deleted_at IS NULL
+            GROUP BY e.id, e.name, e.organization_id, o.name
+            ORDER BY affected_count DESC
+        ");
+        foreach ($duplicateBibStmt->fetchAll() as $row) {
+            $eventId = (string)$row['event_id'];
+            $affectedCount = (int)$row['affected_count'];
+            $addIssue(
+                $qualityIssues,
+                'duplicate-bib-' . $eventId,
+                'warning',
+                'duplicate_bib_numbers',
+                'Powtarzające się numery startowe',
+                sprintf('%s ma %d uczestników w grupach z powtarzającym się numerem startowym.', (string)$row['event_name'], $affectedCount),
+                $affectedCount,
+                [
+                    'organization_id' => (string)$row['organization_id'],
+                    'organization_name' => (string)$row['organization_name'],
+                    'event_id' => $eventId,
+                    'event_name' => (string)$row['event_name'],
+                ]
+            );
+        }
+
+        $duplicateEmailStmt = $pdo->query("
+            SELECT
+                e.id AS event_id,
+                e.name AS event_name,
+                e.organization_id,
+                o.name AS organization_name,
+                SUM(duplicates.group_count) AS affected_count
+            FROM (
+                SELECT event_id, LOWER(TRIM(email)) AS normalized_email, COUNT(*) AS group_count
+                FROM participants
+                WHERE event_id IS NOT NULL
+                  AND TRIM(email) <> ''
+                GROUP BY event_id, LOWER(TRIM(email))
+                HAVING COUNT(*) > 1
+            ) duplicates
+            INNER JOIN events e ON e.id = duplicates.event_id
+            INNER JOIN organizations o ON o.id = e.organization_id
+            WHERE e.deleted_at IS NULL
+            GROUP BY e.id, e.name, e.organization_id, o.name
+            ORDER BY affected_count DESC
+        ");
+        foreach ($duplicateEmailStmt->fetchAll() as $row) {
+            $eventId = (string)$row['event_id'];
+            $affectedCount = (int)$row['affected_count'];
+            $addIssue(
+                $qualityIssues,
+                'duplicate-email-' . $eventId,
+                'warning',
+                'duplicate_emails',
+                'Powtarzające się adresy e-mail',
+                sprintf('%s ma %d uczestników korzystających z powtarzających się adresów e-mail.', (string)$row['event_name'], $affectedCount),
+                $affectedCount,
+                [
+                    'organization_id' => (string)$row['organization_id'],
+                    'organization_name' => (string)$row['organization_name'],
+                    'event_id' => $eventId,
+                    'event_name' => (string)$row['event_name'],
+                ]
+            );
+        }
+
+        $missingQrStmt = $pdo->query("
+            SELECT
+                e.id AS event_id,
+                e.name AS event_name,
+                e.organization_id,
+                o.name AS organization_name,
+                COUNT(*) AS affected_count
+            FROM participants p
+            INNER JOIN events e ON e.id = p.event_id
+            INNER JOIN organizations o ON o.id = e.organization_id
+            WHERE e.archived_at IS NULL
+              AND e.deleted_at IS NULL
+              AND (p.qr_code IS NULL OR TRIM(p.qr_code) = '')
+            GROUP BY e.id, e.name, e.organization_id, o.name
+            ORDER BY affected_count DESC
+        ");
+        foreach ($missingQrStmt->fetchAll() as $row) {
+            $eventId = (string)$row['event_id'];
+            $affectedCount = (int)$row['affected_count'];
+            $addIssue(
+                $qualityIssues,
+                'missing-qr-' . $eventId,
+                'critical',
+                'participants_without_qr',
+                'Uczestnicy bez kodu QR',
+                sprintf('%s ma %d uczestników bez kodu QR.', (string)$row['event_name'], $affectedCount),
+                $affectedCount,
+                [
+                    'organization_id' => (string)$row['organization_id'],
+                    'organization_name' => (string)$row['organization_name'],
+                    'event_id' => $eventId,
+                    'event_name' => (string)$row['event_name'],
+                ]
+            );
+        }
+
+        $orphanParticipantsRow = $pdo->query('SELECT COUNT(*) AS total FROM participants WHERE event_id IS NULL')->fetch();
+        $orphanParticipantsCount = (int)($orphanParticipantsRow['total'] ?? 0);
+        if ($orphanParticipantsCount > 0) {
+            $addIssue(
+                $qualityIssues,
+                'participants-without-event',
+                'critical',
+                'participants_without_event',
+                'Uczestnicy bez wydarzenia',
+                sprintf('%d uczestników nie jest powiązanych z żadnym wydarzeniem.', $orphanParticipantsCount),
+                $orphanParticipantsCount
+            );
+        }
+
+        $unassignedOperatorsRow = $pdo->query("
+            SELECT COUNT(*) AS total
+            FROM users u
+            WHERE u.archived_at IS NULL
+              AND u.role IN ('scanner', 'scanner_plus')
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM user_event_assignments uea
+                  WHERE uea.user_id = u.id
+              )
+        ")->fetch();
+        $unassignedOperatorsCount = (int)($unassignedOperatorsRow['total'] ?? 0);
+        if ($unassignedOperatorsCount > 0) {
+            $addIssue(
+                $qualityIssues,
+                'operators-without-events',
+                'warning',
+                'operators_without_events',
+                'Operatorzy bez przypisań',
+                sprintf('%d aktywnych operatorów nie ma przypisanego żadnego wydarzenia.', $unassignedOperatorsCount),
+                $unassignedOperatorsCount
+            );
+        }
+
+        $eventsWithoutMappingsStmt = $pdo->query("
+            SELECT
+                e.id AS event_id,
+                e.name AS event_name,
+                e.organization_id,
+                o.name AS organization_name
+            FROM events e
+            INNER JOIN organizations o ON o.id = e.organization_id
+            WHERE e.archived_at IS NULL
+              AND e.deleted_at IS NULL
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM event_participant_field_mappings epfm
+                  WHERE epfm.event_id = e.id
+              )
+            ORDER BY e.office_open_at ASC
+        ");
+        foreach ($eventsWithoutMappingsStmt->fetchAll() as $row) {
+            $eventId = (string)$row['event_id'];
+            $addIssue(
+                $qualityIssues,
+                'event-without-mappings-' . $eventId,
+                'info',
+                'event_without_field_mappings',
+                'Brak mapowania pól uczestników',
+                sprintf('%s nie ma zapisanego mapowania pól importu.', (string)$row['event_name']),
+                1,
+                [
+                    'organization_id' => (string)$row['organization_id'],
+                    'organization_name' => (string)$row['organization_name'],
+                    'event_id' => $eventId,
+                    'event_name' => (string)$row['event_name'],
+                ]
+            );
+        }
+
+        $severityOrder = ['critical' => 0, 'warning' => 1, 'info' => 2];
+        $sortIssues = static function (array &$issues) use ($severityOrder): void {
+            usort($issues, static function (array $left, array $right) use ($severityOrder): int {
+                $severityComparison = ($severityOrder[(string)$left['severity']] ?? 99) <=> ($severityOrder[(string)$right['severity']] ?? 99);
+                return $severityComparison !== 0
+                    ? $severityComparison
+                    : strcmp((string)$left['title'], (string)$right['title']);
+            });
+        };
+        $sortIssues($alerts);
+        $sortIssues($qualityIssues);
+
+        $criticalAlertCount = count(array_filter($alerts, static fn(array $alert): bool => $alert['severity'] === 'critical'));
+        $warningAlertCount = count(array_filter($alerts, static fn(array $alert): bool => $alert['severity'] === 'warning'));
+        $syncConflictCount = array_sum(array_map(
+            static fn(array $event): int => (int)$event['conflicts_count'] + (int)$event['outbox_conflict_count'],
+            $syncEvents
+        ));
+
+        jsonResponse(200, [
+            'generated_at' => gmdate(DATE_ATOM),
+            'summary' => [
+                'critical_alerts' => $criticalAlertCount,
+                'warning_alerts' => $warningAlertCount,
+                'quality_issues' => count($qualityIssues),
+                'sync_conflicts' => $syncConflictCount,
+                'active_rate_limit_blocks' => $blockedRateLimitCount,
+            ],
+            'alerts' => $alerts,
+            'sync_events' => $syncEvents,
+            'quality_issues' => $qualityIssues,
+        ]);
+        exit;
+    }
+
+    $buildAuditQuery = static function (): array {
+        $conditions = [];
+        $params = [];
+        foreach (['category', 'action_code', 'outcome', 'severity', 'request_id'] as $field) {
+            $value = trim((string)($_GET[$field] ?? ''));
+            if ($value !== '') {
+                $conditions[] = "al.{$field} = :{$field}";
+                $params[$field] = $value;
+            }
+        }
+        $actorId = trim((string)($_GET['actor_id'] ?? ''));
+        if ($actorId !== '') {
+            $conditions[] = 'al.actor_user_id = :actor_id';
+            $params['actor_id'] = $actorId;
+        }
+        $scope = trim((string)($_GET['scope'] ?? 'all'));
+        $entityId = trim((string)($_GET['id'] ?? ''));
+        $scopeColumns = ['user' => 'actor_user_id', 'organization' => 'organization_id', 'event' => 'event_id', 'participant' => 'participant_id'];
+        if ($entityId !== '' && isset($scopeColumns[$scope])) {
+            $conditions[] = 'al.' . $scopeColumns[$scope] . ' = :entity_id';
+            $params['entity_id'] = $entityId;
+        }
+        foreach (['from' => '>=', 'to' => '<='] as $field => $operator) {
+            $value = trim((string)($_GET[$field] ?? ''));
+            if ($value === '') {
+                continue;
+            }
+            try {
+                $date = new DateTimeImmutable($value);
+            } catch (Throwable) {
+                jsonResponse(422, ['error' => 'Nieprawidlowy zakres dat']);
+                exit;
+            }
+            $conditions[] = "al.created_at {$operator} :{$field}";
+            $params[$field] = $date->setTimezone(new DateTimeZone('UTC'))->format('Y-m-d H:i:s');
+        }
+        $query = trim((string)($_GET['q'] ?? ''));
+        if ($query !== '') {
+            $conditions[] = '(al.action LIKE :query OR al.action_code LIKE :query OR al.actor_name_snapshot LIKE :query OR al.target_id LIKE :query OR al.metadata_json LIKE :query)';
+            $params['query'] = '%' . $query . '%';
+        }
+        return [$conditions === [] ? '' : 'WHERE ' . implode(' AND ', $conditions), $params];
+    };
+
+    $loadAuditRows = static function (PDO $pdo, string $where, array $params, int $limit, int $offset = 0): array {
+        $stmt = $pdo->prepare("
+            SELECT
+                'audit' AS source, al.id, al.action, DATE_FORMAT(al.created_at, '%Y-%m-%dT%H:%i:%sZ') AS timestamp,
+                al.category, al.action_code, al.outcome, al.severity, al.request_id,
+                al.organization_id, o.name AS organization_name, al.event_id, e.name AS event_name,
+                al.participant_id, COALESCE(p.display_name, JSON_UNQUOTE(JSON_EXTRACT(al.metadata_json, '$.participant_name'))) AS participant_name,
+                al.actor_user_id AS user_id, COALESCE(u.name, al.actor_name_snapshot) AS user_name,
+                al.actor_role_snapshot AS user_role, al.target_type, al.target_id, al.metadata_json
+            FROM audit_logs al
+            LEFT JOIN organizations o ON o.id = al.organization_id
+            LEFT JOIN events e ON e.id = al.event_id
+            LEFT JOIN participants p ON p.id = al.participant_id
+            LEFT JOIN users u ON u.id = al.actor_user_id
+            {$where}
+            ORDER BY al.created_at DESC, al.id DESC
+            LIMIT {$limit} OFFSET {$offset}
+        ");
+        $stmt->execute($params);
+        $entries = $stmt->fetchAll();
+        foreach ($entries as &$entry) {
+            $entry['metadata'] = decodeJsonObject($entry['metadata_json'] ?? null);
+            unset($entry['metadata_json']);
+        }
+        unset($entry);
+        return $entries;
+    };
 
     if ($path === '/superadmin/database' && $method === 'GET') {
         requireAnyRole(['superadmin'], $resolveAuthenticatedUser);
@@ -3213,13 +3848,15 @@ try {
             'table_name' => $selectedTable,
         ]);
         $columns = array_map(static function (array $row): array {
+            $columnName = (string)$row['name'];
             return [
-                'name' => (string)$row['name'],
+                'name' => $columnName,
                 'type' => (string)$row['type'],
                 'nullable' => (string)$row['is_nullable'] === 'YES',
                 'key' => (string)($row['column_key'] ?? ''),
                 'default' => isset($row['column_default']) ? (string)$row['column_default'] : null,
                 'extra' => (string)($row['extra'] ?? ''),
+                'masked' => isSensitiveDatabaseColumn($columnName),
             ];
         }, $columnsStmt->fetchAll());
 
@@ -3244,12 +3881,13 @@ try {
         }
 
         $rowsStmt = $pdo->query("SELECT * FROM {$quotedTable}{$orderSql} LIMIT {$limit} OFFSET {$offset}");
+        $rows = maskSensitiveDatabaseRows($rowsStmt->fetchAll(), $columns);
 
         jsonResponse(200, [
             'database' => $databaseName,
             'tables' => $tables,
             'columns' => $columns,
-            'rows' => $rowsStmt->fetchAll(),
+            'rows' => $rows,
             'meta' => [
                 'selected_table' => $selectedTable,
                 'page' => $page,
@@ -3257,6 +3895,188 @@ try {
                 'total' => $totalRows,
                 'total_pages' => $totalPages,
             ],
+        ]);
+        exit;
+    }
+
+    if ($path === '/superadmin/logging-status' && $method === 'GET') {
+        requireAnyRole(['superadmin'], $resolveAuthenticatedUser);
+        jsonResponse(200, ['data' => ApplicationLogger::status()]);
+        exit;
+    }
+
+    if ($path === '/superadmin/server-logs' && $method === 'GET') {
+        requireAnyRole(['superadmin'], $resolveAuthenticatedUser);
+        $source = trim((string)($_GET['source'] ?? 'application'));
+        if (!in_array($source, ['application', 'php'], true)) {
+            jsonResponse(422, ['error' => 'Nieobslugiwane zrodlo logow']);
+            exit;
+        }
+        $utc = new DateTimeZone('UTC');
+        $now = new DateTimeImmutable('now', $utc);
+        try {
+            $from = new DateTimeImmutable((string)($_GET['from'] ?? '-24 hours'), $utc);
+            $to = new DateTimeImmutable((string)($_GET['to'] ?? 'now'), $utc);
+        } catch (Throwable) {
+            jsonResponse(422, ['error' => 'Nieprawidlowy zakres dat']);
+            exit;
+        }
+        if ($from > $to || $from < $now->modify('-30 days') || $to > $now->modify('+5 minutes')) {
+            jsonResponse(422, ['error' => 'Zakres logow musi miescic sie w ostatnich 30 dniach']);
+            exit;
+        }
+        $page = max(1, (int)($_GET['page'] ?? 1));
+        $limit = max(1, min(100, (int)($_GET['limit'] ?? 50)));
+        $entries = ApplicationLogger::readEntries($source, $from, $to, [
+            'level' => $_GET['level'] ?? '',
+            'request_id' => $_GET['request_id'] ?? '',
+            'event_code' => $_GET['event_code'] ?? '',
+            'q' => $_GET['q'] ?? '',
+        ], 5000);
+        $total = count($entries);
+        $totalPages = max(1, (int)ceil($total / $limit));
+        $page = min($page, $totalPages);
+        jsonResponse(200, [
+            'data' => array_slice($entries, ($page - 1) * $limit, $limit),
+            'meta' => ['page' => $page, 'per_page' => $limit, 'total' => $total, 'total_pages' => $totalPages],
+        ]);
+        exit;
+    }
+
+    if ($path === '/superadmin/server-logs/export.csv' && $method === 'GET') {
+        $authUser = requireAnyRole(['superadmin'], $resolveAuthenticatedUser);
+        $source = trim((string)($_GET['source'] ?? 'application'));
+        if (!in_array($source, ['application', 'php'], true)) {
+            jsonResponse(422, ['error' => 'Nieobslugiwane zrodlo logow']);
+            exit;
+        }
+        $utc = new DateTimeZone('UTC');
+        $now = new DateTimeImmutable('now', $utc);
+        try {
+            $from = new DateTimeImmutable((string)($_GET['from'] ?? '-24 hours'), $utc);
+            $to = new DateTimeImmutable((string)($_GET['to'] ?? 'now'), $utc);
+        } catch (Throwable) {
+            jsonResponse(422, ['error' => 'Nieprawidlowy zakres dat']);
+            exit;
+        }
+        if ($from > $to || $from < $now->modify('-30 days')) {
+            jsonResponse(422, ['error' => 'Zakres logow musi miescic sie w ostatnich 30 dniach']);
+            exit;
+        }
+        $entries = ApplicationLogger::readEntries($source, $from, $to, [
+            'level' => $_GET['level'] ?? '',
+            'request_id' => $_GET['request_id'] ?? '',
+            'event_code' => $_GET['event_code'] ?? '',
+            'q' => $_GET['q'] ?? '',
+        ], 10000);
+        addAuditLog($pdo, [
+            'category' => 'system', 'action_code' => 'server_logs.exported', 'action' => 'Wyeksportowano logi serwera',
+            'actor_user_id' => $authUser['id'], 'actor_name' => $authUser['name'], 'actor_role' => $authUser['role'],
+            'target_type' => 'server_logs', 'target_id' => $source, 'metadata' => ['entries_count' => count($entries)],
+        ]);
+        $stream = fopen('php://temp', 'r+');
+        if ($stream === false) {
+            jsonResponse(500, ['error' => 'Nie udalo sie rozpoczac eksportu CSV']);
+            exit;
+        }
+        $writeCsvRow($stream, ['ID', 'Czas UTC', 'Poziom', 'Kod zdarzenia', 'Komunikat', 'Request ID', 'Metoda', 'Sciezka', 'Uzytkownik', 'Rola']);
+        foreach ($entries as $entry) {
+            $writeCsvRow($stream, [
+                $entry['id'] ?? '', $entry['timestamp'] ?? '', $entry['level'] ?? '', $entry['event_code'] ?? '',
+                $entry['message'] ?? '', $entry['request_id'] ?? '', $entry['method'] ?? '', $entry['path'] ?? '',
+                $entry['user_id'] ?? '', $entry['user_role'] ?? '',
+            ]);
+        }
+        rewind($stream);
+        $csvContent = stream_get_contents($stream);
+        fclose($stream);
+        $setCsvDownloadHeaders('logi-serwera-' . $source . '-' . gmdate('Y-m-d') . '.csv');
+        echo "\xEF\xBB\xBF";
+        echo $csvContent;
+        exit;
+    }
+
+    if (preg_match('#^/superadmin/server-logs/(application|php)/(\d{4}-\d{2}-\d{2})/([^/]+)$#', $path, $matches) === 1 && $method === 'GET') {
+        $authUser = requireAnyRole(['superadmin'], $resolveAuthenticatedUser);
+        $entry = ApplicationLogger::findEntry((string)$matches[1], (string)$matches[2], rawurldecode((string)$matches[3]));
+        if ($entry === null) {
+            jsonResponse(404, ['error' => 'Nie znaleziono logu serwera']);
+            exit;
+        }
+        addAuditLog($pdo, [
+            'category' => 'system', 'action_code' => 'server_logs.viewed', 'action' => 'Wyswietlono szczegoly logu serwera',
+            'actor_user_id' => $authUser['id'], 'actor_name' => $authUser['name'], 'actor_role' => $authUser['role'],
+            'target_type' => 'server_log', 'target_id' => $entry['id'] ?? null, 'metadata' => ['source' => $matches[1]],
+        ]);
+        jsonResponse(200, ['data' => $entry]);
+        exit;
+    }
+
+    if ($path === '/superadmin/audit/export.csv' && $method === 'GET') {
+        $authUser = requireAnyRole(['superadmin'], $resolveAuthenticatedUser);
+        [$where, $params] = $buildAuditQuery();
+        $entries = $loadAuditRows($pdo, $where, $params, 10000);
+        addAuditLog($pdo, [
+            'category' => 'system', 'action_code' => 'audit.exported', 'action' => 'Wyeksportowano audyt systemowy',
+            'actor_user_id' => $authUser['id'], 'actor_name' => $authUser['name'], 'actor_role' => $authUser['role'],
+            'target_type' => 'audit_logs', 'metadata' => ['entries_count' => count($entries)],
+        ]);
+        $stream = fopen('php://temp', 'r+');
+        if ($stream === false) {
+            jsonResponse(500, ['error' => 'Nie udalo sie rozpoczac eksportu CSV']);
+            exit;
+        }
+        $writeCsvRow($stream, ['ID', 'Czas UTC', 'Kategoria', 'Kod akcji', 'Akcja', 'Wynik', 'Poziom', 'Aktor', 'Rola', 'Cel', 'Request ID']);
+        foreach ($entries as $entry) {
+            $writeCsvRow($stream, [
+                $entry['id'], $entry['timestamp'], $entry['category'], $entry['action_code'], $entry['action'],
+                $entry['outcome'], $entry['severity'], $entry['user_name'], $entry['user_role'],
+                trim((string)$entry['target_type'] . ':' . (string)$entry['target_id'], ':'), $entry['request_id'],
+            ]);
+        }
+        rewind($stream);
+        $csvContent = stream_get_contents($stream);
+        fclose($stream);
+        $setCsvDownloadHeaders('audyt-systemowy-' . gmdate('Y-m-d') . '.csv');
+        echo "\xEF\xBB\xBF";
+        echo $csvContent;
+        exit;
+    }
+
+    if (preg_match('#^/superadmin/audit/([^/]+)$#', $path, $matches) === 1 && $method === 'GET') {
+        $authUser = requireAnyRole(['superadmin'], $resolveAuthenticatedUser);
+        $stmt = $pdo->prepare('SELECT * FROM audit_logs WHERE id = :id LIMIT 1');
+        $stmt->execute(['id' => rawurldecode((string)$matches[1])]);
+        $entry = $stmt->fetch();
+        if ($entry === false) {
+            jsonResponse(404, ['error' => 'Nie znaleziono wpisu audytu']);
+            exit;
+        }
+        $entry['metadata'] = decodeJsonObject($entry['metadata_json'] ?? null);
+        unset($entry['metadata_json'], $entry['ip_hash']);
+        addAuditLog($pdo, [
+            'category' => 'system', 'action_code' => 'audit.viewed', 'action' => 'Wyswietlono szczegoly audytu',
+            'actor_user_id' => $authUser['id'], 'actor_name' => $authUser['name'], 'actor_role' => $authUser['role'],
+            'target_type' => 'audit_log', 'target_id' => $entry['id'],
+        ]);
+        jsonResponse(200, ['data' => $entry]);
+        exit;
+    }
+
+    if ($path === '/superadmin/audit' && $method === 'GET') {
+        requireAnyRole(['superadmin'], $resolveAuthenticatedUser);
+        [$where, $params] = $buildAuditQuery();
+        $page = max(1, (int)($_GET['page'] ?? 1));
+        $limit = max(1, min(100, (int)($_GET['limit'] ?? 50)));
+        $countStmt = $pdo->prepare("SELECT COUNT(*) AS total FROM audit_logs al {$where}");
+        $countStmt->execute($params);
+        $total = (int)($countStmt->fetch()['total'] ?? 0);
+        $totalPages = max(1, (int)ceil($total / $limit));
+        $page = min($page, $totalPages);
+        $entries = $loadAuditRows($pdo, $where, $params, $limit, ($page - 1) * $limit);
+        jsonResponse(200, [
+            'data' => $entries,
+            'meta' => ['page' => $page, 'per_page' => $limit, 'total' => $total, 'total_pages' => $totalPages],
         ]);
         exit;
     }
@@ -7302,6 +8122,7 @@ try {
 
     jsonResponse(404, ['error' => 'Nie znaleziono endpointu']);
 } catch (PDOException $exception) {
+    ApplicationLogger::logException($exception, 'database.exception');
     if ($exception->getCode() === '23000') {
         jsonResponse(409, [
             'error' => 'Conflict',
@@ -7315,6 +8136,7 @@ try {
         'details' => getenv('APP_DEBUG') === 'true' ? $exception->getMessage() : null,
     ]);
 } catch (Throwable $exception) {
+    ApplicationLogger::logException($exception, 'application.unhandled_exception');
     jsonResponse(500, [
         'error' => 'Server error',
         'details' => getenv('APP_DEBUG') === 'true' ? $exception->getMessage() : null,

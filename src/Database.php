@@ -10,7 +10,8 @@ final class Database
         $port = getenv('DB_PORT') ?: '3306';
         $database = getenv('DB_DATABASE') ?: 'biuro_zawodow';
         $username = getenv('DB_USERNAME') ?: 'biuro_user';
-        $password = getenv('DB_PASSWORD') ?: 'biuro_pass';
+        $configuredPassword = getenv('DB_PASSWORD');
+        $password = $configuredPassword === false ? 'biuro_pass' : $configuredPassword;
 
         $dsn = sprintf('mysql:host=%s;port=%s;dbname=%s;charset=utf8mb4', $host, $port, $database);
 

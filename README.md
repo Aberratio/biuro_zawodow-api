@@ -10,6 +10,8 @@ PHP 8.2 API for the `biuro_zawodow` project. It serves the React frontend, expos
 - Participant CSV import with column mapping
 - QR preview, single send and bulk send for event participants
 - CSV export for event data and event activity logs
+- Structured business audit logs and redacted JSONL server logs for superadmin
+- Optional Sentry error reporting for PHP exceptions
 - Swagger UI at `/docs` and OpenAPI JSON at `/openapi.json` on non-production environments
 - Basic API hardening:
   - strict CORS configuration
@@ -66,6 +68,17 @@ APP_URL=http://localhost:8080
 APP_FRONTEND_URL=http://localhost:5173
 APP_KEY=change-this-local-secret
 APP_CORS_ORIGIN=http://localhost:8080,http://localhost:5173
+APP_RELEASE=local
+
+LOG_DIR=
+LOG_LEVEL=info
+LOG_RETENTION_DAYS=30
+AUDIT_RETENTION_DAYS=730
+SLOW_REQUEST_MS=2000
+
+SENTRY_DSN=
+SENTRY_ENVIRONMENT=local
+SENTRY_TRACES_SAMPLE_RATE=0
 
 DB_HOST=127.0.0.1
 DB_PORT=3306
@@ -89,6 +102,8 @@ Notes:
 - `APP_FRONTEND_URL` is used in password reset emails.
 - `APP_KEY` signs auth tokens and must be strong outside local/dev/test.
 - `APP_CORS_ORIGIN` must contain the frontend origin. Wildcard CORS is rejected outside local/dev/test.
+- `LOG_DIR` defaults to `storage/logs`, outside the public webroot. Production should use a private absolute path.
+- `SENTRY_DSN` is optional. Empty or unavailable Sentry never blocks API requests.
 
 For local mail testing you can use Mailpit:
 
@@ -154,6 +169,7 @@ The directory currently contains:
 - `018_add_request_rate_limits_and_activity_event.php`
 - `019_add_user_archiving_and_event_soft_delete.php`
 - `020_add_event_sync_tables.php`
+- `021_add_audit_logs.php`
 
 ## Auth and access model
 
@@ -231,6 +247,14 @@ The full and current contract lives in Swagger. The most important route groups 
   - `POST /participants/{id}/check-in`
   - `POST /participants/{id}/undo-check-in`
   - `POST /participants/scan`
+- superadmin observability:
+  - `GET /superadmin/audit`
+  - `GET /superadmin/audit/{id}`
+  - `GET /superadmin/audit/export.csv`
+  - `GET /superadmin/server-logs`
+  - `GET /superadmin/server-logs/{source}/{date}/{id}`
+  - `GET /superadmin/server-logs/export.csv`
+  - `GET /superadmin/logging-status`
 
 ## API behavior worth knowing
 
@@ -240,6 +264,8 @@ The full and current contract lives in Swagger. The most important route groups 
 - CSV analyze/import endpoints accept larger payloads than standard JSON routes.
 - Event and participant exports are generated as downloadable CSV files.
 - Activity logs include user, participant and exact timestamp information where applicable.
+- Every API response includes `X-Request-ID`, which correlates audit entries, JSONL server logs and Sentry events.
+- Run `php scripts/maintain-logs.php` daily to compress logs older than two days and enforce retention.
 
 ## Development workflow
 

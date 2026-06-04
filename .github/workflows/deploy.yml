@@ -276,6 +276,24 @@ jobs:
           DB_USERNAME="$(get_env DB_USERNAME)"
           DB_PASSWORD="$(get_env DB_PASSWORD)"
           APP_ENV="$(get_env APP_ENV)"
+          LOG_DIR="$(get_env LOG_DIR)"
+          if [ -z "$LOG_DIR" ]; then
+            LOG_DIR="$BACKEND_REMOTE_DIR_REAL/storage/logs"
+          fi
+
+          mkdir -p "$LOG_DIR"
+          chmod 700 "$LOG_DIR"
+          LOG_DIR_REAL="$(cd "$LOG_DIR" && pwd -P)"
+          case "$LOG_DIR_REAL/" in
+            "$BACKEND_REMOTE_DIR_REAL/public/"*|"$BACKEND_REMOTE_DIR_REAL/public_html/"*)
+              echo "LOG_DIR must be outside public web directories."
+              exit 35
+              ;;
+          esac
+          LOG_TEST_FILE="$LOG_DIR_REAL/.deploy-write-test"
+          printf '%s\n' "$DEPLOY_ID" > "$LOG_TEST_FILE"
+          chmod 600 "$LOG_TEST_FILE"
+          rm -f "$LOG_TEST_FILE"
 
           if [ "$TARGET_ENV" != "$APP_ENV" ]; then
             echo "TARGET_ENV=$TARGET_ENV but APP_ENV=$APP_ENV in $ENV_FILE"

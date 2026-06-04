@@ -199,7 +199,11 @@ final class MailService
             }
         }
 
-        return new RuntimeException($message, 0, $exception);
+        $runtimeException = new RuntimeException($message, 0, $exception);
+        if (class_exists('ApplicationLogger')) {
+            ApplicationLogger::logException($runtimeException, 'smtp.send_failed');
+        }
+        return $runtimeException;
     }
 
     private static function actionHtml(

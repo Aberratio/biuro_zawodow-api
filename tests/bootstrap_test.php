@@ -94,6 +94,11 @@ test('documents critical API paths in the generated OpenAPI document', function 
         '/auth/login',
         '/auth/me',
         '/bootstrap',
+        '/superadmin/operations',
+        '/superadmin/audit',
+        '/superadmin/audit/{id}',
+        '/superadmin/server-logs',
+        '/superadmin/logging-status',
         '/events/{id}/participant-imports/analyze',
         '/events/{id}/participant-imports/run',
         '/events/{id}/participant-field-mappings',
@@ -103,6 +108,70 @@ test('documents critical API paths in the generated OpenAPI document', function 
     ] as $path) {
         assertTrue(in_array($path, $paths, true), "OpenAPI path missing: {$path}");
     }
+});
+
+test('redacts secrets and writes structured application logs', function (): void {
+    $directory = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'biuro-zawodow-logs-' . bin2hex(random_bytes(4));
+    putenv('LOG_DIR=' . $directory);
+    putenv('LOG_LEVEL=debug');
+
+    $id = ApplicationLogger::log('info', 'test.logger', 'Token token=secret-value', [
+        'password' => 'Secret123!',
+        'ordinary' => 'visible',
+    ]);
+
+    assertTrue(is_string($id));
+    $entries = ApplicationLogger::readEntries(
+        'application',
+        new DateTimeImmutable('-1 minute', new DateTimeZone('UTC')),
+        new DateTimeImmutable('+1 minute', new DateTimeZone('UTC')),
+        ['event_code' => 'test.logger']
+    );
+    assertSame(1, count($entries));
+    assertSame('[REDACTED]', $entries[0]['context']['password'] ?? null);
+    assertSame('visible', $entries[0]['context']['ordinary'] ?? null);
+    assertStringContains('[REDACTED]', (string)($entries[0]['message'] ?? ''));
+    assertSame([], ApplicationLogger::readEntries(
+        '../../etc/passwd',
+        new DateTimeImmutable('-1 minute', new DateTimeZone('UTC')),
+        new DateTimeImmutable('+1 minute', new DateTimeZone('UTC'))
+    ));
+    assertNullValue(ApplicationLogger::findEntry('application', '../2026-01-01', (string)$id));
+
+    foreach (glob($directory . DIRECTORY_SEPARATOR . '*') ?: [] as $file) {
+        unlink($file);
+    }
+    rmdir($directory);
+});
+
+test('masks sensitive database values without changing ordinary columns', function (): void {
+    $columns = [
+        ['name' => 'id'],
+        ['name' => 'password'],
+        ['name' => 'token_hash'],
+        ['name' => 'qr_code'],
+        ['name' => 'bucket_key'],
+        ['name' => 'email'],
+    ];
+    $rows = [[
+        'id' => 'user-1',
+        'password' => 'secret',
+        'token_hash' => 'hash',
+        'qr_code' => 'pqr_secret',
+        'bucket_key' => 'auth_login:anna@example.com',
+        'email' => 'anna@example.com',
+    ]];
+
+    assertTrue(isSensitiveDatabaseColumn('PASSWORD'));
+    assertFalse(isSensitiveDatabaseColumn('participant_audit_key'));
+    assertSame([[
+        'id' => 'user-1',
+        'password' => '[MASKED]',
+        'token_hash' => '[MASKED]',
+        'qr_code' => '[MASKED]',
+        'bucket_key' => '[MASKED]',
+        'email' => 'anna@example.com',
+    ]], maskSensitiveDatabaseRows($rows, $columns));
 });
 
 test('generates and validates participant QR tokens', function (): void {

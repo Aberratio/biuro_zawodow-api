@@ -5,6 +5,9 @@ declare(strict_types=1);
 require_once __DIR__ . '/Database.php';
 require_once __DIR__ . '/MailService.php';
 require_once __DIR__ . '/QrCodeService.php';
+require_once __DIR__ . '/RequestContext.php';
+require_once __DIR__ . '/SentryBridge.php';
+require_once __DIR__ . '/ApplicationLogger.php';
 
 $composerAutoloadPath = __DIR__ . '/../vendor/autoload.php';
 if (is_file($composerAutoloadPath)) {
@@ -12,6 +15,8 @@ if (is_file($composerAutoloadPath)) {
 }
 
 loadEnv(__DIR__ . '/../.env');
+RequestContext::initialize();
+SentryBridge::initialize();
 
 const PASSWORD_RESET_TTL_SECONDS = 60 * 60;
 const ACCOUNT_SETUP_TTL_SECONDS = 7 * 24 * 60 * 60;
@@ -47,9 +52,11 @@ function loadEnv(string $path): void
 
         $value = trim($value, "\"'");
 
-        putenv("{$key}={$value}");
-        $_ENV[$key] = $value;
-        $_SERVER[$key] = $value;
+        if (getenv($key) === false) {
+            putenv("{$key}={$value}");
+            $_ENV[$key] = $value;
+            $_SERVER[$key] = $value;
+        }
     }
 }
 
@@ -57,6 +64,7 @@ function jsonResponse(int $statusCode, array $payload): void
 {
     http_response_code($statusCode);
     header('Content-Type: application/json; charset=utf-8');
+    header('X-Request-ID: ' . RequestContext::id());
     $encoded = encodeJsonValue($payload);
     if ($encoded === false) {
         http_response_code(500);
@@ -262,6 +270,161 @@ function clientIpAddress(): string
 {
     $ip = trim((string)($_SERVER['REMOTE_ADDR'] ?? ''));
     return filter_var($ip, FILTER_VALIDATE_IP) !== false ? $ip : 'unknown';
+}
+
+function registerApplicationLogging(): void
+{
+    static $registered = false;
+    if ($registered) {
+        return;
+    }
+    $registered = true;
+
+    set_error_handler(static function (int $severity, string $message, string $file, int $line): bool {
+        if (!(error_reporting() & $severity)) {
+            return false;
+        }
+        ApplicationLogger::log('error', 'php.error', $message, [
+            'severity' => $severity,
+            'file' => $file,
+            'line' => $line,
+        ], 'php');
+        return false;
+    });
+
+    register_shutdown_function(static function (): void {
+        $error = error_get_last();
+        if (is_array($error) && in_array((int)($error['type'] ?? 0), [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR], true)) {
+            ApplicationLogger::log('critical', 'php.fatal', (string)($error['message'] ?? 'Fatal PHP error'), [
+                'type' => $error['type'] ?? null,
+                'file' => $error['file'] ?? null,
+                'line' => $error['line'] ?? null,
+            ], 'php');
+        }
+
+        $status = http_response_code();
+        $durationMs = RequestContext::durationMs();
+        $slowRequestMs = max(100, (int)(getenv('SLOW_REQUEST_MS') ?: 2000));
+        $level = $status >= 500 ? 'error' : ($status >= 400 || $durationMs >= $slowRequestMs ? 'warning' : 'info');
+        ApplicationLogger::log($level, 'http.request.completed', 'Request completed', [
+            'status' => $status,
+            'duration_ms' => $durationMs,
+            'slow' => $durationMs >= $slowRequestMs,
+        ]);
+    });
+}
+
+function auditIpHash(): ?string
+{
+    $ip = clientIpAddress();
+    if ($ip === 'unknown') {
+        return null;
+    }
+    return hash_hmac('sha256', $ip, authSecret());
+}
+
+function auditActionCodeFromLabel(string $action): string
+{
+    $normalized = strtolower(normalizeUtf8String(trim($action)));
+    $known = [
+        'zalogowano' => 'auth.login.succeeded',
+        'utworzono' => 'entity.created',
+        'dodano' => 'entity.created',
+        'zaktualizowano' => 'entity.updated',
+        'zmieniono' => 'entity.updated',
+        'ustawiono has' => 'user.password.set',
+        'wyslano' => 'message.sent',
+        'wysĹ‚ano' => 'message.sent',
+        'wyeksportowano' => 'export.created',
+        'usuniÄ™to' => 'entity.deleted',
+        'zarchiwizowano' => 'entity.archived',
+        'przywrĂłcono' => 'entity.restored',
+    ];
+    foreach ($known as $needle => $code) {
+        if (str_contains($normalized, strtolower($needle))) {
+            return $code;
+        }
+    }
+    return 'activity.' . substr(hash('sha256', $normalized), 0, 16);
+}
+
+function auditCategoryFromAction(string $actionCode, string $action): string
+{
+    $value = strtolower($actionCode . ' ' . normalizeUtf8String($action));
+    foreach ([
+        'authentication' => ['auth.', 'logow', 'hasĹ‚'],
+        'users' => ['user', 'konto', 'operator', 'admin'],
+        'organizations' => ['organization', 'organizac'],
+        'events' => ['event', 'wydarze'],
+        'participants' => ['participant', 'uczestnik', 'odpraw'],
+        'imports' => ['import'],
+        'exports' => ['export'],
+        'emails' => ['mail', 'email', 'e-mail'],
+        'system' => ['system', 'log'],
+    ] as $category => $needles) {
+        foreach ($needles as $needle) {
+            if (str_contains($value, $needle)) {
+                return $category;
+            }
+        }
+    }
+    return 'system';
+}
+
+function addAuditLog(PDO $pdo, array $entry): string
+{
+    $id = (string)($entry['id'] ?? ('audit-' . bin2hex(random_bytes(10))));
+    $action = trim((string)($entry['action'] ?? 'Zdarzenie systemowe'));
+    $actionCode = trim((string)($entry['action_code'] ?? auditActionCodeFromLabel($action)));
+    $actor = RequestContext::user();
+    $actorId = $entry['actor_user_id'] ?? (is_array($actor) ? ($actor['id'] ?? null) : null);
+    $actorName = $entry['actor_name'] ?? (is_array($actor) ? ($actor['name'] ?? null) : null);
+    $actorRole = $entry['actor_role'] ?? (is_array($actor) ? ($actor['role'] ?? null) : null);
+    $metadata = ApplicationLogger::redact($entry['metadata'] ?? []);
+    $metadataJson = $metadata === [] ? null : encodeJsonValue($metadata);
+
+    $stmt = $pdo->prepare('
+        INSERT INTO audit_logs (
+            id, category, action_code, action, outcome, severity,
+            actor_user_id, actor_name_snapshot, actor_role_snapshot,
+            target_type, target_id, organization_id, event_id, participant_id,
+            request_id, ip_hash, metadata_json, created_at
+        ) VALUES (
+            :id, :category, :action_code, :action, :outcome, :severity,
+            :actor_user_id, :actor_name_snapshot, :actor_role_snapshot,
+            :target_type, :target_id, :organization_id, :event_id, :participant_id,
+            :request_id, :ip_hash, :metadata_json, UTC_TIMESTAMP()
+        )
+    ');
+    $stmt->execute([
+        'id' => $id,
+        'category' => $entry['category'] ?? auditCategoryFromAction($actionCode, $action),
+        'action_code' => $actionCode,
+        'action' => $action,
+        'outcome' => $entry['outcome'] ?? 'success',
+        'severity' => $entry['severity'] ?? 'info',
+        'actor_user_id' => $actorId ?: null,
+        'actor_name_snapshot' => $actorName ?: null,
+        'actor_role_snapshot' => $actorRole ?: null,
+        'target_type' => $entry['target_type'] ?? null,
+        'target_id' => isset($entry['target_id']) ? (string)$entry['target_id'] : null,
+        'organization_id' => $entry['organization_id'] ?? null,
+        'event_id' => $entry['event_id'] ?? null,
+        'participant_id' => isset($entry['participant_id']) ? (int)$entry['participant_id'] : null,
+        'request_id' => RequestContext::id(),
+        'ip_hash' => auditIpHash(),
+        'metadata_json' => $metadataJson,
+    ]);
+    return $id;
+}
+
+function tryAddSecurityAudit(array $entry): void
+{
+    try {
+        addAuditLog(Database::connect(), $entry);
+    } catch (Throwable $exception) {
+        ApplicationLogger::logException($exception, 'audit.security_write_failed');
+    }
 }
 
 function validateServerSecurityConfiguration(): void
@@ -560,10 +723,24 @@ function requireAuth(?callable $resolver = null): array
 {
     $user = authenticatedUserFromRequest($resolver);
     if ($user === null) {
+        ApplicationLogger::log('warning', 'auth.required', 'Authentication required', [
+            'status' => 401,
+            'client_ip' => clientIpAddress(),
+        ]);
+        tryAddSecurityAudit([
+            'category' => 'authentication',
+            'action_code' => 'auth.required',
+            'action' => 'Odrzucono zadanie bez autoryzacji',
+            'outcome' => 'blocked',
+            'severity' => 'warning',
+            'target_type' => 'route',
+            'target_id' => RequestContext::path(),
+        ]);
         jsonResponse(401, ['error' => 'Brak autoryzacji']);
         exit;
     }
 
+    RequestContext::setUser($user);
     return $user;
 }
 
@@ -571,11 +748,60 @@ function requireAnyRole(array $allowedRoles, ?callable $resolver = null): array
 {
     $user = requireAuth($resolver);
     if (!in_array($user['role'], $allowedRoles, true)) {
+        ApplicationLogger::log('warning', 'authorization.denied', 'Access denied for user role', [
+            'status' => 403,
+            'allowed_roles' => $allowedRoles,
+        ]);
+        tryAddSecurityAudit([
+            'category' => 'authorization',
+            'action_code' => 'authorization.denied',
+            'action' => 'Odrzucono zadanie z powodu braku uprawnien',
+            'outcome' => 'blocked',
+            'severity' => 'warning',
+            'target_type' => 'route',
+            'target_id' => RequestContext::path(),
+            'metadata' => ['allowed_roles' => $allowedRoles],
+        ]);
         jsonResponse(403, ['error' => 'Brak uprawnień']);
         exit;
     }
 
     return $user;
+}
+
+function isSensitiveDatabaseColumn(string $columnName): bool
+{
+    return in_array(strtolower(trim($columnName)), [
+        'password',
+        'token_hash',
+        'qr_code',
+        'bucket_key',
+    ], true);
+}
+
+function maskSensitiveDatabaseRows(array $rows, array $columns): array
+{
+    $sensitiveColumns = array_values(array_filter(
+        array_map(
+            static fn(array $column): string => (string)($column['name'] ?? ''),
+            $columns
+        ),
+        static fn(string $columnName): bool => isSensitiveDatabaseColumn($columnName)
+    ));
+
+    if ($sensitiveColumns === []) {
+        return $rows;
+    }
+
+    return array_map(static function (array $row) use ($sensitiveColumns): array {
+        foreach ($sensitiveColumns as $columnName) {
+            if (array_key_exists($columnName, $row) && $row[$columnName] !== null) {
+                $row[$columnName] = '[MASKED]';
+            }
+        }
+
+        return $row;
+    }, $rows);
 }
 
 function openApiDocument(): array
@@ -602,6 +828,7 @@ function openApiDocument(): array
             ['name' => 'Events'],
             ['name' => 'Users'],
             ['name' => 'Participants'],
+            ['name' => 'Superadmin'],
         ],
         'paths' => [
             '/auth/login' => [
@@ -871,6 +1098,111 @@ function openApiDocument(): array
                         '401' => [
                             '$ref' => '#/components/responses/Brak autoryzacji',
                         ],
+                    ],
+                ],
+            ],
+            '/superadmin/operations' => [
+                'get' => [
+                    'tags' => ['Superadmin'],
+                    'summary' => 'Load operational alerts, synchronization status and data quality issues',
+                    'security' => [
+                        ['bearerAuth' => []],
+                    ],
+                    'responses' => [
+                        '200' => [
+                            'description' => 'Operational overview for superadmin',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => [
+                                        'type' => 'object',
+                                    ],
+                                ],
+                            ],
+                        ],
+                        '401' => [
+                            '$ref' => '#/components/responses/Brak autoryzacji',
+                        ],
+                        '403' => [
+                            '$ref' => '#/components/responses/Brak uprawnień',
+                        ],
+                    ],
+                ],
+            ],
+            '/superadmin/audit' => [
+                'get' => [
+                    'tags' => ['Superadmin'],
+                    'summary' => 'Search business audit logs',
+                    'security' => [['bearerAuth' => []]],
+                    'responses' => [
+                        '200' => ['description' => 'Paginated audit entries'],
+                        '401' => ['$ref' => '#/components/responses/Brak autoryzacji'],
+                        '403' => ['$ref' => '#/components/responses/Forbidden'],
+                    ],
+                ],
+            ],
+            '/superadmin/audit/{id}' => [
+                'get' => [
+                    'tags' => ['Superadmin'],
+                    'summary' => 'Load audit log details',
+                    'security' => [['bearerAuth' => []]],
+                    'responses' => [
+                        '200' => ['description' => 'Audit entry details'],
+                        '404' => ['$ref' => '#/components/responses/NotFound'],
+                    ],
+                ],
+            ],
+            '/superadmin/audit/export.csv' => [
+                'get' => [
+                    'tags' => ['Superadmin'],
+                    'summary' => 'Export filtered business audit logs as CSV',
+                    'security' => [['bearerAuth' => []]],
+                    'responses' => [
+                        '200' => ['description' => 'Audit CSV export'],
+                        '403' => ['$ref' => '#/components/responses/Forbidden'],
+                    ],
+                ],
+            ],
+            '/superadmin/server-logs' => [
+                'get' => [
+                    'tags' => ['Superadmin'],
+                    'summary' => 'Search redacted application and PHP logs',
+                    'security' => [['bearerAuth' => []]],
+                    'responses' => [
+                        '200' => ['description' => 'Paginated server log entries'],
+                        '403' => ['$ref' => '#/components/responses/Forbidden'],
+                    ],
+                ],
+            ],
+            '/superadmin/server-logs/export.csv' => [
+                'get' => [
+                    'tags' => ['Superadmin'],
+                    'summary' => 'Export filtered server logs as CSV',
+                    'security' => [['bearerAuth' => []]],
+                    'responses' => [
+                        '200' => ['description' => 'Server log CSV export'],
+                        '403' => ['$ref' => '#/components/responses/Forbidden'],
+                    ],
+                ],
+            ],
+            '/superadmin/server-logs/{source}/{date}/{id}' => [
+                'get' => [
+                    'tags' => ['Superadmin'],
+                    'summary' => 'Load server log entry details',
+                    'security' => [['bearerAuth' => []]],
+                    'responses' => [
+                        '200' => ['description' => 'Server log entry details'],
+                        '404' => ['$ref' => '#/components/responses/NotFound'],
+                    ],
+                ],
+            ],
+            '/superadmin/logging-status' => [
+                'get' => [
+                    'tags' => ['Superadmin'],
+                    'summary' => 'Load logging subsystem status',
+                    'security' => [['bearerAuth' => []]],
+                    'responses' => [
+                        '200' => ['description' => 'Logging status'],
+                        '403' => ['$ref' => '#/components/responses/Forbidden'],
                     ],
                 ],
             ],

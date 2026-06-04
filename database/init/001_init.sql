@@ -3,6 +3,7 @@ SET NAMES utf8mb4;
 
 DROP TABLE IF EXISTS activity_logs;
 DROP TABLE IF EXISTS event_participant_change_logs;
+DROP TABLE IF EXISTS audit_logs;
 DROP TABLE IF EXISTS event_participant_import_baseline_records;
 DROP TABLE IF EXISTS sync_outbox;
 DROP TABLE IF EXISTS client_mutations;
@@ -172,8 +173,46 @@ CREATE TABLE participants (
         ON UPDATE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+CREATE TABLE audit_logs (
+    id VARCHAR(64) NOT NULL,
+    category VARCHAR(64) NOT NULL,
+    action_code VARCHAR(128) NOT NULL,
+    action VARCHAR(190) NOT NULL,
+    outcome VARCHAR(32) NOT NULL DEFAULT 'success',
+    severity VARCHAR(32) NOT NULL DEFAULT 'info',
+    actor_user_id VARCHAR(64) NULL,
+    actor_name_snapshot VARCHAR(190) NULL,
+    actor_role_snapshot VARCHAR(64) NULL,
+    target_type VARCHAR(64) NULL,
+    target_id VARCHAR(128) NULL,
+    organization_id VARCHAR(64) NULL,
+    event_id VARCHAR(64) NULL,
+    participant_id BIGINT UNSIGNED NULL,
+    request_id VARCHAR(128) NULL,
+    ip_hash CHAR(64) NULL,
+    metadata_json LONGTEXT NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    KEY idx_audit_logs_created_at (created_at),
+    KEY idx_audit_logs_category (category),
+    KEY idx_audit_logs_action_code (action_code),
+    KEY idx_audit_logs_outcome (outcome),
+    KEY idx_audit_logs_severity (severity),
+    KEY idx_audit_logs_actor_user_id (actor_user_id),
+    KEY idx_audit_logs_target (target_type, target_id),
+    KEY idx_audit_logs_organization_id (organization_id),
+    KEY idx_audit_logs_event_id (event_id),
+    KEY idx_audit_logs_participant_id (participant_id),
+    KEY idx_audit_logs_request_id (request_id),
+    CONSTRAINT fk_audit_logs_actor_user FOREIGN KEY (actor_user_id) REFERENCES users(id) ON DELETE SET NULL ON UPDATE CASCADE,
+    CONSTRAINT fk_audit_logs_organization FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE SET NULL ON UPDATE CASCADE,
+    CONSTRAINT fk_audit_logs_event FOREIGN KEY (event_id) REFERENCES events(id) ON DELETE SET NULL ON UPDATE CASCADE,
+    CONSTRAINT fk_audit_logs_participant FOREIGN KEY (participant_id) REFERENCES participants(id) ON DELETE SET NULL ON UPDATE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 CREATE TABLE event_participant_change_logs (
     id VARCHAR(64) NOT NULL,
+    audit_log_id VARCHAR(64) NULL,
     event_id VARCHAR(64) NOT NULL,
     participant_audit_key VARCHAR(64) NOT NULL,
     baseline_record_id BIGINT UNSIGNED NULL,
@@ -188,6 +227,7 @@ CREATE TABLE event_participant_change_logs (
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (id),
     KEY idx_event_participant_change_logs_event_id (event_id),
+    KEY idx_event_participant_change_logs_audit_log_id (audit_log_id),
     KEY idx_event_participant_change_logs_audit_key (participant_audit_key),
     KEY idx_event_participant_change_logs_baseline_record_id (baseline_record_id),
     KEY idx_event_participant_change_logs_participant_id (participant_id),
@@ -195,6 +235,10 @@ CREATE TABLE event_participant_change_logs (
     CONSTRAINT fk_event_participant_change_logs_event
         FOREIGN KEY (event_id) REFERENCES events(id)
         ON DELETE CASCADE
+        ON UPDATE CASCADE,
+    CONSTRAINT fk_event_participant_change_logs_audit_log
+        FOREIGN KEY (audit_log_id) REFERENCES audit_logs(id)
+        ON DELETE SET NULL
         ON UPDATE CASCADE,
     CONSTRAINT fk_event_participant_change_logs_baseline_record
         FOREIGN KEY (baseline_record_id) REFERENCES event_participant_import_baseline_records(id)
@@ -435,3 +479,26 @@ ON DUPLICATE KEY UPDATE
     participant_name_snapshot = VALUES(participant_name_snapshot),
     user_id = VALUES(user_id),
     user_name_snapshot = VALUES(user_name_snapshot);
+
+INSERT INTO audit_logs (
+    id, category, action_code, action, actor_user_id, actor_name_snapshot,
+    target_type, target_id, participant_id, metadata_json
+)
+SELECT
+    CONCAT('legacy-', al.id),
+    'participants',
+    'activity.seed',
+    al.action,
+    al.user_id,
+    al.user_name_snapshot,
+    'participant',
+    CAST(al.participant_id AS CHAR),
+    al.participant_id,
+    JSON_OBJECT('participant_name', al.participant_name_snapshot, 'migrated_from_activity_logs', TRUE)
+FROM activity_logs al
+ON DUPLICATE KEY UPDATE
+    action = VALUES(action),
+    actor_user_id = VALUES(actor_user_id),
+    actor_name_snapshot = VALUES(actor_name_snapshot),
+    participant_id = VALUES(participant_id),
+    metadata_json = VALUES(metadata_json);
