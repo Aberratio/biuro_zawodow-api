@@ -105,6 +105,9 @@ $insertStmt = $pdo->prepare('
     INSERT INTO schema_migrations (migration, checksum)
     VALUES (:migration, :checksum)
 ');
+$runMigration = static function (string $migrationPath): void {
+    require $migrationPath;
+};
 
 if (isset($options['baseline'])) {
     foreach ($pending as $migration) {
@@ -121,7 +124,7 @@ if (isset($options['baseline'])) {
 foreach ($pending as $migration) {
     echo "Running migration: {$migration['name']}\n";
 
-    require $migration['path'];
+    $runMigration($migration['path']);
 
     $insertStmt->execute([
         'migration' => $migration['name'],
