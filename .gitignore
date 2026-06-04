@@ -1,5 +1,5 @@
 ﻿# Ignore local env and runtime artifacts
-.env
+.env*
 vendor/
 mysql-data/
 storage/logs/*
