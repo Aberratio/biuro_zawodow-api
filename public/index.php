@@ -7108,6 +7108,8 @@ try {
         }
 
         try {
+            $wasAlreadySent = (string)($participant['email_status'] ?? '') === 'sent';
+
             MailService::sendParticipantQrEmail(
                 recipientEmail: (string)$participant['email'],
                 recipientName: (string)$participant['display_name'],
@@ -7129,7 +7131,7 @@ try {
 
             $addActivityLog(
                 $pdo,
-                'Ponownie wyslano kod QR',
+                $wasAlreadySent ? 'Ponownie wyslano kod QR' : 'Wyslano kod QR',
                 (string)$event['id'],
                 (int)$participant['id'],
                 (string)$participant['display_name'],
