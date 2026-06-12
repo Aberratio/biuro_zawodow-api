@@ -2,12 +2,11 @@
 
 declare(strict_types=1);
 
-use PHPMailer\PHPMailer\Exception as PHPMailerException;
-use PHPMailer\PHPMailer\PHPMailer;
-use PHPMailer\PHPMailer\SMTP;
-
 final class MailService
 {
+    private const PRIORITY_NORMAL = 'normal';
+    private const PRIORITY_TECHNICAL = 'technical';
+
     public static function sendPasswordResetEmail(string $recipientEmail, string $recipientName, string $resetUrl): void
     {
         self::sendActionEmail(
@@ -17,7 +16,8 @@ final class MailService
             introText: 'Otrzymaliśmy prośbę o ustawienie nowego hasła do Twojego konta.',
             validityText: 'Link jest ważny przez 60 minut.',
             actionLabel: 'Ustaw nowe hasło',
-            actionUrl: $resetUrl
+            actionUrl: $resetUrl,
+            metadataType: 'password_reset'
         );
     }
 
@@ -30,7 +30,8 @@ final class MailService
             introText: 'Twoje konto zostało utworzone. Aby rozpocząć pracę, ustaw własne hasło.',
             validityText: 'Link do ustawienia hasła jest ważny przez 7 dni.',
             actionLabel: 'Ustaw hasło',
-            actionUrl: $resetUrl
+            actionUrl: $resetUrl,
+            metadataType: 'account_setup'
         );
     }
 
@@ -43,7 +44,8 @@ final class MailService
             introText: 'Administrator wysłał link do ustawienia hasła do Twojego konta.',
             validityText: 'Link do ustawienia hasła jest ważny przez 7 dni.',
             actionLabel: 'Ustaw hasło',
-            actionUrl: $resetUrl
+            actionUrl: $resetUrl,
+            metadataType: 'password_setup'
         );
     }
 
@@ -58,51 +60,61 @@ final class MailService
         array $participantCustomFields = [],
         array $participantImportantFieldAliases = []
     ): void {
-        $mail = self::createConfiguredMailer();
-        $qrImage = QrCodeService::renderPng($qrToken, 320, 10);
-        $qrMimeType = 'image/png';
-        $qrFilename = 'kod-qr.png';
+        self::sendQueuedEmail(
+            endpoint: '/emails',
+            payload: self::participantQrPayload(
+                recipientEmail: $recipientEmail,
+                recipientName: $recipientName,
+                eventName: $eventName,
+                eventOfficeWindow: $eventOfficeWindow,
+                eventLocation: $eventLocation,
+                bibNumber: $bibNumber,
+                qrToken: $qrToken,
+                participantCustomFields: $participantCustomFields,
+                participantImportantFieldAliases: $participantImportantFieldAliases
+            ),
+            idempotencyKey: self::idempotencyKey('participant-qr', $recipientEmail . '|' . $eventName . '|' . $qrToken . '|' . bin2hex(random_bytes(8)))
+        );
+    }
 
-        try {
-            $mail->addAddress($recipientEmail, $recipientName);
-            $mail->addStringEmbeddedImage(
-                $qrImage,
-                'participant-qr',
-                $qrFilename,
-                PHPMailer::ENCODING_BASE64,
-                $qrMimeType
+    public static function sendParticipantQrEmailBatch(array $messages): void
+    {
+        $recipients = [];
+        foreach ($messages as $message) {
+            $payload = self::participantQrPayload(
+                recipientEmail: (string)($message['recipientEmail'] ?? ''),
+                recipientName: (string)($message['recipientName'] ?? ''),
+                eventName: (string)($message['eventName'] ?? ''),
+                eventOfficeWindow: (string)($message['eventOfficeWindow'] ?? ''),
+                eventLocation: (string)($message['eventLocation'] ?? ''),
+                bibNumber: (string)($message['bibNumber'] ?? ''),
+                qrToken: (string)($message['qrToken'] ?? ''),
+                participantCustomFields: is_array($message['participantCustomFields'] ?? null) ? $message['participantCustomFields'] : [],
+                participantImportantFieldAliases: is_array($message['participantImportantFieldAliases'] ?? null) ? $message['participantImportantFieldAliases'] : []
             );
-            $mail->addStringAttachment(
-                $qrImage,
-                $qrFilename,
-                PHPMailer::ENCODING_BASE64,
-                $qrMimeType
+            unset($payload['priority']);
+            $payload['metadata']['participantId'] = $message['participantId'] ?? null;
+            $recipients[] = $payload;
+        }
+
+        if ($recipients === []) {
+            return;
+        }
+
+        $batchSize = max(1, (int)(getenv('CENTRAL_MAILER_BATCH_SIZE') ?: 500));
+        foreach (array_chunk($recipients, $batchSize) as $index => $recipientChunk) {
+            self::sendQueuedEmail(
+                endpoint: '/emails/batch',
+                payload: [
+                    'subject' => 'Kody QR uczestnikow',
+                    'html' => '<p>Kod QR uczestnika jest gotowy.</p>',
+                    'text' => 'Kod QR uczestnika jest gotowy.',
+                    'priority' => self::PRIORITY_NORMAL,
+                    'metadata' => ['type' => 'participant_qr_batch', 'chunkIndex' => $index],
+                    'recipients' => $recipientChunk,
+                ],
+                idempotencyKey: self::idempotencyKey('participant-qr-batch', json_encode($recipientChunk, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR) . '|' . $index . '|' . bin2hex(random_bytes(8)))
             );
-            $mail->isHTML(true);
-            $mail->Subject = sprintf('Twój pakiet startowy i kod QR: %s', $eventName);
-            $mail->Body = self::participantQrHtml(
-                $recipientName,
-                $recipientEmail,
-                $eventName,
-                $eventOfficeWindow,
-                $eventLocation,
-                $bibNumber,
-                $participantCustomFields,
-                $participantImportantFieldAliases
-            );
-            $mail->AltBody = self::participantQrText(
-                $recipientName,
-                $recipientEmail,
-                $eventName,
-                $eventOfficeWindow,
-                $eventLocation,
-                $bibNumber,
-                $participantCustomFields,
-                $participantImportantFieldAliases
-            );
-            $mail->send();
-        } catch (PHPMailerException $exception) {
-            throw self::buildSendException($mail, $exception);
         }
     }
 
@@ -113,97 +125,136 @@ final class MailService
         string $introText,
         string $validityText,
         string $actionLabel,
-        string $actionUrl
+        string $actionUrl,
+        string $metadataType
     ): void {
-        $mail = self::createConfiguredMailer();
+        self::sendQueuedEmail(
+            endpoint: '/emails',
+            payload: [
+                'to' => $recipientEmail,
+                'subject' => $subject,
+                'html' => self::actionHtml($recipientName, $introText, $validityText, $actionLabel, $actionUrl),
+                'text' => self::actionText($recipientName, $introText, $validityText, $actionLabel, $actionUrl),
+                'priority' => self::PRIORITY_TECHNICAL,
+                'metadata' => [
+                    'type' => $metadataType,
+                    'recipientName' => $recipientName,
+                ],
+            ],
+            idempotencyKey: self::idempotencyKey($metadataType, $recipientEmail . '|' . $actionUrl)
+        );
+    }
 
+    private static function participantQrPayload(
+        string $recipientEmail,
+        string $recipientName,
+        string $eventName,
+        string $eventOfficeWindow,
+        string $eventLocation,
+        string $bibNumber,
+        string $qrToken,
+        array $participantCustomFields,
+        array $participantImportantFieldAliases
+    ): array {
+        $qrImage = QrCodeService::renderPng($qrToken, 320, 10);
+
+        return [
+            'to' => $recipientEmail,
+            'subject' => sprintf('Twoj pakiet startowy i kod QR: %s', $eventName),
+            'html' => self::participantQrHtml(
+                $recipientName,
+                $recipientEmail,
+                $eventName,
+                $eventOfficeWindow,
+                $eventLocation,
+                $bibNumber,
+                qrCodeImageUrl($qrToken),
+                $participantCustomFields,
+                $participantImportantFieldAliases
+            ),
+            'text' => self::participantQrText(
+                $recipientName,
+                $recipientEmail,
+                $eventName,
+                $eventOfficeWindow,
+                $eventLocation,
+                $bibNumber,
+                $participantCustomFields,
+                $participantImportantFieldAliases
+            ),
+            'priority' => self::PRIORITY_NORMAL,
+            'metadata' => [
+                'type' => 'participant_qr',
+                'recipientName' => $recipientName,
+                'eventName' => $eventName,
+                'bibNumber' => $bibNumber,
+            ],
+            'attachments' => [
+                [
+                    'filename' => 'kod-qr.png',
+                    'contentBase64' => base64_encode($qrImage),
+                ],
+            ],
+        ];
+    }
+
+    private static function sendQueuedEmail(string $endpoint, array $payload, ?string $idempotencyKey = null): void
+    {
+        $baseUrl = rtrim(trim((string)(getenv('CENTRAL_MAILER_URL') ?: '')), '/');
+        $apiKey = trim((string)(getenv('CENTRAL_MAILER_API_KEY') ?: ''));
+        $timeoutSeconds = max(1, (int)(getenv('CENTRAL_MAILER_TIMEOUT_SECONDS') ?: 10));
+
+        if ($baseUrl === '' || $apiKey === '') {
+            throw new RuntimeException('Central-mailer nie jest skonfigurowany. Uzupelnij CENTRAL_MAILER_URL oraz CENTRAL_MAILER_API_KEY.');
+        }
+
+        $payload['metadata'] = array_merge([
+            'source' => 'biuro_zawodow',
+            'requestId' => class_exists('RequestContext') ? RequestContext::id() : null,
+        ], is_array($payload['metadata'] ?? null) ? $payload['metadata'] : []);
+
+        $json = json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+        $headers = [
+            'Content-Type: application/json',
+            'Accept: application/json',
+            'X-API-Key: ' . $apiKey,
+        ];
+        if ($idempotencyKey !== null) {
+            $headers[] = 'Idempotency-Key: ' . $idempotencyKey;
+        }
+
+        $context = stream_context_create([
+            'http' => [
+                'method' => 'POST',
+                'header' => implode("\r\n", $headers),
+                'content' => $json,
+                'timeout' => $timeoutSeconds,
+                'ignore_errors' => true,
+            ],
+        ]);
+
+        set_error_handler(static function (int $severity, string $message): bool {
+            throw new RuntimeException($message, $severity);
+        });
         try {
-            $mail->addAddress($recipientEmail, $recipientName);
-            $mail->isHTML(true);
-            $mail->Subject = $subject;
-            $mail->Body = self::actionHtml($recipientName, $introText, $validityText, $actionLabel, $actionUrl);
-            $mail->AltBody = self::actionText($recipientName, $introText, $validityText, $actionLabel, $actionUrl);
-            $mail->send();
-        } catch (PHPMailerException $exception) {
-            throw self::buildSendException($mail, $exception);
-        }
-    }
-
-    private static function createConfiguredMailer(): PHPMailer
-    {
-        if (!class_exists(PHPMailer::class)) {
-            throw new RuntimeException('PHPMailer nie jest zainstalowany. Uruchom composer install w katalogu biuro_zawodow-api.');
+            $responseBody = file_get_contents($baseUrl . $endpoint, false, $context);
+            $responseHeaders = $http_response_header ?? [];
+        } catch (Throwable $exception) {
+            $runtimeException = new RuntimeException('Nie udalo sie przekazac wiadomosci do central-mailer: ' . $exception->getMessage(), 0, $exception);
+            self::logException($runtimeException, 'central_mailer.enqueue_failed');
+            throw $runtimeException;
+        } finally {
+            restore_error_handler();
         }
 
-        $host = trim((string)(getenv('MAIL_HOST') ?: ''));
-        $port = (int)(getenv('MAIL_PORT') ?: 0);
-        $username = trim((string)(getenv('MAIL_USERNAME') ?: ''));
-        $password = (string)(getenv('MAIL_PASSWORD') ?: '');
-        $fromAddress = trim((string)(getenv('MAIL_FROM_ADDRESS') ?: ''));
-        $fromName = trim((string)(getenv('MAIL_FROM_NAME') ?: 'Biuro Zawodów'));
-
-        if ($host === '' || $port <= 0 || $username === '' || $password === '' || $fromAddress === '') {
-            throw new RuntimeException('SMTP nie jest skonfigurowane. Uzupełnij MAIL_HOST, MAIL_PORT, MAIL_USERNAME, MAIL_PASSWORD oraz MAIL_FROM_ADDRESS.');
+        $statusCode = self::extractHttpStatusCode($responseHeaders);
+        if ($responseBody === false || $statusCode < 200 || $statusCode >= 300) {
+            $error = self::extractErrorMessage(is_string($responseBody) ? $responseBody : '');
+            $message = sprintf('Central-mailer odrzucil wiadomosc e-mail (HTTP %d)%s.', $statusCode, $error !== '' ? ': ' . $error : '');
+            $runtimeException = new RuntimeException($message);
+            self::logException($runtimeException, 'central_mailer.enqueue_rejected');
+            throw $runtimeException;
         }
-
-        $encryption = strtolower(trim((string)(getenv('MAIL_ENCRYPTION') ?: 'tls')));
-        $mail = new PHPMailer(true);
-        $debugBuffer = '';
-
-        $mail->isSMTP();
-        $mail->Host = $host;
-        $mail->Port = $port;
-        $mail->SMTPAuth = true;
-        $mail->Username = $username;
-        $mail->Password = $password;
-        $mail->CharSet = 'UTF-8';
-
-        if ((getenv('APP_DEBUG') ?: 'false') === 'true') {
-            $mail->SMTPDebug = SMTP::DEBUG_SERVER;
-            $mail->Debugoutput = static function (string $message, int $level) use (&$debugBuffer): void {
-                $debugBuffer .= "[{$level}] {$message}\n";
-            };
-        }
-
-        if ($encryption === 'tls') {
-            $mail->SMTPSecure = PHPMailer::ENCRYPTION_STARTTLS;
-        } elseif ($encryption === 'ssl') {
-            $mail->SMTPSecure = PHPMailer::ENCRYPTION_SMTPS;
-        } else {
-            $mail->SMTPSecure = false;
-            $mail->SMTPAutoTLS = false;
-        }
-
-        $mail->setFrom($fromAddress, $fromName);
-        if ($debugBuffer !== '') {
-            $mail->setCustomHeader('X-Debug-Buffer', base64_encode($debugBuffer));
-        }
-
-        return $mail;
-    }
-
-    private static function buildSendException(PHPMailer $mail, PHPMailerException $exception): RuntimeException
-    {
-        $message = 'Nie udało się wysłać wiadomości e-mail: ' . $exception->getMessage();
-        if ((getenv('APP_DEBUG') ?: 'false') === 'true') {
-            foreach ($mail->getCustomHeaders() as $header) {
-                if (($header[0] ?? '') !== 'X-Debug-Buffer') {
-                    continue;
-                }
-
-                $decoded = base64_decode((string)($header[1] ?? ''), true);
-                if ($decoded !== false && $decoded !== '') {
-                    $message .= "\nSMTP debug:\n" . trim($decoded);
-                }
-                break;
-            }
-        }
-
-        $runtimeException = new RuntimeException($message, 0, $exception);
-        if (class_exists('ApplicationLogger')) {
-            ApplicationLogger::logException($runtimeException, 'smtp.send_failed');
-        }
-        return $runtimeException;
     }
 
     private static function actionHtml(
@@ -213,94 +264,40 @@ final class MailService
         string $actionLabel,
         string $actionUrl
     ): string {
-        $safeName = htmlspecialchars($recipientName !== '' ? $recipientName : 'Użytkowniku', ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
-        $safeIntroText = htmlspecialchars($introText, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
-        $safeValidityText = htmlspecialchars($validityText, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
-        $safeActionLabel = htmlspecialchars($actionLabel, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
-        $safeUrl = htmlspecialchars($actionUrl, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+        $safeName = self::escape($recipientName !== '' ? $recipientName : 'Uzytkowniku');
+        $safeIntroText = self::escape($introText);
+        $safeValidityText = self::escape($validityText);
+        $safeActionLabel = self::escape($actionLabel);
+        $safeUrl = self::escape($actionUrl);
 
         return <<<HTML
 <!doctype html>
 <html lang="pl">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="color-scheme" content="dark light">
-  <meta name="supported-color-schemes" content="dark light">
-  <title>{$safeActionLabel}</title>
-</head>
-<body style="margin:0;padding:0;background:#07090d;color:#f8f5ef;font-family:Arial,Helvetica,sans-serif;-webkit-text-size-adjust:100%;-ms-text-size-adjust:100%;">
-  <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;line-height:1px;font-size:1px;">{$safeIntroText} {$safeValidityText}</div>
-  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;background:#07090d;">
-    <tr>
-      <td align="center" style="padding:18px 10px;">
-        <table role="presentation" width="600" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:600px;border-collapse:separate;border-spacing:0;background:#111419;border:1px solid #302d28;border-radius:22px;overflow:hidden;box-shadow:0 24px 70px rgba(0,0,0,0.45);">
-          <tr>
-            <td style="height:5px;line-height:5px;font-size:0;background:#e5b761;">&nbsp;</td>
-          </tr>
-          <tr>
-            <td style="padding:22px 22px 18px;background:#111419;">
-              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;">
-                <tr>
-                  <td style="padding:0 0 10px;">
-                    <p style="margin:0;font-size:12px;line-height:16px;font-weight:700;letter-spacing:1.8px;text-transform:uppercase;color:#e5b761;">Biuro Zawodów</p>
-                  </td>
-                </tr>
-                <tr>
-                  <td style="padding:0;">
-                    <h1 style="margin:0;font-size:25px;line-height:31px;font-weight:800;color:#f8f5ef;">{$safeActionLabel}</h1>
-                    <p style="margin:8px 0 0;font-size:14px;line-height:21px;color:#b8b0a6;">Cześć {$safeName},</p>
-                  </td>
-                </tr>
-              </table>
-            </td>
-          </tr>
-          <tr>
-            <td style="padding:0 22px 22px;background:#111419;">
-              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:separate;border-spacing:0;background:#171a20;border:1px solid #3a3228;border-radius:18px;">
-                <tr>
-                  <td style="padding:18px 16px 8px;">
-                    <p style="margin:0;font-size:15px;line-height:23px;color:#f8f5ef;">{$safeIntroText}</p>
-                    <p style="margin:10px 0 0;font-size:13px;line-height:20px;color:#b8b0a6;">{$safeValidityText}</p>
-                  </td>
-                </tr>
-                <tr>
-                  <td align="center" style="padding:12px 16px 18px;">
-                    <a href="{$safeUrl}" style="display:inline-block;background:#e5b761;color:#19140d;text-decoration:none;font-size:15px;line-height:20px;font-weight:800;padding:13px 22px;border-radius:14px;border:1px solid #f0cc80;">{$safeActionLabel}</a>
-                  </td>
-                </tr>
-              </table>
-              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:separate;border-spacing:0;background:#0b0d12;border:1px solid #2e2a25;border-radius:16px;margin-top:14px;">
-                <tr>
-                  <td style="padding:14px 16px;">
-                    <p style="margin:0 0 6px;font-size:12px;line-height:18px;color:#a79d91;">Jeśli przycisk nie działa, skopiuj ten adres do przeglądarki:</p>
-                    <p style="margin:0;font-size:13px;line-height:19px;word-break:break-all;"><a href="{$safeUrl}" style="color:#e5b761;text-decoration:underline;">{$safeUrl}</a></p>
-                  </td>
-                </tr>
-              </table>
-            </td>
-          </tr>
-          <tr>
-            <td align="center" style="padding:14px 22px 20px;background:#0b0d12;border-top:1px solid #2e2a25;">
-              <p style="margin:0;font-size:11px;line-height:16px;color:#7e756b;">Jeśli to nie Ty, zignoruj tę wiadomość. Link wygaśnie automatycznie.</p>
-            </td>
-          </tr>
-        </table>
-      </td>
-    </tr>
+<body style="margin:0;padding:0;background:#07090d;color:#f8f5ef;font-family:Arial,Helvetica,sans-serif;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#07090d;padding:18px 10px;">
+    <tr><td align="center">
+      <table role="presentation" width="600" cellspacing="0" cellpadding="0" style="width:100%;max-width:600px;background:#111419;border:1px solid #302d28;border-radius:18px;overflow:hidden;">
+        <tr><td style="height:5px;background:#e5b761;"></td></tr>
+        <tr><td style="padding:24px;">
+          <p style="margin:0 0 8px;font-size:12px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:#e5b761;">Biuro Zawodów</p>
+          <h1 style="margin:0 0 12px;font-size:25px;line-height:31px;color:#f8f5ef;">{$safeActionLabel}</h1>
+          <p style="margin:0 0 12px;font-size:15px;line-height:23px;color:#f8f5ef;">Cześć {$safeName},</p>
+          <p style="margin:0 0 10px;font-size:15px;line-height:23px;color:#f8f5ef;">{$safeIntroText}</p>
+          <p style="margin:0 0 18px;font-size:13px;line-height:20px;color:#b8b0a6;">{$safeValidityText}</p>
+          <p style="margin:0 0 18px;text-align:center;"><a href="{$safeUrl}" style="display:inline-block;background:#e5b761;color:#19140d;text-decoration:none;font-size:15px;font-weight:800;padding:13px 22px;border-radius:12px;">{$safeActionLabel}</a></p>
+          <p style="margin:0;font-size:12px;line-height:18px;color:#a79d91;">Jeśli przycisk nie działa, skopiuj ten adres do przeglądarki:<br><a href="{$safeUrl}" style="color:#e5b761;">{$safeUrl}</a></p>
+        </td></tr>
+        <tr><td style="padding:14px 24px;background:#0b0d12;border-top:1px solid #2e2a25;text-align:center;"><p style="margin:0;font-size:11px;color:#7e756b;">Jeśli to nie Ty, zignoruj tę wiadomość.</p></td></tr>
+      </table>
+    </td></tr>
   </table>
 </body>
 </html>
 HTML;
     }
 
-    private static function actionText(
-        string $recipientName,
-        string $introText,
-        string $validityText,
-        string $actionLabel,
-        string $actionUrl
-    ): string {
+    private static function actionText(string $recipientName, string $introText, string $validityText, string $actionLabel, string $actionUrl): string
+    {
         $name = $recipientName !== '' ? $recipientName : 'Użytkowniku';
 
         return implode("\n\n", [
@@ -319,124 +316,47 @@ HTML;
         string $eventOfficeWindow,
         string $eventLocation,
         string $bibNumber,
+        string $qrImageUrl,
         array $participantCustomFields,
         array $participantImportantFieldAliases
     ): string {
-        $safeName = htmlspecialchars($recipientName !== '' ? $recipientName : 'Zawodniku', ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
-        $safeEmail = htmlspecialchars($recipientEmail !== '' ? $recipientEmail : '-', ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
-        $safeEventName = htmlspecialchars($eventName !== '' ? $eventName : 'Wydarzenie sportowe', ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
-        $safeEventOfficeWindow = htmlspecialchars($eventOfficeWindow !== '' ? $eventOfficeWindow : 'Do potwierdzenia', ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
-        $safeEventLocation = htmlspecialchars($eventLocation !== '' ? $eventLocation : 'Do potwierdzenia', ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
-        $safeBibNumber = htmlspecialchars($bibNumber !== '' ? $bibNumber : '-', ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+        $safeName = self::escape($recipientName !== '' ? $recipientName : 'Zawodniku');
+        $safeEmail = self::escape($recipientEmail !== '' ? $recipientEmail : '-');
+        $safeEventName = self::escape($eventName !== '' ? $eventName : 'Wydarzenie sportowe');
+        $safeEventOfficeWindow = self::escape($eventOfficeWindow !== '' ? $eventOfficeWindow : 'Do potwierdzenia');
+        $safeEventLocation = self::escape($eventLocation !== '' ? $eventLocation : 'Do potwierdzenia');
+        $safeBibNumber = self::escape($bibNumber !== '' ? $bibNumber : '-');
+        $safeQrImageUrl = self::escape($qrImageUrl);
         $importantFieldRows = self::participantImportantFieldRows($participantCustomFields, $participantImportantFieldAliases);
 
         return <<<HTML
 <!doctype html>
 <html lang="pl">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="color-scheme" content="dark light">
-  <meta name="supported-color-schemes" content="dark light">
-  <title>Twój kod QR na wydarzenie</title>
-</head>
-<body style="margin:0;padding:0;background:#07090d;color:#f8f5ef;font-family:Arial,Helvetica,sans-serif;-webkit-text-size-adjust:100%;-ms-text-size-adjust:100%;">
-  <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;line-height:1px;font-size:1px;">Kod QR na {$safeEventName}. Numer startowy #{$safeBibNumber}. Biuro zawodów: {$safeEventOfficeWindow}.</div>
-  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;background:#07090d;">
-    <tr>
-      <td align="center" style="padding:18px 10px;">
-        <table role="presentation" width="600" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:600px;border-collapse:separate;border-spacing:0;background:#111419;border:1px solid #302d28;border-radius:22px;overflow:hidden;box-shadow:0 24px 70px rgba(0,0,0,0.45);">
-          <tr>
-            <td style="height:5px;line-height:5px;font-size:0;background:#e5b761;">&nbsp;</td>
-          </tr>
-          <tr>
-            <td style="padding:22px 22px 14px;background:#111419;">
-              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;">
-                <tr>
-                  <td style="padding:0 0 10px;">
-                    <p style="margin:0;font-size:12px;line-height:16px;font-weight:700;letter-spacing:1.8px;text-transform:uppercase;color:#e5b761;">Biuro Zawodów</p>
-                  </td>
-                </tr>
-                <tr>
-                  <td style="padding:0;">
-                    <h1 style="margin:0;font-size:25px;line-height:31px;font-weight:800;color:#f8f5ef;">{$safeEventName}</h1>
-                    <p style="margin:8px 0 0;font-size:14px;line-height:21px;color:#b8b0a6;">Cześć {$safeName}, to jest Twój kod QR do odprawy.</p>
-                  </td>
-                </tr>
-              </table>
-            </td>
-          </tr>
-          <tr>
-            <td style="padding:0 22px 22px;background:#111419;">
-              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:separate;border-spacing:0;background:#171a20;border:1px solid #3a3228;border-radius:18px;">
-                <tr>
-                  <td align="center" style="padding:16px 16px 12px;">
-                    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:316px;border-collapse:separate;border-spacing:0;background:#e5b761;border-radius:18px;">
-                      <tr>
-                        <td align="center" style="padding:8px;">
-                          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:separate;border-spacing:0;background:#ffffff;border-radius:13px;">
-                            <tr>
-                              <td align="center" style="padding:14px;">
-                                <img src="cid:participant-qr" width="252" alt="Kod QR uczestnika" style="display:block;width:252px;max-width:100%;height:auto;border:0;outline:none;text-decoration:none;" />
-                              </td>
-                            </tr>
-                          </table>
-                        </td>
-                      </tr>
-                    </table>
-                  </td>
-                </tr>
-                <tr>
-                  <td align="center" style="padding:0 16px 18px;">
-                    <p style="margin:0 0 4px;font-size:12px;line-height:16px;font-weight:700;text-transform:uppercase;letter-spacing:1.3px;color:#a79d91;">Numer startowy</p>
-                    <p style="margin:0;font-size:38px;line-height:42px;font-weight:800;color:#f8f5ef;">#{$safeBibNumber}</p>
-                  </td>
-                </tr>
-              </table>
-              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:separate;border-spacing:0;background:#0b0d12;border:1px solid #2e2a25;border-radius:16px;margin-top:14px;">
-                <tr>
-                  <td style="padding:14px 16px;">
-                    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;">
-                      <tr>
-                        <td style="padding:0 0 10px;border-bottom:1px solid #26231f;">
-                          <p style="margin:0 0 3px;font-size:11px;line-height:15px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:#a79d91;">Uczestnik</p>
-                          <p style="margin:0;font-size:15px;line-height:21px;font-weight:700;color:#f8f5ef;">{$safeName}</p>
-                        </td>
-                      </tr>
-                      <tr>
-                        <td style="padding:10px 0;border-bottom:1px solid #26231f;">
-                          <p style="margin:0 0 3px;font-size:11px;line-height:15px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:#a79d91;">E-mail</p>
-                          <p style="margin:0;font-size:15px;line-height:21px;color:#f8f5ef;word-break:break-word;">{$safeEmail}</p>
-                        </td>
-                      </tr>
-                      {$importantFieldRows}
-                      <tr>
-                        <td style="padding:10px 0;border-bottom:1px solid #26231f;">
-                          <p style="margin:0 0 3px;font-size:11px;line-height:15px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:#a79d91;">Biuro zawodów</p>
-                          <p style="margin:0;font-size:15px;line-height:21px;color:#f8f5ef;">{$safeEventOfficeWindow}</p>
-                        </td>
-                      </tr>
-                      <tr>
-                        <td style="padding:10px 0 0;">
-                          <p style="margin:0 0 3px;font-size:11px;line-height:15px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:#a79d91;">Lokalizacja</p>
-                          <p style="margin:0;font-size:15px;line-height:21px;color:#f8f5ef;">{$safeEventLocation}</p>
-                        </td>
-                      </tr>
-                    </table>
-                  </td>
-                </tr>
-              </table>
-              <p style="margin:12px 0 0;font-size:12px;line-height:18px;color:#a79d91;text-align:center;">Kod QR jest też w załączniku, gdyby klient pocztowy nie wyświetlił obrazka.</p>
-            </td>
-          </tr>
-          <tr>
-            <td align="center" style="padding:14px 22px 20px;background:#0b0d12;border-top:1px solid #2e2a25;">
-              <p style="margin:0;font-size:11px;line-height:16px;color:#7e756b;">Wiadomość automatyczna. Pokaż kod QR przy wejściu lub w biurze zawodów.</p>
-            </td>
-          </tr>
-        </table>
-      </td>
-    </tr>
+<body style="margin:0;padding:0;background:#07090d;color:#f8f5ef;font-family:Arial,Helvetica,sans-serif;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#07090d;padding:18px 10px;">
+    <tr><td align="center">
+      <table role="presentation" width="600" cellspacing="0" cellpadding="0" style="width:100%;max-width:600px;background:#111419;border:1px solid #302d28;border-radius:18px;overflow:hidden;">
+        <tr><td style="height:5px;background:#e5b761;"></td></tr>
+        <tr><td style="padding:24px;">
+          <p style="margin:0 0 8px;font-size:12px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:#e5b761;">Biuro Zawodow</p>
+          <h1 style="margin:0 0 8px;font-size:25px;line-height:31px;color:#f8f5ef;">{$safeEventName}</h1>
+          <p style="margin:0 0 16px;font-size:14px;line-height:21px;color:#b8b0a6;">Czesc {$safeName}, to jest Twoj kod QR do odprawy.</p>
+          <div style="text-align:center;background:#171a20;border:1px solid #3a3228;border-radius:16px;padding:16px;margin-bottom:14px;">
+            <img src="{$safeQrImageUrl}" width="252" alt="Kod QR uczestnika" style="display:block;width:252px;max-width:100%;height:auto;margin:0 auto 12px;background:#ffffff;padding:12px;border-radius:10px;">
+            <p style="margin:0 0 4px;font-size:12px;font-weight:700;text-transform:uppercase;color:#a79d91;">Numer startowy</p>
+            <p style="margin:0;font-size:38px;line-height:42px;font-weight:800;color:#f8f5ef;">#{$safeBibNumber}</p>
+          </div>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#0b0d12;border:1px solid #2e2a25;border-radius:14px;">
+            <tr><td style="padding:14px 16px;border-bottom:1px solid #26231f;"><strong>Uczestnik</strong><br>{$safeName}</td></tr>
+            <tr><td style="padding:14px 16px;border-bottom:1px solid #26231f;"><strong>E-mail</strong><br>{$safeEmail}</td></tr>
+            {$importantFieldRows}
+            <tr><td style="padding:14px 16px;border-bottom:1px solid #26231f;"><strong>Biuro zawodów</strong><br>{$safeEventOfficeWindow}</td></tr>
+            <tr><td style="padding:14px 16px;"><strong>Lokalizacja</strong><br>{$safeEventLocation}</td></tr>
+          </table>
+          <p style="margin:12px 0 0;font-size:12px;line-height:18px;color:#a79d91;text-align:center;">Kod QR jest też w załączniku.</p>
+        </td></tr>
+      </table>
+    </td></tr>
   </table>
 </body>
 </html>
@@ -447,16 +367,9 @@ HTML;
     {
         $rows = [];
         foreach (self::participantImportantFields($customFields, $importantFieldAliases) as $label => $value) {
-            $safeLabel = htmlspecialchars($label, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
-            $safeValue = htmlspecialchars($value, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
-            $rows[] = <<<HTML
-                      <tr>
-                        <td style="padding:10px 0;border-bottom:1px solid #26231f;">
-                          <p style="margin:0 0 3px;font-size:11px;line-height:15px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:#a79d91;">{$safeLabel}</p>
-                          <p style="margin:0;font-size:15px;line-height:21px;color:#f8f5ef;word-break:break-word;">{$safeValue}</p>
-                        </td>
-                      </tr>
-HTML;
+            $safeLabel = self::escape($label);
+            $safeValue = self::escape($value);
+            $rows[] = '<tr><td style="padding:14px 16px;border-bottom:1px solid #26231f;"><strong>' . $safeLabel . '</strong><br>' . $safeValue . '</td></tr>';
         }
 
         return implode("\n", $rows);
@@ -514,17 +427,67 @@ HTML;
         $importantFieldLines = self::participantImportantFieldTextLines($participantCustomFields, $participantImportantFieldAliases);
 
         return implode("\n\n", [
-            "Cześć {$name},",
-            'Twój kod QR do odprawy jest gotowy.',
+            "Czesc {$name},",
+            'Twoj kod QR do odprawy jest gotowy.',
             "Wydarzenie: {$resolvedEventName}",
             "Uczestnik: {$name}",
             "E-mail: {$email}",
             ...$importantFieldLines,
-            "Biuro zawodów: {$resolvedEventOfficeWindow}",
+            "Biuro zawodow: {$resolvedEventOfficeWindow}",
             "Miejsce: {$resolvedEventLocation}",
             "Numer startowy: #{$resolvedBibNumber}",
-            'Zachowaj tę wiadomość i pokaż kod QR przy wejściu lub w biurze zawodów.',
-            'Kod QR jest dołączony do tej wiadomości jako załącznik.',
+            'Zachowaj te wiadomosc i pokaz kod QR przy wejsciu lub w biurze zawodow.',
+            'Kod QR jest dolaczony do tej wiadomosci jako zalacznik.',
         ]);
+    }
+
+    private static function extractHttpStatusCode(array $headers): int
+    {
+        $statusLine = (string)($headers[0] ?? '');
+        if (preg_match('#^HTTP/\S+\s+(\d{3})#', $statusLine, $matches) === 1) {
+            return (int)$matches[1];
+        }
+
+        return 0;
+    }
+
+    private static function extractErrorMessage(string $responseBody): string
+    {
+        if ($responseBody === '') {
+            return '';
+        }
+
+        try {
+            $decoded = json_decode($responseBody, true, 512, JSON_THROW_ON_ERROR);
+        } catch (Throwable) {
+            return mb_substr($responseBody, 0, 500);
+        }
+
+        if (is_array($decoded)) {
+            foreach (['error', 'message'] as $key) {
+                if (isset($decoded[$key]) && is_string($decoded[$key])) {
+                    return $decoded[$key];
+                }
+            }
+        }
+
+        return '';
+    }
+
+    private static function idempotencyKey(string $type, string $value): string
+    {
+        return sprintf('biuro-zawodow:%s:%s', $type, hash('sha256', $value));
+    }
+
+    private static function escape(string $value): string
+    {
+        return htmlspecialchars($value, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+    }
+
+    private static function logException(Throwable $exception, string $context): void
+    {
+        if (class_exists('ApplicationLogger')) {
+            ApplicationLogger::logException($exception, $context);
+        }
     }
 }

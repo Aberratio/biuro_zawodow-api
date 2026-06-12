@@ -86,13 +86,10 @@ DB_DATABASE=biuro_zawodow
 DB_USERNAME=biuro_user
 DB_PASSWORD=biuro_pass
 
-MAIL_HOST=127.0.0.1
-MAIL_PORT=1025
-MAIL_USERNAME=
-MAIL_PASSWORD=
-MAIL_ENCRYPTION=tls
-MAIL_FROM_ADDRESS=no-reply@biurozawodow.local
-MAIL_FROM_NAME=Biuro Zawodów
+CENTRAL_MAILER_URL=http://localhost:8080
+CENTRAL_MAILER_API_KEY=
+CENTRAL_MAILER_TIMEOUT_SECONDS=10
+CENTRAL_MAILER_BATCH_SIZE=500
 ```
 
 Notes:
@@ -103,18 +100,8 @@ Notes:
 - `APP_CORS_ORIGIN` must contain the frontend origin. Wildcard CORS is rejected outside local/dev/test.
 - `LOG_DIR` defaults to `storage/logs`, outside the public webroot. Production should use a private absolute path.
 - `SENTRY_DSN` is optional. Empty or unavailable Sentry never blocks API requests.
-
-For local mail testing you can use Mailpit:
-
-```powershell
-docker run --rm -p 1025:1025 -p 8025:8025 axllent/mailpit
-```
-
-Then open:
-
-```text
-http://localhost:8025
-```
+- `CENTRAL_MAILER_URL` points to the central-mailer REST API. `CENTRAL_MAILER_API_KEY` must match an active central-mailer client key for this application.
+- `CENTRAL_MAILER_BATCH_SIZE` controls QR email batch chunking and should not exceed central-mailer's `EMAIL_BATCH_MAX_RECIPIENTS`.
 
 ## Seeded local accounts
 

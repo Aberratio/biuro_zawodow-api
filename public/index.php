@@ -7202,6 +7202,8 @@ try {
         }
 
         $updateSentEmailStatusStmt = $pdo->prepare('UPDATE participants SET email_status = :email_status WHERE id = :id');
+        $qrEmailMessages = [];
+        $queuedParticipantRows = [];
 
         foreach ($participants as $participantRow) {
             $decodedCustomFields = decodeJsonObject($participantRow['custom_fields_json'] ?? null);
@@ -7215,26 +7217,33 @@ try {
                 continue;
             }
 
-            try {
-                MailService::sendParticipantQrEmail(
-                    recipientEmail: (string)$participantRow['email'],
-                    recipientName: (string)$participantRow['display_name'],
-                    eventName: (string)$event['name'],
-                    eventOfficeWindow: $formatEventOfficeWindow($event),
-                    eventLocation: (string)$event['location'],
-                    bibNumber: (string)($participantRow['bib_number'] ?? ''),
-                    qrToken: (string)$participantRow['qr_code'],
-                    participantCustomFields: is_array($participantRow['custom_fields'] ?? null) ? $participantRow['custom_fields'] : [],
-                    participantImportantFieldAliases: is_array($participantRow['important_field_aliases'] ?? null) ? $participantRow['important_field_aliases'] : []
-                );
+            $qrEmailMessages[] = [
+                'participantId' => (int)$participantRow['id'],
+                'recipientEmail' => (string)$participantRow['email'],
+                'recipientName' => (string)$participantRow['display_name'],
+                'eventName' => (string)$event['name'],
+                'eventOfficeWindow' => $formatEventOfficeWindow($event),
+                'eventLocation' => (string)$event['location'],
+                'bibNumber' => (string)($participantRow['bib_number'] ?? ''),
+                'qrToken' => (string)$participantRow['qr_code'],
+                'participantCustomFields' => is_array($participantRow['custom_fields'] ?? null) ? $participantRow['custom_fields'] : [],
+                'participantImportantFieldAliases' => is_array($participantRow['important_field_aliases'] ?? null) ? $participantRow['important_field_aliases'] : [],
+            ];
+            $queuedParticipantRows[] = $participantRow;
+        }
 
+        try {
+            MailService::sendParticipantQrEmailBatch($qrEmailMessages);
+            foreach ($queuedParticipantRows as $participantRow) {
                 $updateSentEmailStatusStmt->execute([
                     'email_status' => 'sent',
                     'id' => (int)$participantRow['id'],
                 ]);
-                $sentCount++;
-            } catch (Throwable $exception) {
-                $errorCount++;
+            }
+            $sentCount = count($queuedParticipantRows);
+        } catch (Throwable $exception) {
+            $errorCount = count($queuedParticipantRows);
+            foreach ($queuedParticipantRows as $participantRow) {
                 $errors[] = [
                     'participant_id' => (int)$participantRow['id'],
                     'participant_name' => (string)$participantRow['display_name'],
