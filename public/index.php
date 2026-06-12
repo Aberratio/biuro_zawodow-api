@@ -7141,7 +7141,8 @@ try {
 
             jsonResponse(200, ['data' => $participant]);
         } catch (Throwable $exception) {
-            jsonResponse(422, ['error' => $exception->getMessage()]);
+            $statusCode = $exception instanceof CentralMailerRequestException ? $exception->apiStatusCode() : 422;
+            jsonResponse($statusCode, ['error' => $exception->getMessage()]);
         }
         exit;
     }

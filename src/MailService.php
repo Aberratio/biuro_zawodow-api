@@ -240,7 +240,12 @@ final class MailService
             $responseBody = file_get_contents($baseUrl . $endpoint, false, $context);
             $responseHeaders = $http_response_header ?? [];
         } catch (Throwable $exception) {
-            $runtimeException = new RuntimeException('Nie udalo sie przekazac wiadomosci do central-mailer: ' . $exception->getMessage(), 0, $exception);
+            $runtimeException = new CentralMailerRequestException(
+                'Nie udalo sie przekazac wiadomosci do central-mailer: ' . $exception->getMessage(),
+                503,
+                0,
+                $exception
+            );
             self::logException($runtimeException, 'central_mailer.enqueue_failed');
             throw $runtimeException;
         } finally {
@@ -251,7 +256,7 @@ final class MailService
         if ($responseBody === false || $statusCode < 200 || $statusCode >= 300) {
             $error = self::extractErrorMessage(is_string($responseBody) ? $responseBody : '');
             $message = sprintf('Central-mailer odrzucil wiadomosc e-mail (HTTP %d)%s.', $statusCode, $error !== '' ? ': ' . $error : '');
-            $runtimeException = new RuntimeException($message);
+            $runtimeException = new CentralMailerRequestException($message, self::apiStatusForCentralMailerStatus($statusCode));
             self::logException($runtimeException, 'central_mailer.enqueue_rejected');
             throw $runtimeException;
         }
@@ -474,6 +479,17 @@ HTML;
         return '';
     }
 
+    private static function apiStatusForCentralMailerStatus(int $statusCode): int
+    {
+        return match (true) {
+            $statusCode === 400 => 422,
+            $statusCode === 413 => 413,
+            $statusCode === 429 => 429,
+            $statusCode >= 500 => 502,
+            default => 502,
+        };
+    }
+
     private static function idempotencyKey(string $type, string $value): string
     {
         return sprintf('biuro-zawodow:%s:%s', $type, hash('sha256', $value));
@@ -489,5 +505,22 @@ HTML;
         if (class_exists('ApplicationLogger')) {
             ApplicationLogger::logException($exception, $context);
         }
+    }
+}
+
+final class CentralMailerRequestException extends RuntimeException
+{
+    public function __construct(
+        string $message,
+        private readonly int $apiStatusCode,
+        int $code = 0,
+        ?Throwable $previous = null
+    ) {
+        parent::__construct($message, $code, $previous);
+    }
+
+    public function apiStatusCode(): int
+    {
+        return $this->apiStatusCode;
     }
 }
