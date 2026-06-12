@@ -2905,6 +2905,24 @@ try {
         exit;
     }
 
+    if (preg_match('#^/qr-images/([A-Za-z0-9_%-]+)\.png$#', $path, $matches) === 1 && $method === 'GET') {
+        $qrCode = rawurldecode((string)$matches[1]);
+        $participant = $loadParticipantByQrCode($pdo, $qrCode);
+
+        if ($participant === false) {
+            http_response_code(404);
+            header('Content-Type: text/plain; charset=utf-8');
+            echo 'Nie znaleziono obrazu kodu QR';
+            exit;
+        }
+
+        http_response_code(200);
+        header('Content-Type: image/png');
+        header('Cache-Control: public, max-age=300');
+        echo QrCodeService::renderPng((string)$participant['qr_code'], 320, 10);
+        exit;
+    }
+
     if ($path === '/auth/login' && $method === 'POST') {
         $input = readJsonBody();
         $email = normalizeEmailAddress((string)($input['email'] ?? ''));

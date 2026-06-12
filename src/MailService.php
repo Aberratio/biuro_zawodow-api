@@ -278,13 +278,15 @@ final class MailService
         return <<<HTML
 <!doctype html>
 <html lang="pl">
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
 <body style="margin:0;padding:0;background:#07090d;color:#f8f5ef;font-family:Arial,Helvetica,sans-serif;">
   <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#07090d;padding:18px 10px;">
     <tr><td align="center">
-      <table role="presentation" width="600" cellspacing="0" cellpadding="0" style="width:100%;max-width:600px;background:#111419;border:1px solid #302d28;border-radius:18px;overflow:hidden;">
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;max-width:600px;background:#111419;border:1px solid #302d28;border-radius:18px;overflow:hidden;">
         <tr><td style="height:5px;background:#e5b761;"></td></tr>
         <tr><td style="padding:24px;">
-          <p style="margin:0 0 8px;font-size:12px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:#e5b761;">Biuro Zawodów</p>
           <h1 style="margin:0 0 12px;font-size:25px;line-height:31px;color:#f8f5ef;">{$safeActionLabel}</h1>
           <p style="margin:0 0 12px;font-size:15px;line-height:23px;color:#f8f5ef;">Cześć {$safeName},</p>
           <p style="margin:0 0 10px;font-size:15px;line-height:23px;color:#f8f5ef;">{$safeIntroText}</p>
@@ -337,26 +339,29 @@ HTML;
         return <<<HTML
 <!doctype html>
 <html lang="pl">
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
 <body style="margin:0;padding:0;background:#07090d;color:#f8f5ef;font-family:Arial,Helvetica,sans-serif;">
   <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#07090d;padding:18px 10px;">
     <tr><td align="center">
-      <table role="presentation" width="600" cellspacing="0" cellpadding="0" style="width:100%;max-width:600px;background:#111419;border:1px solid #302d28;border-radius:18px;overflow:hidden;">
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;max-width:600px;background:#111419;border:1px solid #302d28;border-radius:18px;overflow:hidden;table-layout:fixed;">
         <tr><td style="height:5px;background:#e5b761;"></td></tr>
         <tr><td style="padding:24px;">
-          <p style="margin:0 0 8px;font-size:12px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:#e5b761;">Biuro Zawodow</p>
-          <h1 style="margin:0 0 8px;font-size:25px;line-height:31px;color:#f8f5ef;">{$safeEventName}</h1>
-          <p style="margin:0 0 16px;font-size:14px;line-height:21px;color:#b8b0a6;">Czesc {$safeName}, to jest Twoj kod QR do odprawy.</p>
+          <p style="margin:0 0 8px;font-size:12px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:#e5b761;">Biuro Zawodów</p>
+          <h1 style="margin:0 0 8px;font-size:25px;line-height:31px;color:#f8f5ef;overflow-wrap:anywhere;word-break:break-word;">{$safeEventName}</h1>
+          <p style="margin:0 0 16px;font-size:14px;line-height:21px;color:#b8b0a6;">Cześć {$safeName}, to jest Twój kod QR do odprawy.</p>
           <div style="text-align:center;background:#171a20;border:1px solid #3a3228;border-radius:16px;padding:16px;margin-bottom:14px;">
-            <img src="{$safeQrImageUrl}" width="252" alt="Kod QR uczestnika" style="display:block;width:252px;max-width:100%;height:auto;margin:0 auto 12px;background:#ffffff;padding:12px;border-radius:10px;">
+            <img src="{$safeQrImageUrl}" width="220" alt="Kod QR uczestnika" style="display:block;width:220px;max-width:85%;height:auto;margin:0 auto 12px;background:#ffffff;padding:10px;border-radius:10px;">
             <p style="margin:0 0 4px;font-size:12px;font-weight:700;text-transform:uppercase;color:#a79d91;">Numer startowy</p>
-            <p style="margin:0;font-size:38px;line-height:42px;font-weight:800;color:#f8f5ef;">#{$safeBibNumber}</p>
+            <p style="margin:0;font-size:38px;line-height:42px;font-weight:800;color:#f8f5ef;overflow-wrap:anywhere;word-break:break-word;">#{$safeBibNumber}</p>
           </div>
-          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#0b0d12;border:1px solid #2e2a25;border-radius:14px;">
-            <tr><td style="padding:14px 16px;border-bottom:1px solid #26231f;"><strong>Uczestnik</strong><br>{$safeName}</td></tr>
-            <tr><td style="padding:14px 16px;border-bottom:1px solid #26231f;"><strong>E-mail</strong><br>{$safeEmail}</td></tr>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;background:#0b0d12;border:1px solid #2e2a25;border-radius:14px;table-layout:fixed;">
+            <tr><td style="padding:14px 16px;border-bottom:1px solid #26231f;overflow-wrap:anywhere;word-break:break-word;"><strong>Uczestnik</strong><br>{$safeName}</td></tr>
+            <tr><td style="padding:14px 16px;border-bottom:1px solid #26231f;overflow-wrap:anywhere;word-break:break-word;"><strong>E-mail</strong><br>{$safeEmail}</td></tr>
             {$importantFieldRows}
-            <tr><td style="padding:14px 16px;border-bottom:1px solid #26231f;"><strong>Biuro zawodów</strong><br>{$safeEventOfficeWindow}</td></tr>
-            <tr><td style="padding:14px 16px;"><strong>Lokalizacja</strong><br>{$safeEventLocation}</td></tr>
+            <tr><td style="padding:14px 16px;border-bottom:1px solid #26231f;overflow-wrap:anywhere;word-break:break-word;"><strong>Biuro zawodów</strong><br>{$safeEventOfficeWindow}</td></tr>
+            <tr><td style="padding:14px 16px;overflow-wrap:anywhere;word-break:break-word;"><strong>Lokalizacja</strong><br>{$safeEventLocation}</td></tr>
           </table>
           <p style="margin:12px 0 0;font-size:12px;line-height:18px;color:#a79d91;text-align:center;">Kod QR jest też w załączniku.</p>
         </td></tr>
@@ -374,7 +379,7 @@ HTML;
         foreach (self::participantImportantFields($customFields, $importantFieldAliases) as $label => $value) {
             $safeLabel = self::escape($label);
             $safeValue = self::escape($value);
-            $rows[] = '<tr><td style="padding:14px 16px;border-bottom:1px solid #26231f;"><strong>' . $safeLabel . '</strong><br>' . $safeValue . '</td></tr>';
+            $rows[] = '<tr><td style="padding:14px 16px;border-bottom:1px solid #26231f;overflow-wrap:anywhere;word-break:break-word;"><strong>' . $safeLabel . '</strong><br>' . $safeValue . '</td></tr>';
         }
 
         return implode("\n", $rows);
@@ -432,17 +437,17 @@ HTML;
         $importantFieldLines = self::participantImportantFieldTextLines($participantCustomFields, $participantImportantFieldAliases);
 
         return implode("\n\n", [
-            "Czesc {$name},",
-            'Twoj kod QR do odprawy jest gotowy.',
+            "Cześć {$name},",
+            'Twój kod QR do odprawy jest gotowy.',
             "Wydarzenie: {$resolvedEventName}",
             "Uczestnik: {$name}",
             "E-mail: {$email}",
             ...$importantFieldLines,
-            "Biuro zawodow: {$resolvedEventOfficeWindow}",
+            "Biuro zawodów: {$resolvedEventOfficeWindow}",
             "Miejsce: {$resolvedEventLocation}",
             "Numer startowy: #{$resolvedBibNumber}",
-            'Zachowaj te wiadomosc i pokaz kod QR przy wejsciu lub w biurze zawodow.',
-            'Kod QR jest dolaczony do tej wiadomosci jako zalacznik.',
+            'Zachowaj tą wiadomość i pokaś kod QR przy wejściu lub w biurze zawodów.',
+            'Kod QR jest dołączony do tej wiadomości jako załącznik.',
         ]);
     }
 

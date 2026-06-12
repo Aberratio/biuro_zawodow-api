@@ -614,7 +614,7 @@ function appUrl(): string
 
 function qrCodeImageUrl(string $token): string
 {
-    return appUrl() . '/qr-images/' . rawurlencode($token) . '.svg';
+    return appUrl() . '/qr-images/' . rawurlencode($token) . '.png';
 }
 
 function passwordResetTokenHash(string $token): string
@@ -1061,6 +1061,38 @@ function openApiDocument(): array
                             'description' => 'QR code image',
                             'content' => [
                                 'image/svg+xml' => [
+                                    'schema' => [
+                                        'type' => 'string',
+                                        'format' => 'binary',
+                                    ],
+                                ],
+                            ],
+                        ],
+                        '404' => [
+                            '$ref' => '#/components/responses/NotFound',
+                        ],
+                    ],
+                ],
+            ],
+            '/qr-images/{token}.png' => [
+                'get' => [
+                    'tags' => ['Participants'],
+                    'summary' => 'Render participant QR code as PNG',
+                    'parameters' => [
+                        [
+                            'name' => 'token',
+                            'in' => 'path',
+                            'required' => true,
+                            'schema' => [
+                                'type' => 'string',
+                            ],
+                        ],
+                    ],
+                    'responses' => [
+                        '200' => [
+                            'description' => 'QR code image',
+                            'content' => [
+                                'image/png' => [
                                     'schema' => [
                                         'type' => 'string',
                                         'format' => 'binary',

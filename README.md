@@ -165,6 +165,7 @@ Public endpoints:
 - `GET /openapi.json` (non-production only)
 - `GET /health`
 - `GET /qr-images/{token}.svg`
+- `GET /qr-images/{token}.png`
 - `POST /auth/login`
 - `POST /auth/forgot-password`
 - `POST /auth/reset-password`
