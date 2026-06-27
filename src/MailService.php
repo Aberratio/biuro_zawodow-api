@@ -157,6 +157,7 @@ final class MailService
         array $participantImportantFieldAliases
     ): array {
         $qrImage = QrCodeService::renderPng($qrToken, 320, 10);
+        $qrContentId = 'participant-qr-' . substr(hash('sha256', $qrToken), 0, 24);
 
         return [
             'to' => $recipientEmail,
@@ -168,7 +169,7 @@ final class MailService
                 $eventOfficeWindow,
                 $eventLocation,
                 $bibNumber,
-                qrCodeImageUrl($qrToken),
+                'cid:' . $qrContentId,
                 $participantCustomFields,
                 $participantImportantFieldAliases
             ),
@@ -190,6 +191,11 @@ final class MailService
                 'bibNumber' => $bibNumber,
             ],
             'attachments' => [
+                [
+                    'filename' => 'kod-qr-inline.png',
+                    'contentBase64' => base64_encode($qrImage),
+                    'contentId' => $qrContentId,
+                ],
                 [
                     'filename' => 'kod-qr.png',
                     'contentBase64' => base64_encode($qrImage),
