@@ -800,7 +800,8 @@ try {
         ?int $participantId = null,
         ?string $participantName = null,
         ?string $userId = null,
-        ?string $userName = null
+        ?string $userName = null,
+        array $metadata = []
     ): void {
         $stmt = $pdo->prepare('
             INSERT INTO activity_logs (
@@ -839,10 +840,10 @@ try {
             'participant_id' => $participantId,
             'target_type' => $participantId !== null ? 'participant' : ($eventId !== null ? 'event' : null),
             'target_id' => $participantId !== null ? (string)$participantId : $eventId,
-            'metadata' => [
+            'metadata' => array_merge([
                 'participant_name' => $participantName,
                 'legacy_activity_log' => true,
-            ],
+            ], $metadata),
         ]);
     };
 
@@ -2909,8 +2910,41 @@ try {
         $input = readJsonBody();
         $email = normalizeEmailAddress((string)($input['email'] ?? ''));
         $password = (string)($input['password'] ?? '');
+        $clientDiagnostics = normalizeClientDiagnostics($input['client_diagnostics'] ?? null);
+        $requestDiagnostics = requestDiagnostics();
+        $emailHash = $email !== '' ? hash_hmac('sha256', $email, authSecret()) : null;
+        $accountState = ['exists' => false, 'archived' => null, 'role' => null, 'organization_id' => null];
+        if ($email !== '') {
+            $accountStateStmt = $pdo->prepare('
+                SELECT role, organization_id, archived_at
+                FROM users
+                WHERE email = :email
+                LIMIT 1
+            ');
+            $accountStateStmt->execute(['email' => $email]);
+            $accountStateRow = $accountStateStmt->fetch();
+            if ($accountStateRow !== false) {
+                $accountState = [
+                    'exists' => true,
+                    'archived' => trim((string)($accountStateRow['archived_at'] ?? '')) !== '',
+                    'role' => (string)($accountStateRow['role'] ?? ''),
+                    'organization_id' => $accountStateRow['organization_id'] ?? null,
+                ];
+            }
+        }
+        $loginDiagnosticBase = loginDiagnosticMetadata($email, $password, $clientDiagnostics, $requestDiagnostics, [
+            'account' => $accountState,
+        ]);
         $loginRateLimit = $consumeRateLimitAttempt($pdo, 'auth_login', 5, 900, $email);
         if (!$loginRateLimit['allowed']) {
+            $metadata = array_merge($loginDiagnosticBase, [
+                'rate_limit' => [
+                    'bucket' => 'auth_login',
+                    'max_attempts' => 5,
+                    'window_seconds' => 900,
+                    'retry_after' => (int)$loginRateLimit['retry_after'],
+                ],
+            ]);
             addAuditLog($pdo, [
                 'category' => 'authentication',
                 'action_code' => 'auth.login.rate_limited',
@@ -2918,9 +2952,11 @@ try {
                 'outcome' => 'blocked',
                 'severity' => 'warning',
                 'target_type' => 'user_email',
-                'target_id' => $email !== '' ? hash_hmac('sha256', $email, authSecret()) : null,
-                'metadata' => ['retry_after' => (int)$loginRateLimit['retry_after']],
+                'target_id' => $emailHash,
+                'organization_id' => is_string($accountState['organization_id'] ?? null) ? $accountState['organization_id'] : null,
+                'metadata' => $metadata,
             ]);
+            ApplicationLogger::log('warning', 'auth.login.rate_limited', 'Login blocked by rate limit', $metadata);
             jsonResponse(429, [
                 'error' => 'Zbyt wiele prób logowania. Spróbuj ponownie później.',
                 'retry_after' => (int)$loginRateLimit['retry_after'],
@@ -2929,6 +2965,24 @@ try {
         }
 
         if ($email === '' || $password === '') {
+            $metadata = array_merge($loginDiagnosticBase, [
+                'validation_error' => [
+                    'missing_email' => $email === '',
+                    'missing_password' => $password === '',
+                ],
+            ]);
+            addAuditLog($pdo, [
+                'category' => 'authentication',
+                'action_code' => 'auth.login.invalid_request',
+                'action' => 'Odrzucono probe logowania przez brak wymaganych danych',
+                'outcome' => 'failure',
+                'severity' => 'warning',
+                'target_type' => 'user_email',
+                'target_id' => $emailHash,
+                'organization_id' => is_string($accountState['organization_id'] ?? null) ? $accountState['organization_id'] : null,
+                'metadata' => $metadata,
+            ]);
+            ApplicationLogger::log('warning', 'auth.login.invalid_request', 'Login rejected due to missing credentials', $metadata);
             jsonResponse(422, ['error' => 'Adres e-mail i hasło są wymagane']);
             exit;
         }
@@ -2936,6 +2990,9 @@ try {
         $user = $loadUserWithPasswordByEmail($pdo, $email);
 
         if ($user === false || !passwordMatches($password, (string)$user['password'])) {
+            $metadata = array_merge($loginDiagnosticBase, [
+                'failure_reason' => $user === false ? 'account_not_found_or_archived' : 'password_mismatch',
+            ]);
             addAuditLog($pdo, [
                 'category' => 'authentication',
                 'action_code' => 'auth.login.failed',
@@ -2943,8 +3000,11 @@ try {
                 'outcome' => 'failure',
                 'severity' => 'warning',
                 'target_type' => 'user_email',
-                'target_id' => $email !== '' ? hash_hmac('sha256', $email, authSecret()) : null,
+                'target_id' => $emailHash,
+                'organization_id' => is_string($accountState['organization_id'] ?? null) ? $accountState['organization_id'] : null,
+                'metadata' => $metadata,
             ]);
+            ApplicationLogger::log('warning', 'auth.login.failed', 'Login failed', $metadata);
             jsonResponse(401, ['error' => 'Nieprawidłowy adres e-mail lub hasło']);
             exit;
         }
@@ -2969,8 +3029,21 @@ try {
             null,
             null,
             (string)$user['id'],
-            (string)$user['name']
+            (string)$user['name'],
+            array_merge($loginDiagnosticBase, [
+                'success' => true,
+                'account' => array_merge($accountState, [
+                    'user_id' => (string)$user['id'],
+                    'role' => (string)$user['role'],
+                    'organization_id' => $user['organization_id'] ?? null,
+                ]),
+            ])
         );
+        ApplicationLogger::log('info', 'auth.login.succeeded', 'Login succeeded', array_merge($loginDiagnosticBase, [
+            'success' => true,
+            'user_id' => (string)$user['id'],
+            'user_role' => (string)$user['role'],
+        ]));
         unset($user['password']);
         $clearRateLimitBucket($pdo, 'auth_login', $email);
 
@@ -4026,12 +4099,13 @@ try {
             jsonResponse(500, ['error' => 'Nie udalo sie rozpoczac eksportu CSV']);
             exit;
         }
-        $writeCsvRow($stream, ['ID', 'Czas UTC', 'Kategoria', 'Kod akcji', 'Akcja', 'Wynik', 'Poziom', 'Aktor', 'Rola', 'Cel', 'Request ID']);
+        $writeCsvRow($stream, ['ID', 'Czas UTC', 'Kategoria', 'Kod akcji', 'Akcja', 'Wynik', 'Poziom', 'Aktor', 'Rola', 'Cel', 'Request ID', 'Metadane JSON']);
         foreach ($entries as $entry) {
             $writeCsvRow($stream, [
                 $entry['id'], $entry['timestamp'], $entry['category'], $entry['action_code'], $entry['action'],
                 $entry['outcome'], $entry['severity'], $entry['user_name'], $entry['user_role'],
                 trim((string)$entry['target_type'] . ':' . (string)$entry['target_id'], ':'), $entry['request_id'],
+                encodeJsonValue($entry['metadata'] ?? []) ?: '',
             ]);
         }
         rewind($stream);

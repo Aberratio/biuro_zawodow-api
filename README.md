@@ -30,7 +30,7 @@ PHP 8.2 API for the `biuro_zawodow` project. It serves the React frontend, expos
 
 ```powershell
 cd biuro_zawodow-api
-Copy-Item .env.example .env
+Copy-Item .example.env .env
 composer install
 "C:\Program Files\MySQL\MySQL Server 8.0\bin\mysql.exe" -u root -p -e "CREATE DATABASE IF NOT EXISTS biuro_zawodow CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
 "C:\Program Files\MySQL\MySQL Server 8.0\bin\mysql.exe" -u root -p biuro_zawodow < database/init/001_init.sql
@@ -59,7 +59,7 @@ http://localhost:8080/openapi.json
 
 ## Local configuration
 
-Default local config from `.env.example`:
+Default local config from `.example.env`:
 
 ```env
 APP_ENV=local
@@ -100,7 +100,7 @@ Notes:
 - `APP_URL` must match the backend origin.
 - `APP_FRONTEND_URL` is used in password reset emails.
 - `APP_KEY` signs auth tokens and must be strong outside local/dev/test.
-- `APP_CORS_ORIGIN` must contain the frontend origin. Wildcard CORS is rejected outside local/dev/test.
+- `APP_CORS_ORIGIN` must contain the frontend origin. The API also accepts the matching `www`/non-`www` variant for configured public frontend origins. Wildcard CORS is rejected outside local/dev/test.
 - `LOG_DIR` defaults to `storage/logs`, outside the public webroot. Production should use a private absolute path.
 - `SENTRY_DSN` is optional. Empty or unavailable Sentry never blocks API requests.
 

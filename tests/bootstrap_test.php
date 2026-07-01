@@ -16,7 +16,13 @@ test('normalizes and deduplicates configured CORS origins', function (): void {
     putenv('APP_URL=https://api.example.com/v1');
 
     assertSame(
-        ['https://app.example.com:8443', 'https://panel.example.com', 'https://api.example.com'],
+        [
+            'https://app.example.com:8443',
+            'https://www.app.example.com:8443',
+            'https://panel.example.com',
+            'https://www.panel.example.com',
+            'https://api.example.com',
+        ],
         configuredCorsOrigins(' https://APP.example.com:8443/path,https://app.example.com:8443/other ')
     );
 

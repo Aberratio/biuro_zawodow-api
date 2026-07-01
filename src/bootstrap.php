@@ -180,17 +180,55 @@ function corsOriginFromUrl(string $url): ?string
     return $origin;
 }
 
+function corsOriginWwwVariants(string $origin): array
+{
+    $parts = parse_url($origin);
+    if (!is_array($parts) || empty($parts['scheme']) || empty($parts['host'])) {
+        return [$origin];
+    }
+
+    $scheme = strtolower((string)$parts['scheme']);
+    $host = strtolower((string)$parts['host']);
+    $normalizedHost = trim($host, '[]');
+    if (
+        $normalizedHost === 'localhost'
+        || str_ends_with($normalizedHost, '.localhost')
+        || filter_var($normalizedHost, FILTER_VALIDATE_IP) !== false
+    ) {
+        return [$origin];
+    }
+
+    $alternateHost = str_starts_with($host, 'www.')
+        ? substr($host, 4)
+        : 'www.' . $host;
+    if ($alternateHost === '' || $alternateHost === $host) {
+        return [$origin];
+    }
+
+    $alternateOrigin = $scheme . '://' . $alternateHost;
+    if (isset($parts['port'])) {
+        $alternateOrigin .= ':' . (int)$parts['port'];
+    }
+
+    return [$origin, $alternateOrigin];
+}
+
 function configuredCorsOrigins(string $allowedOriginsRaw): array
 {
     $origins = [];
     foreach (explode(',', $allowedOriginsRaw) as $origin) {
         $normalizedOrigin = corsOriginFromUrl($origin) ?? trim($origin);
         if ($normalizedOrigin !== '') {
-            $origins[] = $normalizedOrigin;
+            array_push($origins, ...corsOriginWwwVariants($normalizedOrigin));
         }
     }
 
-    foreach (['APP_FRONTEND_URL', 'APP_URL'] as $envKey) {
+    $frontendOrigin = corsOriginFromUrl((string)(getenv('APP_FRONTEND_URL') ?: ''));
+    if ($frontendOrigin !== null) {
+        array_push($origins, ...corsOriginWwwVariants($frontendOrigin));
+    }
+
+    foreach (['APP_URL'] as $envKey) {
         $origin = corsOriginFromUrl((string)(getenv($envKey) ?: ''));
         if ($origin !== null) {
             $origins[] = $origin;
@@ -223,18 +261,30 @@ function isLocalDevelopmentCorsOrigin(string $origin): bool
 function setCorsHeaders(): void
 {
     $allowedOriginsRaw = getenv('APP_CORS_ORIGIN') ?: '*';
-    $requestOrigin = $_SERVER['HTTP_ORIGIN'] ?? '';
+    $requestOriginHeader = trim((string)($_SERVER['HTTP_ORIGIN'] ?? ''));
+    $requestOrigin = corsOriginFromUrl($requestOriginHeader) ?? $requestOriginHeader;
 
     if ($allowedOriginsRaw === '*') {
         header('Access-Control-Allow-Origin: *');
     } else {
         $allowedOrigins = configuredCorsOrigins($allowedOriginsRaw);
         $fallbackOrigin = $allowedOrigins[0] ?? '';
-        $allowOrigin = in_array($requestOrigin, $allowedOrigins, true) || (isLocalEnvironment() && isLocalDevelopmentCorsOrigin($requestOrigin))
-            ? $requestOrigin
-            : $fallbackOrigin;
+        $isAllowedOrigin = $requestOrigin !== ''
+            && (in_array($requestOrigin, $allowedOrigins, true) || (isLocalEnvironment() && isLocalDevelopmentCorsOrigin($requestOrigin)));
+        $allowOrigin = $isAllowedOrigin
+            ? $requestOriginHeader
+            : ($requestOrigin === '' ? $fallbackOrigin : '');
         if ($allowOrigin !== '') {
             header('Access-Control-Allow-Origin: ' . $allowOrigin);
+        }
+        if ($requestOrigin !== '' && !$isAllowedOrigin) {
+            ApplicationLogger::log('warning', 'security.cors_origin_denied', 'CORS origin was denied', [
+                'origin' => $requestOrigin,
+                'method' => $_SERVER['REQUEST_METHOD'] ?? null,
+                'path' => parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/',
+                'allowed_origins_count' => count($allowedOrigins),
+                'request_id' => RequestContext::id(),
+            ]);
         }
     }
 
@@ -321,6 +371,166 @@ function auditIpHash(): ?string
         return null;
     }
     return hash_hmac('sha256', $ip, authSecret());
+}
+
+function requestHeaderValue(string $name): string
+{
+    $serverKey = 'HTTP_' . strtoupper(str_replace('-', '_', $name));
+    return trim((string)($_SERVER[$serverKey] ?? ''));
+}
+
+function sanitizeDiagnosticString(mixed $value, int $maxLength = 500): ?string
+{
+    $text = trim((string)$value);
+    if ($text === '') {
+        return null;
+    }
+
+    $text = normalizeUtf8String($text);
+    return function_exists('mb_substr') ? mb_substr($text, 0, $maxLength) : substr($text, 0, $maxLength);
+}
+
+function hashDiagnosticValue(mixed $value): ?string
+{
+    $text = sanitizeDiagnosticString($value, 2000);
+    return $text === null ? null : hash_hmac('sha256', $text, authSecret());
+}
+
+function passwordLengthBucket(string $password): string
+{
+    $length = strlen($password);
+    if ($length === 0) {
+        return 'empty';
+    }
+    if ($length < 8) {
+        return '1-7';
+    }
+    if ($length < 12) {
+        return '8-11';
+    }
+    if ($length < 20) {
+        return '12-19';
+    }
+    return '20+';
+}
+
+function emailDiagnosticDomain(string $email): ?string
+{
+    if (!str_contains($email, '@')) {
+        return null;
+    }
+
+    return sanitizeDiagnosticString(substr(strrchr($email, '@') ?: '', 1), 190);
+}
+
+function requestDiagnostics(): array
+{
+    $forwardedFor = requestHeaderValue('X-Forwarded-For');
+    $forwarded = requestHeaderValue('Forwarded');
+    return [
+        'request_id' => RequestContext::id(),
+        'server_received_at' => gmdate(DATE_ATOM),
+        'method' => RequestContext::method(),
+        'path' => RequestContext::path(),
+        'origin' => sanitizeDiagnosticString(requestHeaderValue('Origin'), 300),
+        'referer' => sanitizeDiagnosticString(requestHeaderValue('Referer'), 500),
+        'host' => sanitizeDiagnosticString((string)($_SERVER['HTTP_HOST'] ?? ''), 190),
+        'content_type' => sanitizeDiagnosticString((string)($_SERVER['CONTENT_TYPE'] ?? ''), 190),
+        'accept_language' => sanitizeDiagnosticString(requestHeaderValue('Accept-Language'), 190),
+        'user_agent' => sanitizeDiagnosticString(requestHeaderValue('User-Agent'), 600),
+        'sec_ch_ua' => sanitizeDiagnosticString(requestHeaderValue('Sec-CH-UA'), 300),
+        'sec_ch_ua_mobile' => sanitizeDiagnosticString(requestHeaderValue('Sec-CH-UA-Mobile'), 40),
+        'sec_ch_ua_platform' => sanitizeDiagnosticString(requestHeaderValue('Sec-CH-UA-Platform'), 100),
+        'sec_fetch_site' => sanitizeDiagnosticString(requestHeaderValue('Sec-Fetch-Site'), 80),
+        'sec_fetch_mode' => sanitizeDiagnosticString(requestHeaderValue('Sec-Fetch-Mode'), 80),
+        'sec_fetch_dest' => sanitizeDiagnosticString(requestHeaderValue('Sec-Fetch-Dest'), 80),
+        'ip_hash' => auditIpHash(),
+        'forwarded_for_present' => $forwardedFor !== '',
+        'forwarded_for_hash' => hashDiagnosticValue($forwardedFor),
+        'forwarded_present' => $forwarded !== '',
+        'forwarded_hash' => hashDiagnosticValue($forwarded),
+    ];
+}
+
+function normalizeClientDiagnostics(mixed $value): array
+{
+    if (!is_array($value)) {
+        return [];
+    }
+
+    $allowedStringKeys = [
+        'client_timestamp',
+        'timezone',
+        'language',
+        'languages',
+        'platform',
+        'user_agent',
+        'display_mode',
+        'visibility_state',
+        'app_environment',
+        'app_release',
+        'api_base_url',
+        'current_url',
+    ];
+    $allowedBooleanKeys = [
+        'online',
+        'cookie_enabled',
+        'session_storage_available',
+        'local_storage_available',
+        'indexed_db_available',
+        'can_persist_session',
+        'standalone',
+    ];
+    $normalized = [];
+
+    foreach ($allowedStringKeys as $key) {
+        if (array_key_exists($key, $value)) {
+            $normalized[$key] = sanitizeDiagnosticString($value[$key], $key === 'user_agent' ? 600 : 500);
+        }
+    }
+    foreach ($allowedBooleanKeys as $key) {
+        if (array_key_exists($key, $value)) {
+            $normalized[$key] = (bool)$value[$key];
+        }
+    }
+    if (isset($value['screen']) && is_array($value['screen'])) {
+        $normalized['screen'] = [
+            'width' => isset($value['screen']['width']) ? (int)$value['screen']['width'] : null,
+            'height' => isset($value['screen']['height']) ? (int)$value['screen']['height'] : null,
+            'pixel_ratio' => isset($value['screen']['pixel_ratio']) ? (float)$value['screen']['pixel_ratio'] : null,
+        ];
+    }
+    if (isset($value['storage_warnings']) && is_array($value['storage_warnings'])) {
+        $normalized['storage_warnings'] = array_values(array_filter(array_map(
+            static fn(mixed $warning): ?string => sanitizeDiagnosticString($warning, 300),
+            $value['storage_warnings']
+        )));
+    }
+    if (isset($normalized['client_timestamp']) && is_string($normalized['client_timestamp'])) {
+        try {
+            $clientTime = new DateTimeImmutable($normalized['client_timestamp']);
+            $serverTime = new DateTimeImmutable('now', new DateTimeZone('UTC'));
+            $normalized['client_server_clock_skew_seconds'] = $clientTime->getTimestamp() - $serverTime->getTimestamp();
+        } catch (Throwable) {
+            $normalized['client_timestamp_parse_error'] = true;
+        }
+    }
+
+    return array_filter($normalized, static fn(mixed $entry): bool => $entry !== null && $entry !== '');
+}
+
+function loginDiagnosticMetadata(string $email, string $password, array $clientDiagnostics, array $requestDiagnostics, array $extra = []): array
+{
+    return array_merge([
+        'email_hash' => $email !== '' ? hash_hmac('sha256', $email, authSecret()) : null,
+        'email_domain' => emailDiagnosticDomain($email),
+        'email_present' => $email !== '',
+        'email_valid' => $email !== '' && isValidEmailAddress($email),
+        'password_present' => $password !== '',
+        'password_length_bucket' => passwordLengthBucket($password),
+        'client' => $clientDiagnostics,
+        'request' => $requestDiagnostics,
+    ], $extra);
 }
 
 function auditActionCodeFromLabel(string $action): string
