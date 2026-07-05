@@ -147,6 +147,13 @@ php scripts/run-migrations.php --dry-run
 php scripts/run-migrations.php
 ```
 
+If an older database already has some migration effects in its schema but is missing rows in `schema_migrations`, adopt only the migrations that can be verified from the current schema:
+
+```powershell
+php scripts/run-migrations.php --adopt-existing
+php scripts/run-migrations.php
+```
+
 The directory currently contains:
 
 - `002_hash_user_passwords.php`
@@ -169,6 +176,7 @@ The directory currently contains:
 - `019_add_user_archiving_and_event_soft_delete.php`
 - `020_add_event_sync_tables.php`
 - `021_add_audit_logs.php`
+- `022_add_participant_field_validation.php`
 
 ## Auth and access model
 

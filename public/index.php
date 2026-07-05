@@ -1196,12 +1196,204 @@ try {
         return $normalizedCustomFields;
     };
 
-    $loadParticipantFieldMappings = static function (PDO $pdo, string $eventId): array {
+    $isParticipantConfigurableFieldRole = static function (string $fieldRole): bool {
+        return in_array($fieldRole, ['custom', 'important_custom'], true);
+    };
+
+    $normalizeParticipantFieldType = static function (string $fieldRole, mixed $fieldType) use ($isParticipantConfigurableFieldRole): string {
+        if (!$isParticipantConfigurableFieldRole($fieldRole)) {
+            return 'text';
+        }
+
+        $normalizedFieldType = trim((string)$fieldType);
+        return in_array($normalizedFieldType, ['text', 'number', 'date', 'select'], true) ? $normalizedFieldType : 'text';
+    };
+
+    $isValidParticipantRuleDate = static function (string $value): bool {
+        if (preg_match('/^\d{4}-\d{2}-\d{2}$/', $value) !== 1) {
+            return false;
+        }
+
+        [$year, $month, $day] = array_map('intval', explode('-', $value));
+        return checkdate($month, $day, $year);
+    };
+
+    $normalizeParticipantValidationRules = static function (string $fieldType, mixed $rulesInput, string $fieldLabel) use ($isValidParticipantRuleDate): array {
+        $rules = is_array($rulesInput) ? $rulesInput : [];
+        $normalized = [];
+
+        if ($fieldType === 'text') {
+            foreach (['min_length', 'max_length'] as $key) {
+                if (!array_key_exists($key, $rules) || $rules[$key] === '' || $rules[$key] === null) {
+                    continue;
+                }
+                if (!is_int($rules[$key]) && !(is_string($rules[$key]) && preg_match('/^\d+$/', $rules[$key]) === 1)) {
+                    return [null, sprintf('ReguĹ‚a %s dla pola "%s" musi byÄ‡ liczbÄ… caĹ‚kowitÄ…', $key, $fieldLabel)];
+                }
+                $normalized[$key] = max(0, (int)$rules[$key]);
+            }
+            if (isset($normalized['min_length'], $normalized['max_length']) && $normalized['min_length'] > $normalized['max_length']) {
+                return [null, sprintf('Minimalna liczba znakĂłw nie moĹĽe byÄ‡ wiÄ™ksza od maksymalnej dla pola "%s"', $fieldLabel)];
+            }
+            return [$normalized, null];
+        }
+
+        if ($fieldType === 'number') {
+            foreach (['min', 'max'] as $key) {
+                if (!array_key_exists($key, $rules) || $rules[$key] === '' || $rules[$key] === null) {
+                    continue;
+                }
+                $numberValue = is_string($rules[$key]) ? str_replace(',', '.', trim($rules[$key])) : $rules[$key];
+                if (!is_numeric($numberValue)) {
+                    return [null, sprintf('ReguĹ‚a %s dla pola "%s" musi byÄ‡ liczbÄ…', $key, $fieldLabel)];
+                }
+                $normalized[$key] = (float)$numberValue;
+            }
+            if (isset($normalized['min'], $normalized['max']) && $normalized['min'] > $normalized['max']) {
+                return [null, sprintf('Minimalna wartoĹ›Ä‡ nie moĹĽe byÄ‡ wiÄ™ksza od maksymalnej dla pola "%s"', $fieldLabel)];
+            }
+            return [$normalized, null];
+        }
+
+        if ($fieldType === 'date') {
+            foreach (['min', 'max'] as $key) {
+                if (!array_key_exists($key, $rules) || $rules[$key] === '' || $rules[$key] === null) {
+                    continue;
+                }
+                $dateValue = trim((string)$rules[$key]);
+                if (!$isValidParticipantRuleDate($dateValue)) {
+                    return [null, sprintf('ReguĹ‚a %s dla pola "%s" musi byÄ‡ datÄ… w formacie RRRR-MM-DD', $key, $fieldLabel)];
+                }
+                $normalized[$key] = $dateValue;
+            }
+            if (isset($normalized['min'], $normalized['max']) && strcmp($normalized['min'], $normalized['max']) > 0) {
+                return [null, sprintf('Data poczÄ…tkowa nie moĹĽe byÄ‡ pĂłĹşniejsza od koĹ„cowej dla pola "%s"', $fieldLabel)];
+            }
+            return [$normalized, null];
+        }
+
+        if ($fieldType === 'select') {
+            $optionsInput = is_array($rules['options'] ?? null) ? $rules['options'] : [];
+            $options = [];
+            foreach ($optionsInput as $option) {
+                $normalizedOption = trim((string)$option);
+                if ($normalizedOption === '' || isset($options[$normalizedOption])) {
+                    continue;
+                }
+                if (strlen($normalizedOption) > 190) {
+                    return [null, sprintf('Opcja listy dla pola "%s" jest zbyt dĹ‚uga', $fieldLabel)];
+                }
+                $options[$normalizedOption] = $normalizedOption;
+            }
+            if ($options === []) {
+                return [null, sprintf('Lista wyboru dla pola "%s" musi mieÄ‡ co najmniej jednÄ… opcjÄ™', $fieldLabel)];
+            }
+            return [['options' => array_values($options)], null];
+        }
+
+        return [[], null];
+    };
+
+    $countParticipantFieldValueCharacters = static function (string $value): int {
+        return function_exists('mb_strlen') ? mb_strlen($value, 'UTF-8') : strlen($value);
+    };
+
+    $validateParticipantFieldValue = static function (array $mapping, string $value) use ($countParticipantFieldValueCharacters, $isValidParticipantRuleDate): array {
+        $alias = trim((string)($mapping['alias'] ?? ''));
+        if ($alias === '') {
+            $alias = trim((string)($mapping['source_column_name'] ?? 'pole'));
+        }
+
+        $trimmedValue = trim($value);
+        if ($trimmedValue === '') {
+            return (bool)($mapping['is_required'] ?? false)
+                ? [sprintf('Pole "%s" jest wymagane.', $alias)]
+                : [];
+        }
+
+        $fieldType = (string)($mapping['field_type'] ?? 'text');
+        $rules = is_array($mapping['validation_rules'] ?? null) ? $mapping['validation_rules'] : [];
+
+        if ($fieldType === 'text') {
+            $length = $countParticipantFieldValueCharacters($trimmedValue);
+            if (isset($rules['min_length']) && $length < (int)$rules['min_length']) {
+                return [sprintf('Pole "%s" musi mieÄ‡ co najmniej %d znakĂłw.', $alias, (int)$rules['min_length'])];
+            }
+            if (isset($rules['max_length']) && $length > (int)$rules['max_length']) {
+                return [sprintf('Pole "%s" moĹĽe mieÄ‡ maksymalnie %d znakĂłw.', $alias, (int)$rules['max_length'])];
+            }
+            return [];
+        }
+
+        if ($fieldType === 'number') {
+            $numberValue = str_replace(',', '.', $trimmedValue);
+            if (!is_numeric($numberValue)) {
+                return [sprintf('Pole "%s" musi byÄ‡ liczbÄ….', $alias)];
+            }
+            $number = (float)$numberValue;
+            if (isset($rules['min']) && $number < (float)$rules['min']) {
+                return [sprintf('Pole "%s" musi mieÄ‡ wartoĹ›Ä‡ nie mniejszÄ… niĹĽ %s.', $alias, (string)$rules['min'])];
+            }
+            if (isset($rules['max']) && $number > (float)$rules['max']) {
+                return [sprintf('Pole "%s" musi mieÄ‡ wartoĹ›Ä‡ nie wiÄ™kszÄ… niĹĽ %s.', $alias, (string)$rules['max'])];
+            }
+            return [];
+        }
+
+        if ($fieldType === 'date') {
+            if (!$isValidParticipantRuleDate($trimmedValue)) {
+                return [sprintf('Pole "%s" musi byÄ‡ datÄ… w formacie RRRR-MM-DD.', $alias)];
+            }
+            if (isset($rules['min']) && strcmp($trimmedValue, (string)$rules['min']) < 0) {
+                return [sprintf('Pole "%s" nie moĹĽe byÄ‡ wczeĹ›niejsze niĹĽ %s.', $alias, (string)$rules['min'])];
+            }
+            if (isset($rules['max']) && strcmp($trimmedValue, (string)$rules['max']) > 0) {
+                return [sprintf('Pole "%s" nie moĹĽe byÄ‡ pĂłĹşniejsze niĹĽ %s.', $alias, (string)$rules['max'])];
+            }
+            return [];
+        }
+
+        if ($fieldType === 'select') {
+            $options = is_array($rules['options'] ?? null) ? array_map('strval', $rules['options']) : [];
+            if (!in_array($trimmedValue, $options, true)) {
+                return [sprintf('Pole "%s" musi byÄ‡ jednÄ… z wartoĹ›ci: %s.', $alias, implode(', ', $options))];
+            }
+        }
+
+        return [];
+    };
+
+    $validateParticipantMappedValues = static function (array $mappings, array $values, bool $useSourceColumnNames) use ($validateParticipantFieldValue): array {
+        $errors = [];
+        foreach ($mappings as $mapping) {
+            if (!($mapping['is_active'] ?? true) || ($mapping['field_role'] ?? '') === 'email') {
+                continue;
+            }
+
+            $key = $useSourceColumnNames
+                ? (string)($mapping['source_column_name'] ?? '')
+                : (string)($mapping['alias'] ?? '');
+            if ($key === '') {
+                continue;
+            }
+
+            $errors = [
+                ...$errors,
+                ...$validateParticipantFieldValue($mapping, trim((string)($values[$key] ?? ''))),
+            ];
+        }
+
+        return $errors;
+    };
+
+    $loadParticipantFieldMappings = static function (PDO $pdo, string $eventId) use ($normalizeParticipantFieldType): array {
         $stmt = $pdo->prepare('
             SELECT
                 source_column_name,
                 alias,
                 field_role,
+                field_type,
+                validation_rules_json,
                 display_order,
                 is_required,
                 is_active
@@ -1211,11 +1403,17 @@ try {
         ');
         $stmt->execute(['event_id' => $eventId]);
 
-        return array_map(static function (array $row): array {
+        return array_map(static function (array $row) use ($normalizeParticipantFieldType): array {
+            $fieldRole = (string)$row['field_role'];
+            $fieldType = $normalizeParticipantFieldType($fieldRole, $row['field_type'] ?? 'text');
             return [
                 'source_column_name' => (string)$row['source_column_name'],
                 'alias' => (string)$row['alias'],
-                'field_role' => (string)$row['field_role'],
+                'field_role' => $fieldRole,
+                'field_type' => $fieldType,
+                'validation_rules' => $fieldType === 'text' && !in_array($fieldRole, ['custom', 'important_custom'], true)
+                    ? []
+                    : decodeJsonObject($row['validation_rules_json'] ?? null),
                 'display_order' => (int)$row['display_order'],
                 'is_required' => (bool)$row['is_required'],
                 'is_active' => (bool)$row['is_active'],
@@ -1228,11 +1426,12 @@ try {
         array $fieldValues,
         bool $requireAllActiveFields = false,
         ?string $preservedBibNumber = null
-    ): array {
+    ) use ($validateParticipantFieldValue): array {
         $displayNameParts = [];
         $customFields = [];
         $bibNumber = $preservedBibNumber;
         $missingFields = [];
+        $validationErrors = [];
         $importantFieldAliases = [];
 
         foreach ($mappings as $mapping) {
@@ -1250,6 +1449,17 @@ try {
 
             if ($mapping['field_role'] === 'bib_number' && $preservedBibNumber !== null && trim($preservedBibNumber) !== '') {
                 $value = trim($preservedBibNumber);
+            }
+
+            $fieldValidationErrors = $validateParticipantFieldValue(
+                [
+                    ...$mapping,
+                    'is_required' => $isRequired,
+                ],
+                $value
+            );
+            if ($fieldValidationErrors !== []) {
+                $validationErrors = [...$validationErrors, ...$fieldValidationErrors];
             }
 
             if ($value === '') {
@@ -1278,6 +1488,7 @@ try {
             'custom_fields' => $customFields,
             'bib_number' => $bibNumber,
             'missing_fields' => $missingFields,
+            'validation_errors' => $validationErrors,
             'important_field_aliases' => $importantFieldAliases,
         ];
     };
@@ -2170,7 +2381,7 @@ try {
         return $loadParticipantById($pdo, $participantId) ?: [];
     };
 
-    $buildParticipantImportMappingsFromInput = static function (array $input): array {
+    $buildParticipantImportMappingsFromInput = static function (array $input) use ($normalizeParticipantFieldType, $normalizeParticipantValidationRules): array {
         $csvColumns = array_values(array_filter(
             is_array($input['csv_columns'] ?? null) ? $input['csv_columns'] : [],
             static fn(mixed $column): bool => is_string($column) && trim($column) !== ''
@@ -2190,6 +2401,8 @@ try {
             'source_column_name' => $emailColumn,
             'alias' => 'Email',
             'field_role' => 'email',
+            'field_type' => 'text',
+            'validation_rules' => [],
             'display_order' => 0,
             'is_required' => true,
             'is_active' => true,
@@ -2231,12 +2444,30 @@ try {
                 $displayNamePartCount++;
             }
 
+            $fieldType = $normalizeParticipantFieldType($fieldRole, $field['field_type'] ?? 'text');
+            [$validationRules, $validationRulesError] = $normalizeParticipantValidationRules(
+                $fieldType,
+                $field['validation_rules'] ?? [],
+                $alias
+            );
+            if ($validationRulesError !== null || $validationRules === null) {
+                return [null, $validationRulesError ?? sprintf('NieprawidĹ‚owe reguĹ‚y walidacji dla kolumny "%s"', $sourceColumnName)];
+            }
+            if (!in_array($fieldRole, ['custom', 'important_custom'], true)) {
+                $fieldType = 'text';
+                $validationRules = [];
+            }
+
             $mappingsToSave[] = [
                 'source_column_name' => $sourceColumnName,
                 'alias' => $alias,
                 'field_role' => $fieldRole,
+                'field_type' => $fieldType,
+                'validation_rules' => $validationRules,
                 'display_order' => $displayOrder++,
-                'is_required' => $fieldRole === 'display_name_part',
+                'is_required' => $fieldRole === 'display_name_part'
+                    ? true
+                    : (bool)($field['is_required'] ?? false),
                 'is_active' => true,
             ];
         }
@@ -2255,6 +2486,8 @@ try {
                 source_column_name,
                 alias,
                 field_role,
+                field_type,
+                validation_rules_json,
                 display_order,
                 is_required,
                 is_active
@@ -2263,6 +2496,8 @@ try {
                 :source_column_name,
                 :alias,
                 :field_role,
+                :field_type,
+                :validation_rules_json,
                 :display_order,
                 :is_required,
                 :is_active
@@ -2275,6 +2510,8 @@ try {
                 'source_column_name' => $mapping['source_column_name'],
                 'alias' => $mapping['alias'],
                 'field_role' => $mapping['field_role'],
+                'field_type' => $mapping['field_type'] ?? 'text',
+                'validation_rules_json' => ($mapping['validation_rules'] ?? []) !== [] ? encodeJsonValue($mapping['validation_rules']) : null,
                 'display_order' => $mapping['display_order'],
                 'is_required' => $mapping['is_required'] ? 1 : 0,
                 'is_active' => $mapping['is_active'] ? 1 : 0,
@@ -2419,7 +2656,7 @@ try {
         return null;
     };
 
-    $buildParticipantFieldMappingUpdatesFromInput = static function (array $existingMappings, array $input) use ($normalizeMappingDisplayOrder): array {
+    $buildParticipantFieldMappingUpdatesFromInput = static function (array $existingMappings, array $input) use ($normalizeMappingDisplayOrder, $normalizeParticipantFieldType, $normalizeParticipantValidationRules): array {
         $inputMappings = is_array($input['mappings'] ?? null) ? $input['mappings'] : [];
         if ($inputMappings === []) {
             return [null, 'Pole mappings jest wymagane'];
@@ -2458,6 +2695,15 @@ try {
                 ? (bool)$inputMapping['is_required']
                 : (bool)$existingMapping['is_required'];
             $nextDisplayOrder = $normalizeMappingDisplayOrder($inputMapping['display_order'] ?? null, $index + 1);
+            $nextFieldType = $normalizeParticipantFieldType($nextRole, $inputMapping['field_type'] ?? ($existingMapping['field_type'] ?? 'text'));
+            [$nextValidationRules, $validationRulesError] = $normalizeParticipantValidationRules(
+                $nextFieldType,
+                $inputMapping['validation_rules'] ?? ($existingMapping['validation_rules'] ?? []),
+                $nextAlias !== '' ? $nextAlias : $sourceColumnName
+            );
+            if ($validationRulesError !== null || $nextValidationRules === null) {
+                return [null, $validationRulesError ?? sprintf('NieprawidĹ‚owe reguĹ‚y walidacji dla kolumny "%s"', $sourceColumnName)];
+            }
 
             if ($currentRole === 'email') {
                 if ($nextRole !== 'email' || $nextAlias !== (string)$existingMapping['alias'] || !$nextIsActive || !$nextIsRequired) {
@@ -2466,6 +2712,8 @@ try {
 
                 $updatesBySourceColumn[$sourceColumnName] = [
                     ...$existingMapping,
+                    'field_type' => 'text',
+                    'validation_rules' => [],
                     'display_order' => 0,
                     'is_required' => true,
                     'is_active' => true,
@@ -2493,12 +2741,19 @@ try {
                 $nextIsRequired = false;
             } elseif ($nextRole === 'display_name_part') {
                 $nextIsRequired = true;
+                $nextFieldType = 'text';
+                $nextValidationRules = [];
+            } elseif ($nextRole === 'bib_number') {
+                $nextFieldType = 'text';
+                $nextValidationRules = [];
             }
 
             $updatesBySourceColumn[$sourceColumnName] = [
                 'source_column_name' => $sourceColumnName,
                 'alias' => $nextAlias,
                 'field_role' => $nextRole,
+                'field_type' => $nextFieldType,
+                'validation_rules' => $nextValidationRules,
                 'display_order' => $nextDisplayOrder,
                 'is_required' => $nextIsRequired,
                 'is_active' => $nextIsActive,
@@ -2716,7 +2971,8 @@ try {
         $normalizeParticipantChangeState,
         $createParticipantImportBaselineRecord,
         $attachParticipantBaselineRecord,
-        $addParticipantChangeLog
+        $addParticipantChangeLog,
+        $validateParticipantMappedValues
     ): array {
         $emailMapping = $findParticipantEmailMapping($mappings);
         if ($emailMapping === null) {
@@ -2775,6 +3031,11 @@ try {
                     ? 'Brak aktywnej kolumny budującej nazwę uczestnika.'
                     : sprintf('Brak danych budujących nazwę uczestnika w kolumnach: %s.', implode(', ', $displayNameColumns));
             }
+
+            $rowErrors = [
+                ...$rowErrors,
+                ...$validateParticipantMappedValues($mappings, $row, true),
+            ];
 
             if ($rowErrors !== []) {
                 $invalidCount++;
@@ -6324,6 +6585,8 @@ try {
                 SET
                     alias = :alias,
                     field_role = :field_role,
+                    field_type = :field_type,
+                    validation_rules_json = :validation_rules_json,
                     display_order = :display_order,
                     is_required = :is_required,
                     is_active = :is_active
@@ -6337,6 +6600,8 @@ try {
                     'source_column_name' => $mappingUpdate['source_column_name'],
                     'alias' => $mappingUpdate['alias'],
                     'field_role' => $mappingUpdate['field_role'],
+                    'field_type' => $mappingUpdate['field_type'] ?? 'text',
+                    'validation_rules_json' => ($mappingUpdate['validation_rules'] ?? []) !== [] ? encodeJsonValue($mappingUpdate['validation_rules']) : null,
                     'display_order' => (int)$mappingUpdate['display_order'],
                     'is_required' => $mappingUpdate['is_required'] ? 1 : 0,
                     'is_active' => $mappingUpdate['is_active'] ? 1 : 0,
@@ -6405,6 +6670,10 @@ try {
         }
 
         $resolvedData = $buildParticipantDataFromMappings($mappings, $fieldValues);
+        if (($resolvedData['validation_errors'] ?? []) !== []) {
+            jsonResponse(422, ['error' => implode(' ', $resolvedData['validation_errors'])]);
+            exit;
+        }
         $resolvedDisplayName = $resolveParticipantDisplayName((string)$resolvedData['display_name'], $email);
 
         $participant = $insertParticipantRecord(
@@ -7865,6 +8134,10 @@ try {
                 false,
                 (string)($participant['bib_number'] ?? '')
             );
+            if (($resolvedData['validation_errors'] ?? []) !== []) {
+                jsonResponse(422, ['error' => implode(' ', $resolvedData['validation_errors'])]);
+                exit;
+            }
             $mappedAliases = [];
             foreach ($mappings as $mapping) {
                 if (!($mapping['is_active'] ?? true) || ($mapping['field_role'] ?? '') === 'email') {
