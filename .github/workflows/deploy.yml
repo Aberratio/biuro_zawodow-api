@@ -23,6 +23,7 @@ on:
         options:
           - run
           - baseline
+          - adopt-existing
           - dry-run
           - skip
       confirm_production:
@@ -332,7 +333,7 @@ jobs:
             exit 21
           fi
 
-          if [ "$MIGRATION_MODE" = "dry-run" ] || [ "$MIGRATION_MODE" = "baseline" ]; then
+          if [ "$MIGRATION_MODE" = "dry-run" ] || [ "$MIGRATION_MODE" = "baseline" ] || [ "$MIGRATION_MODE" = "adopt-existing" ]; then
             CHECK_DIR="$(mktemp -d "$BACKEND_REMOTE_DIR_REAL/.deploy/check-${DEPLOY_ID}.XXXXXX")"
             cleanup_check_dir() {
               case "$CHECK_DIR" in
@@ -345,13 +346,20 @@ jobs:
             unzip -o -q "$REMOTE_ZIP" -d "$CHECK_DIR"
             cp "$ENV_FILE" "$CHECK_DIR/.env"
 
-            if [ "$MIGRATION_MODE" = "dry-run" ]; then
-              php "$CHECK_DIR/scripts/run-migrations.php" --dry-run
-              echo "Migration dry-run finished. API files were not changed."
-            else
-              php "$CHECK_DIR/scripts/run-migrations.php" --baseline
-              echo "Migration baseline finished. API files were not changed."
-            fi
+            case "$MIGRATION_MODE" in
+              dry-run)
+                php "$CHECK_DIR/scripts/run-migrations.php" --dry-run
+                echo "Migration dry-run finished. API files were not changed."
+                ;;
+              baseline)
+                php "$CHECK_DIR/scripts/run-migrations.php" --baseline
+                echo "Migration baseline finished. API files were not changed."
+                ;;
+              adopt-existing)
+                php "$CHECK_DIR/scripts/run-migrations.php" --adopt-existing
+                echo "Migration adoption finished. API files were not changed."
+                ;;
+            esac
 
             rm -f "$REMOTE_ZIP"
             exit 0
@@ -387,6 +395,10 @@ jobs:
               ;;
             baseline)
               echo "Baseline mode should have exited before deployment."
+              exit 22
+              ;;
+            adopt-existing)
+              echo "Adopt-existing mode should have exited before deployment."
               exit 22
               ;;
             *)

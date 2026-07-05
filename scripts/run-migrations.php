@@ -4,15 +4,26 @@ declare(strict_types=1);
 
 require_once __DIR__ . '/../src/bootstrap.php';
 
-$options = getopt('', ['baseline', 'dry-run', 'no-lock', 'help']);
+$options = getopt('', ['baseline', 'dry-run', 'adopt-existing', 'no-lock', 'help']);
 
 if (isset($options['help'])) {
-    echo "Usage: php scripts/run-migrations.php [--dry-run] [--baseline]\n";
+    echo "Usage: php scripts/run-migrations.php [--dry-run] [--baseline] [--adopt-existing]\n";
     echo "\n";
-    echo "  --dry-run   List pending migrations without running them.\n";
-    echo "  --baseline  Mark all current migrations as applied without running them.\n";
-    echo "  --no-lock   Do not use the database advisory lock.\n";
+    echo "  --dry-run         List pending migrations without running them.\n";
+    echo "  --baseline        Mark all current migrations as applied without running them.\n";
+    echo "  --adopt-existing  Mark pending migrations as applied only when their schema effects already exist.\n";
+    echo "  --no-lock         Do not use the database advisory lock.\n";
     exit(0);
+}
+
+$selectedModes = array_filter([
+    isset($options['dry-run']),
+    isset($options['baseline']),
+    isset($options['adopt-existing']),
+]);
+if (count($selectedModes) > 1) {
+    fwrite(STDERR, "Choose only one of --dry-run, --baseline or --adopt-existing.\n");
+    exit(4);
 }
 
 $rootPath = dirname(__DIR__);
@@ -67,6 +78,171 @@ foreach ($appliedRows as $row) {
     $applied[(string)$row['migration']] = (string)$row['checksum'];
 }
 
+$tableExists = static function (PDO $pdo, string $tableName): bool {
+    $stmt = $pdo->prepare("
+        SELECT COUNT(*) AS total
+        FROM information_schema.TABLES
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = :table_name
+    ");
+    $stmt->execute(['table_name' => $tableName]);
+
+    return (int)($stmt->fetch()['total'] ?? 0) > 0;
+};
+
+$columnExists = static function (PDO $pdo, string $tableName, string $columnName): bool {
+    $stmt = $pdo->prepare("
+        SELECT COUNT(*) AS total
+        FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = :table_name
+          AND COLUMN_NAME = :column_name
+    ");
+    $stmt->execute([
+        'table_name' => $tableName,
+        'column_name' => $columnName,
+    ]);
+
+    return (int)($stmt->fetch()['total'] ?? 0) > 0;
+};
+
+$indexExists = static function (PDO $pdo, string $tableName, string $indexName): bool {
+    $stmt = $pdo->prepare("
+        SELECT COUNT(*) AS total
+        FROM information_schema.STATISTICS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = :table_name
+          AND INDEX_NAME = :index_name
+    ");
+    $stmt->execute([
+        'table_name' => $tableName,
+        'index_name' => $indexName,
+    ]);
+
+    return (int)($stmt->fetch()['total'] ?? 0) > 0;
+};
+
+$enumContains = static function (PDO $pdo, string $tableName, string $columnName, string $value): bool {
+    $stmt = $pdo->prepare("
+        SELECT COLUMN_TYPE
+        FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = :table_name
+          AND COLUMN_NAME = :column_name
+    ");
+    $stmt->execute([
+        'table_name' => $tableName,
+        'column_name' => $columnName,
+    ]);
+    $columnType = (string)($stmt->fetch()['COLUMN_TYPE'] ?? '');
+
+    return str_contains($columnType, "'" . str_replace("'", "''", $value) . "'");
+};
+
+$hasLaterSchemaMarker = static function (PDO $pdo) use ($tableExists, $columnExists): bool {
+    return $tableExists($pdo, 'event_participant_field_mappings')
+        || $tableExists($pdo, 'request_rate_limits')
+        || $tableExists($pdo, 'event_sync_state')
+        || $tableExists($pdo, 'audit_logs')
+        || $columnExists($pdo, 'events', 'deleted_at');
+};
+
+$adoptionChecks = [
+    '002_hash_user_passwords.php' => static function (PDO $pdo) use ($tableExists): bool {
+        if (!$tableExists($pdo, 'users')) {
+            return false;
+        }
+
+        $rows = $pdo->query('SELECT password FROM users')->fetchAll();
+        foreach ($rows as $row) {
+            if (!isPasswordHash((string)$row['password'])) {
+                return false;
+            }
+        }
+
+        return true;
+    },
+    '003_add_admin_id_to_users.php' => static function (PDO $pdo) use ($columnExists, $hasLaterSchemaMarker): bool {
+        return $columnExists($pdo, 'users', 'admin_id') || $hasLaterSchemaMarker($pdo);
+    },
+    '004_add_event_limit_to_organizations.php' => static function (PDO $pdo) use ($columnExists): bool {
+        return $columnExists($pdo, 'organizations', 'event_limit');
+    },
+    '005_create_admin_organization_assignments.php' => static function (PDO $pdo) use ($tableExists, $hasLaterSchemaMarker): bool {
+        return $tableExists($pdo, 'admin_organization_assignments')
+            || (!$tableExists($pdo, 'admin_organization_assignments') && $hasLaterSchemaMarker($pdo));
+    },
+    '006_align_user_organization_relations.php' => static function (PDO $pdo) use ($columnExists, $hasLaterSchemaMarker): bool {
+        return !$columnExists($pdo, 'users', 'admin_id') || $hasLaterSchemaMarker($pdo);
+    },
+    '007_add_event_participant_imports.php' => static function (PDO $pdo) use ($tableExists, $columnExists): bool {
+        return $columnExists($pdo, 'participants', 'display_name')
+            && $columnExists($pdo, 'participants', 'custom_fields_json')
+            && $tableExists($pdo, 'event_participant_field_mappings');
+    },
+    '008_create_password_resets.php' => static function (PDO $pdo) use ($tableExists): bool {
+        return $tableExists($pdo, 'password_resets');
+    },
+    '009_backfill_participant_qr_codes.php' => static function (PDO $pdo) use ($columnExists): bool {
+        return $columnExists($pdo, 'participants', 'qr_code');
+    },
+    '010_unify_participant_status.php' => static function (PDO $pdo) use ($columnExists, $enumContains): bool {
+        return !$columnExists($pdo, 'participants', 'package_status')
+            && $enumContains($pdo, 'participants', 'status', 'checked_in_not_starting');
+    },
+    '011_add_event_archiving.php' => static function (PDO $pdo) use ($columnExists): bool {
+        return $columnExists($pdo, 'events', 'archived_at');
+    },
+    '012_add_scanner_plus_role.php' => static function (PDO $pdo) use ($enumContains): bool {
+        return $enumContains($pdo, 'users', 'role', 'scanner_plus');
+    },
+    '013_allow_multiple_admins_per_organization.php' => static function (PDO $pdo) use ($tableExists, $indexExists, $hasLaterSchemaMarker): bool {
+        if (!$tableExists($pdo, 'admin_organization_assignments')) {
+            return $hasLaterSchemaMarker($pdo);
+        }
+
+        return !$indexExists($pdo, 'admin_organization_assignments', 'uq_admin_organization_assignments_organization_id');
+    },
+    '014_drop_admin_organization_assignments.php' => static function (PDO $pdo) use ($tableExists): bool {
+        return !$tableExists($pdo, 'admin_organization_assignments');
+    },
+    '015_allow_duplicate_participant_bib_numbers.php' => static function (PDO $pdo) use ($indexExists): bool {
+        return !$indexExists($pdo, 'participants', 'uq_participants_event_bib')
+            && $indexExists($pdo, 'participants', 'idx_participants_event_bib');
+    },
+    '016_add_important_participant_field_role.php' => static function (PDO $pdo) use ($enumContains): bool {
+        return $enumContains($pdo, 'event_participant_field_mappings', 'field_role', 'important_custom');
+    },
+    '017_add_event_participant_change_audit.php' => static function (PDO $pdo) use ($tableExists, $columnExists): bool {
+        return $columnExists($pdo, 'participants', 'participant_audit_key')
+            && $columnExists($pdo, 'participants', 'baseline_import_record_id')
+            && $tableExists($pdo, 'event_participant_import_baseline_records')
+            && $tableExists($pdo, 'event_participant_change_logs');
+    },
+    '018_add_request_rate_limits_and_activity_event.php' => static function (PDO $pdo) use ($tableExists, $columnExists): bool {
+        return $tableExists($pdo, 'request_rate_limits')
+            && $columnExists($pdo, 'activity_logs', 'event_id');
+    },
+    '019_add_user_archiving_and_event_soft_delete.php' => static function (PDO $pdo) use ($columnExists): bool {
+        return $columnExists($pdo, 'users', 'archived_at')
+            && $columnExists($pdo, 'users', 'archived_email')
+            && $columnExists($pdo, 'events', 'deleted_at');
+    },
+    '020_add_event_sync_tables.php' => static function (PDO $pdo) use ($tableExists): bool {
+        return $tableExists($pdo, 'event_sync_state')
+            && $tableExists($pdo, 'client_mutations')
+            && $tableExists($pdo, 'sync_outbox');
+    },
+    '021_add_audit_logs.php' => static function (PDO $pdo) use ($tableExists, $columnExists): bool {
+        return $tableExists($pdo, 'audit_logs')
+            && $columnExists($pdo, 'event_participant_change_logs', 'audit_log_id');
+    },
+    '022_add_participant_field_validation.php' => static function (PDO $pdo) use ($columnExists): bool {
+        return $columnExists($pdo, 'event_participant_field_mappings', 'field_type')
+            && $columnExists($pdo, 'event_participant_field_mappings', 'validation_rules_json');
+    },
+];
+
 $pending = [];
 foreach ($migrationFiles as $migrationFile) {
     $migrationName = basename($migrationFile);
@@ -116,6 +292,57 @@ if (isset($options['baseline'])) {
             'checksum' => $migration['checksum'],
         ]);
         echo "Baselined migration: {$migration['name']}\n";
+    }
+
+    exit(0);
+}
+
+if (isset($options['adopt-existing'])) {
+    $adoptedCount = 0;
+    $remaining = [];
+
+    $pdo->beginTransaction();
+
+    try {
+        foreach ($pending as $index => $migration) {
+            $migrationName = $migration['name'];
+            $canAdopt = isset($adoptionChecks[$migrationName])
+                && $adoptionChecks[$migrationName]($pdo);
+
+            if (!$canAdopt) {
+                $remaining = array_slice($pending, $index);
+                break;
+            }
+
+            $insertStmt->execute([
+                'migration' => $migrationName,
+                'checksum' => $migration['checksum'],
+            ]);
+            $adoptedCount++;
+            echo "Adopted existing migration: {$migrationName}\n";
+        }
+
+        $pdo->commit();
+    } catch (Throwable $exception) {
+        if ($pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+
+        throw $exception;
+    }
+
+    if ($adoptedCount === 0) {
+        echo "No existing migrations were adopted.\n";
+    }
+
+    if ($remaining !== []) {
+        echo "Migrations still pending:\n";
+        foreach ($remaining as $migration) {
+            echo "- {$migration['name']}\n";
+        }
+        echo "Run php scripts/run-migrations.php to apply pending migrations.\n";
+    } else {
+        echo "No pending migrations remain after adoption.\n";
     }
 
     exit(0);

@@ -30,7 +30,7 @@ PHP 8.2 API for the `biuro_zawodow` project. It serves the React frontend, expos
 
 ```powershell
 cd biuro_zawodow-api
-Copy-Item .env.example .env
+Copy-Item .example.env .env
 composer install
 "C:\Program Files\MySQL\MySQL Server 8.0\bin\mysql.exe" -u root -p -e "CREATE DATABASE IF NOT EXISTS biuro_zawodow CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
 "C:\Program Files\MySQL\MySQL Server 8.0\bin\mysql.exe" -u root -p biuro_zawodow < database/init/001_init.sql
@@ -59,7 +59,7 @@ http://localhost:8080/openapi.json
 
 ## Local configuration
 
-Default local config from `.env.example`:
+Default local config from `.example.env`:
 
 ```env
 APP_ENV=local
@@ -97,7 +97,7 @@ Notes:
 - `APP_URL` must match the backend origin.
 - `APP_FRONTEND_URL` is used in password reset emails.
 - `APP_KEY` signs auth tokens and must be strong outside local/dev/test.
-- `APP_CORS_ORIGIN` must contain the frontend origin. Wildcard CORS is rejected outside local/dev/test.
+- `APP_CORS_ORIGIN` must contain the frontend origin. The API also accepts the matching `www`/non-`www` variant for configured public frontend origins. Wildcard CORS is rejected outside local/dev/test.
 - `LOG_DIR` defaults to `storage/logs`, outside the public webroot. Production should use a private absolute path.
 - `SENTRY_DSN` is optional. Empty or unavailable Sentry never blocks API requests.
 - `CENTRAL_MAILER_URL` points to the central-mailer REST API. `CENTRAL_MAILER_API_KEY` must match an active central-mailer client key for this application.
@@ -134,6 +134,13 @@ php scripts/run-migrations.php --dry-run
 php scripts/run-migrations.php
 ```
 
+If an older database already has some migration effects in its schema but is missing rows in `schema_migrations`, adopt only the migrations that can be verified from the current schema:
+
+```powershell
+php scripts/run-migrations.php --adopt-existing
+php scripts/run-migrations.php
+```
+
 The directory currently contains:
 
 - `002_hash_user_passwords.php`
@@ -156,6 +163,7 @@ The directory currently contains:
 - `019_add_user_archiving_and_event_soft_delete.php`
 - `020_add_event_sync_tables.php`
 - `021_add_audit_logs.php`
+- `022_add_participant_field_validation.php`
 
 ## Auth and access model
 
