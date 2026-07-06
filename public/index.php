@@ -1228,12 +1228,12 @@ try {
                     continue;
                 }
                 if (!is_int($rules[$key]) && !(is_string($rules[$key]) && preg_match('/^\d+$/', $rules[$key]) === 1)) {
-                    return [null, sprintf('ReguĹ‚a %s dla pola "%s" musi byÄ‡ liczbÄ… caĹ‚kowitÄ…', $key, $fieldLabel)];
+                    return [null, sprintf('Reguła %s dla pola "%s" musi być liczbą całkowitą', $key, $fieldLabel)];
                 }
                 $normalized[$key] = max(0, (int)$rules[$key]);
             }
             if (isset($normalized['min_length'], $normalized['max_length']) && $normalized['min_length'] > $normalized['max_length']) {
-                return [null, sprintf('Minimalna liczba znakĂłw nie moĹĽe byÄ‡ wiÄ™ksza od maksymalnej dla pola "%s"', $fieldLabel)];
+                return [null, sprintf('Minimalna liczba znaków nie może być większa od maksymalnej dla pola "%s"', $fieldLabel)];
             }
             return [$normalized, null];
         }
@@ -1245,12 +1245,12 @@ try {
                 }
                 $numberValue = is_string($rules[$key]) ? str_replace(',', '.', trim($rules[$key])) : $rules[$key];
                 if (!is_numeric($numberValue)) {
-                    return [null, sprintf('ReguĹ‚a %s dla pola "%s" musi byÄ‡ liczbÄ…', $key, $fieldLabel)];
+                    return [null, sprintf('Reguła %s dla pola "%s" musi być liczbą', $key, $fieldLabel)];
                 }
                 $normalized[$key] = (float)$numberValue;
             }
             if (isset($normalized['min'], $normalized['max']) && $normalized['min'] > $normalized['max']) {
-                return [null, sprintf('Minimalna wartoĹ›Ä‡ nie moĹĽe byÄ‡ wiÄ™ksza od maksymalnej dla pola "%s"', $fieldLabel)];
+                return [null, sprintf('Minimalna wartość nie może być większa od maksymalnej dla pola "%s"', $fieldLabel)];
             }
             return [$normalized, null];
         }
@@ -1262,12 +1262,12 @@ try {
                 }
                 $dateValue = trim((string)$rules[$key]);
                 if (!$isValidParticipantRuleDate($dateValue)) {
-                    return [null, sprintf('ReguĹ‚a %s dla pola "%s" musi byÄ‡ datÄ… w formacie RRRR-MM-DD', $key, $fieldLabel)];
+                    return [null, sprintf('Reguła %s dla pola "%s" musi być datą w formacie RRRR-MM-DD', $key, $fieldLabel)];
                 }
                 $normalized[$key] = $dateValue;
             }
             if (isset($normalized['min'], $normalized['max']) && strcmp($normalized['min'], $normalized['max']) > 0) {
-                return [null, sprintf('Data poczÄ…tkowa nie moĹĽe byÄ‡ pĂłĹşniejsza od koĹ„cowej dla pola "%s"', $fieldLabel)];
+                return [null, sprintf('Data początkowa nie może być późniejsza od końcowej dla pola "%s"', $fieldLabel)];
             }
             return [$normalized, null];
         }
@@ -1281,12 +1281,12 @@ try {
                     continue;
                 }
                 if (strlen($normalizedOption) > 190) {
-                    return [null, sprintf('Opcja listy dla pola "%s" jest zbyt dĹ‚uga', $fieldLabel)];
+                    return [null, sprintf('Opcja listy dla pola "%s" jest zbyt długa', $fieldLabel)];
                 }
                 $options[$normalizedOption] = $normalizedOption;
             }
             if ($options === []) {
-                return [null, sprintf('Lista wyboru dla pola "%s" musi mieÄ‡ co najmniej jednÄ… opcjÄ™', $fieldLabel)];
+                return [null, sprintf('Lista wyboru dla pola "%s" musi mieć co najmniej jedną opcję', $fieldLabel)];
             }
             return [['options' => array_values($options)], null];
         }
@@ -1317,10 +1317,10 @@ try {
         if ($fieldType === 'text') {
             $length = $countParticipantFieldValueCharacters($trimmedValue);
             if (isset($rules['min_length']) && $length < (int)$rules['min_length']) {
-                return [sprintf('Pole "%s" musi mieÄ‡ co najmniej %d znakĂłw.', $alias, (int)$rules['min_length'])];
+                return [sprintf('Pole "%s" musi mieć co najmniej %d znaków.', $alias, (int)$rules['min_length'])];
             }
             if (isset($rules['max_length']) && $length > (int)$rules['max_length']) {
-                return [sprintf('Pole "%s" moĹĽe mieÄ‡ maksymalnie %d znakĂłw.', $alias, (int)$rules['max_length'])];
+                return [sprintf('Pole "%s" może mieć maksymalnie %d znaków.', $alias, (int)$rules['max_length'])];
             }
             return [];
         }
@@ -1328,27 +1328,27 @@ try {
         if ($fieldType === 'number') {
             $numberValue = str_replace(',', '.', $trimmedValue);
             if (!is_numeric($numberValue)) {
-                return [sprintf('Pole "%s" musi byÄ‡ liczbÄ….', $alias)];
+                return [sprintf('Pole "%s" musi być liczbą.', $alias)];
             }
             $number = (float)$numberValue;
             if (isset($rules['min']) && $number < (float)$rules['min']) {
-                return [sprintf('Pole "%s" musi mieÄ‡ wartoĹ›Ä‡ nie mniejszÄ… niĹĽ %s.', $alias, (string)$rules['min'])];
+                return [sprintf('Pole "%s" musi mieć wartość nie mniejszą niż %s.', $alias, (string)$rules['min'])];
             }
             if (isset($rules['max']) && $number > (float)$rules['max']) {
-                return [sprintf('Pole "%s" musi mieÄ‡ wartoĹ›Ä‡ nie wiÄ™kszÄ… niĹĽ %s.', $alias, (string)$rules['max'])];
+                return [sprintf('Pole "%s" musi mieć wartość nie większą niż %s.', $alias, (string)$rules['max'])];
             }
             return [];
         }
 
         if ($fieldType === 'date') {
             if (!$isValidParticipantRuleDate($trimmedValue)) {
-                return [sprintf('Pole "%s" musi byÄ‡ datÄ… w formacie RRRR-MM-DD.', $alias)];
+                return [sprintf('Pole "%s" musi być datą w formacie RRRR-MM-DD.', $alias)];
             }
             if (isset($rules['min']) && strcmp($trimmedValue, (string)$rules['min']) < 0) {
-                return [sprintf('Pole "%s" nie moĹĽe byÄ‡ wczeĹ›niejsze niĹĽ %s.', $alias, (string)$rules['min'])];
+                return [sprintf('Pole "%s" nie może być wcześniejsze niż %s.', $alias, (string)$rules['min'])];
             }
             if (isset($rules['max']) && strcmp($trimmedValue, (string)$rules['max']) > 0) {
-                return [sprintf('Pole "%s" nie moĹĽe byÄ‡ pĂłĹşniejsze niĹĽ %s.', $alias, (string)$rules['max'])];
+                return [sprintf('Pole "%s" nie może być późniejsze niż %s.', $alias, (string)$rules['max'])];
             }
             return [];
         }
@@ -1356,7 +1356,7 @@ try {
         if ($fieldType === 'select') {
             $options = is_array($rules['options'] ?? null) ? array_map('strval', $rules['options']) : [];
             if (!in_array($trimmedValue, $options, true)) {
-                return [sprintf('Pole "%s" musi byÄ‡ jednÄ… z wartoĹ›ci: %s.', $alias, implode(', ', $options))];
+                return [sprintf('Pole "%s" musi być jedną z wartości: %s.', $alias, implode(', ', $options))];
             }
         }
 
@@ -2451,7 +2451,7 @@ try {
                 $alias
             );
             if ($validationRulesError !== null || $validationRules === null) {
-                return [null, $validationRulesError ?? sprintf('NieprawidĹ‚owe reguĹ‚y walidacji dla kolumny "%s"', $sourceColumnName)];
+                return [null, $validationRulesError ?? sprintf('Nieprawidłowe reguły walidacji dla kolumny "%s"', $sourceColumnName)];
             }
             if (!in_array($fieldRole, ['custom', 'important_custom'], true)) {
                 $fieldType = 'text';
@@ -2702,7 +2702,7 @@ try {
                 $nextAlias !== '' ? $nextAlias : $sourceColumnName
             );
             if ($validationRulesError !== null || $nextValidationRules === null) {
-                return [null, $validationRulesError ?? sprintf('NieprawidĹ‚owe reguĹ‚y walidacji dla kolumny "%s"', $sourceColumnName)];
+                return [null, $validationRulesError ?? sprintf('Nieprawidłowe reguły walidacji dla kolumny "%s"', $sourceColumnName)];
             }
 
             if ($currentRole === 'email') {

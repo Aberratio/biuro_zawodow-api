@@ -31,6 +31,21 @@ test('normalizes and deduplicates configured CORS origins', function (): void {
     assertFalse(isLocalDevelopmentCorsOrigin('https://example.com'));
 });
 
+test('accepts www and non-www variants for the production frontend CORS origin', function (): void {
+    putenv('APP_FRONTEND_URL');
+    putenv('APP_URL=https://biuro-api.zmierzymyczas.pl');
+
+    $origins = configuredCorsOrigins('https://biuro.zmierzymyczas.pl');
+
+    assertTrue(in_array('https://biuro.zmierzymyczas.pl', $origins, true));
+    assertTrue(in_array('https://www.biuro.zmierzymyczas.pl', $origins, true));
+
+    $origins = configuredCorsOrigins('https://www.biuro.zmierzymyczas.pl');
+
+    assertTrue(in_array('https://biuro.zmierzymyczas.pl', $origins, true));
+    assertTrue(in_array('https://www.biuro.zmierzymyczas.pl', $origins, true));
+});
+
 test('encodes and decodes base64url payloads strictly', function (): void {
     $payload = '{"role":"admin"}';
     $encoded = base64UrlEncode($payload);

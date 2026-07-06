@@ -544,11 +544,11 @@ function auditActionCodeFromLabel(string $action): string
         'zmieniono' => 'entity.updated',
         'ustawiono has' => 'user.password.set',
         'wyslano' => 'message.sent',
-        'wysĹ‚ano' => 'message.sent',
+        'wysłano' => 'message.sent',
         'wyeksportowano' => 'export.created',
-        'usuniÄ™to' => 'entity.deleted',
+        'usunięto' => 'entity.deleted',
         'zarchiwizowano' => 'entity.archived',
-        'przywrĂłcono' => 'entity.restored',
+        'przywrócono' => 'entity.restored',
     ];
     foreach ($known as $needle => $code) {
         if (str_contains($normalized, strtolower($needle))) {
@@ -562,7 +562,7 @@ function auditCategoryFromAction(string $actionCode, string $action): string
 {
     $value = strtolower($actionCode . ' ' . normalizeUtf8String($action));
     foreach ([
-        'authentication' => ['auth.', 'logow', 'hasĹ‚'],
+        'authentication' => ['auth.', 'logow', 'hasł'],
         'users' => ['user', 'konto', 'operator', 'admin'],
         'organizations' => ['organization', 'organizac'],
         'events' => ['event', 'wydarze'],
