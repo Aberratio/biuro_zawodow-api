@@ -1774,7 +1774,7 @@ try {
                 updated_at
             FROM participants
             WHERE event_id IN ($placeholders)
-            ORDER BY id DESC
+            ORDER BY id ASC
         ");
         $stmt->execute($normalizedEventIds);
         $participants = $stmt->fetchAll();
