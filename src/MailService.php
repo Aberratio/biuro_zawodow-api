@@ -58,7 +58,8 @@ final class MailService
         string $bibNumber,
         string $qrToken,
         array $participantCustomFields = [],
-        array $participantImportantFieldAliases = []
+        array $participantImportantFieldAliases = [],
+        ?int $participantId = null
     ): void {
         self::sendQueuedEmail(
             endpoint: '/emails',
@@ -71,7 +72,8 @@ final class MailService
                 bibNumber: $bibNumber,
                 qrToken: $qrToken,
                 participantCustomFields: $participantCustomFields,
-                participantImportantFieldAliases: $participantImportantFieldAliases
+                participantImportantFieldAliases: $participantImportantFieldAliases,
+                participantId: $participantId
             ),
             idempotencyKey: self::idempotencyKey('participant-qr', $recipientEmail . '|' . $eventName . '|' . $qrToken . '|' . bin2hex(random_bytes(8)))
         );
@@ -90,7 +92,8 @@ final class MailService
                 bibNumber: (string)($message['bibNumber'] ?? ''),
                 qrToken: (string)($message['qrToken'] ?? ''),
                 participantCustomFields: is_array($message['participantCustomFields'] ?? null) ? $message['participantCustomFields'] : [],
-                participantImportantFieldAliases: is_array($message['participantImportantFieldAliases'] ?? null) ? $message['participantImportantFieldAliases'] : []
+                participantImportantFieldAliases: is_array($message['participantImportantFieldAliases'] ?? null) ? $message['participantImportantFieldAliases'] : [],
+                participantId: isset($message['participantId']) ? (int)$message['participantId'] : null
             );
             unset($payload['priority']);
             $payload['metadata']['participantId'] = $message['participantId'] ?? null;
@@ -154,10 +157,14 @@ final class MailService
         string $bibNumber,
         string $qrToken,
         array $participantCustomFields,
-        array $participantImportantFieldAliases
+        array $participantImportantFieldAliases,
+        ?int $participantId = null
     ): array {
         $qrImage = QrCodeService::renderPng($qrToken, 320, 10);
-        $qrContentId = 'participant-qr-' . substr(hash('sha256', $qrToken), 0, 24);
+        $qrBase64 = base64_encode($qrImage);
+        $qrContentId = $participantId !== null && $participantId > 0
+            ? 'participant-qr-' . $participantId
+            : 'participant-qr-' . substr(hash('sha256', $qrToken), 0, 24);
 
         return [
             'to' => $recipientEmail,
@@ -193,12 +200,13 @@ final class MailService
             'attachments' => [
                 [
                     'filename' => 'kod-qr-inline.png',
-                    'contentBase64' => base64_encode($qrImage),
+                    'contentBase64' => $qrBase64,
                     'contentId' => $qrContentId,
+                    'inline' => true,
                 ],
                 [
                     'filename' => 'kod-qr.png',
-                    'contentBase64' => base64_encode($qrImage),
+                    'contentBase64' => $qrBase64,
                 ],
             ],
         ];

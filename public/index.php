@@ -7575,7 +7575,8 @@ try {
                 bibNumber: (string)($participant['bib_number'] ?? ''),
                 qrToken: (string)$participant['qr_code'],
                 participantCustomFields: is_array($participant['custom_fields'] ?? null) ? $participant['custom_fields'] : [],
-                participantImportantFieldAliases: is_array($participant['important_field_aliases'] ?? null) ? $participant['important_field_aliases'] : []
+                participantImportantFieldAliases: is_array($participant['important_field_aliases'] ?? null) ? $participant['important_field_aliases'] : [],
+                participantId: (int)$participant['id']
             );
 
             $updateStmt = $pdo->prepare('UPDATE participants SET email_status = :email_status WHERE id = :id');
