@@ -1218,6 +1218,76 @@ try {
         return checkdate($month, $day, $year);
     };
 
+    $formatParticipantDate = static function (int $year, int $month, int $day): ?string {
+        if ($year < 1900 || $year > 2100 || !checkdate($month, $day, $year)) {
+            return null;
+        }
+
+        return sprintf('%04d-%02d-%02d', $year, $month, $day);
+    };
+
+    $normalizeParticipantDateValue = static function (string $value, string $preferredFormat = 'auto') use ($formatParticipantDate): array {
+        $trimmedValue = trim($value);
+        if ($trimmedValue === '') {
+            return [null, null];
+        }
+
+        $preferredFormat = in_array($preferredFormat, ['auto', 'dmy', 'mdy', 'ymd'], true) ? $preferredFormat : 'auto';
+
+        if (preg_match('/^\d{4}[-\/.]\d{1,2}[-\/.]\d{1,2}$/', $trimmedValue) === 1) {
+            [$year, $month, $day] = array_map('intval', preg_split('/[-\/.]/', $trimmedValue));
+            $normalized = $formatParticipantDate($year, $month, $day);
+            return $normalized !== null ? [$normalized, null] : [null, 'nieprawidłowa data'];
+        }
+
+        if (preg_match('/^\d{1,2}[.-]\d{1,2}[.-]\d{4}$/', $trimmedValue) === 1) {
+            [$first, $second, $year] = array_map('intval', preg_split('/[.-]/', $trimmedValue));
+            [$day, $month] = $preferredFormat === 'mdy' ? [$second, $first] : [$first, $second];
+            $normalized = $formatParticipantDate($year, $month, $day);
+            return $normalized !== null ? [$normalized, null] : [null, 'nieprawidłowa data'];
+        }
+
+        if (preg_match('/^\d{1,2}\/\d{1,2}\/\d{4}$/', $trimmedValue) === 1) {
+            [$first, $second, $year] = array_map('intval', explode('/', $trimmedValue));
+            if ($preferredFormat === 'dmy') {
+                $normalized = $formatParticipantDate($year, $second, $first);
+                return $normalized !== null ? [$normalized, null] : [null, 'nieprawidłowa data'];
+            }
+            if ($preferredFormat === 'mdy') {
+                $normalized = $formatParticipantDate($year, $first, $second);
+                return $normalized !== null ? [$normalized, null] : [null, 'nieprawidłowa data'];
+            }
+            if ($first <= 12 && $second <= 12) {
+                return [null, 'niejednoznaczny format daty z ukośnikami'];
+            }
+
+            $normalized = $first > 12
+                ? $formatParticipantDate($year, $second, $first)
+                : $formatParticipantDate($year, $first, $second);
+            return $normalized !== null ? [$normalized, null] : [null, 'nieprawidłowa data'];
+        }
+
+        if (preg_match('/^\d{4,5}(?:\.0+)?$/', $trimmedValue) === 1) {
+            $serial = (int)$trimmedValue;
+            $baseDate = DateTimeImmutable::createFromFormat('!Y-m-d', '1899-12-30');
+            if ($baseDate !== false) {
+                $date = $baseDate->modify(sprintf('+%d days', $serial));
+                if ($date !== false) {
+                    $normalized = $formatParticipantDate(
+                        (int)$date->format('Y'),
+                        (int)$date->format('m'),
+                        (int)$date->format('d')
+                    );
+                    if ($normalized !== null) {
+                        return [$normalized, null];
+                    }
+                }
+            }
+        }
+
+        return [null, 'nieobsługiwany format daty'];
+    };
+
     $normalizeParticipantValidationRules = static function (string $fieldType, mixed $rulesInput, string $fieldLabel) use ($isValidParticipantRuleDate): array {
         $rules = is_array($rulesInput) ? $rulesInput : [];
         $normalized = [];
@@ -1266,6 +1336,13 @@ try {
                 }
                 $normalized[$key] = $dateValue;
             }
+            $dateFormat = trim((string)($rules['date_format'] ?? ''));
+            if ($dateFormat !== '') {
+                if (!in_array($dateFormat, ['dmy', 'mdy', 'ymd'], true)) {
+                    return [null, sprintf('Format daty dla pola "%s" jest nieprawidłowy', $fieldLabel)];
+                }
+                $normalized['date_format'] = $dateFormat;
+            }
             if (isset($normalized['min'], $normalized['max']) && strcmp($normalized['min'], $normalized['max']) > 0) {
                 return [null, sprintf('Data początkowa nie może być późniejsza od końcowej dla pola "%s"', $fieldLabel)];
             }
@@ -1298,7 +1375,7 @@ try {
         return function_exists('mb_strlen') ? mb_strlen($value, 'UTF-8') : strlen($value);
     };
 
-    $validateParticipantFieldValue = static function (array $mapping, string $value) use ($countParticipantFieldValueCharacters, $isValidParticipantRuleDate): array {
+    $validateParticipantFieldValue = static function (array $mapping, string $value) use ($countParticipantFieldValueCharacters, $normalizeParticipantDateValue): array {
         $alias = trim((string)($mapping['alias'] ?? ''));
         if ($alias === '') {
             $alias = trim((string)($mapping['source_column_name'] ?? 'pole'));
@@ -1341,13 +1418,18 @@ try {
         }
 
         if ($fieldType === 'date') {
-            if (!$isValidParticipantRuleDate($trimmedValue)) {
-                return [sprintf('Pole "%s" musi być datą w formacie RRRR-MM-DD.', $alias)];
+            $preferredFormat = is_string($rules['date_format'] ?? null) ? (string)$rules['date_format'] : 'auto';
+            [$normalizedDate, $dateError] = $normalizeParticipantDateValue($trimmedValue, $preferredFormat);
+            if ($normalizedDate === null) {
+                $formatHint = $dateError === 'niejednoznaczny format daty z ukośnikami'
+                    ? ' Użyj formatu RRRR-MM-DD albo DD.MM.RRRR.'
+                    : '';
+                return [sprintf('Pole "%s" musi być poprawną datą.%s', $alias, $formatHint)];
             }
-            if (isset($rules['min']) && strcmp($trimmedValue, (string)$rules['min']) < 0) {
+            if (isset($rules['min']) && strcmp($normalizedDate, (string)$rules['min']) < 0) {
                 return [sprintf('Pole "%s" nie może być wcześniejsze niż %s.', $alias, (string)$rules['min'])];
             }
-            if (isset($rules['max']) && strcmp($trimmedValue, (string)$rules['max']) > 0) {
+            if (isset($rules['max']) && strcmp($normalizedDate, (string)$rules['max']) > 0) {
                 return [sprintf('Pole "%s" nie może być późniejsze niż %s.', $alias, (string)$rules['max'])];
             }
             return [];
@@ -1384,6 +1466,17 @@ try {
         }
 
         return $errors;
+    };
+
+    $normalizeParticipantFieldValueForStorage = static function (array $mapping, string $value) use ($normalizeParticipantDateValue): string {
+        if ((string)($mapping['field_type'] ?? 'text') !== 'date') {
+            return $value;
+        }
+
+        $rules = is_array($mapping['validation_rules'] ?? null) ? $mapping['validation_rules'] : [];
+        $preferredFormat = is_string($rules['date_format'] ?? null) ? (string)$rules['date_format'] : 'auto';
+        [$normalizedDate] = $normalizeParticipantDateValue($value, $preferredFormat);
+        return $normalizedDate ?? $value;
     };
 
     $loadParticipantFieldMappings = static function (PDO $pdo, string $eventId) use ($normalizeParticipantFieldType): array {
@@ -1426,7 +1519,7 @@ try {
         array $fieldValues,
         bool $requireAllActiveFields = false,
         ?string $preservedBibNumber = null
-    ) use ($validateParticipantFieldValue): array {
+    ) use ($normalizeParticipantFieldValueForStorage, $validateParticipantFieldValue): array {
         $displayNameParts = [];
         $customFields = [];
         $bibNumber = $preservedBibNumber;
@@ -1468,6 +1561,8 @@ try {
                 }
                 continue;
             }
+
+            $value = $normalizeParticipantFieldValueForStorage($mapping, $value);
 
             if ($mapping['field_role'] === 'display_name_part') {
                 $displayNameParts[] = $value;
