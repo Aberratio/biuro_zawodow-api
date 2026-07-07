@@ -1248,7 +1248,7 @@ try {
     };
 
     $normalizeParticipantDateValue = static function (string $value, string $preferredFormat = 'auto') use ($formatParticipantDate): array {
-        $trimmedValue = trim($value);
+        $trimmedValue = trim((string)preg_replace('/[T\s]+\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:\s*(?:AM|PM))?$/i', '', trim($value)));
         if ($trimmedValue === '') {
             return [null, null];
         }
@@ -1288,7 +1288,7 @@ try {
             return $normalized !== null ? [$normalized, null] : [null, 'nieprawidłowa data'];
         }
 
-        if (preg_match('/^\d{4,5}(?:\.0+)?$/', $trimmedValue) === 1) {
+        if (preg_match('/^\d{4,5}(?:\.\d+)?$/', $trimmedValue) === 1) {
             $serial = (int)$trimmedValue;
             $baseDate = DateTimeImmutable::createFromFormat('!Y-m-d', '1899-12-30');
             if ($baseDate !== false) {
