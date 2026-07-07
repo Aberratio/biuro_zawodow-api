@@ -150,6 +150,7 @@ try {
                 organization_id,
                 DATE_FORMAT(office_open_at, "%Y-%m-%dT%H:%i:%s") AS office_open_at,
                 DATE_FORMAT(office_close_at, "%Y-%m-%dT%H:%i:%s") AS office_close_at,
+                is_test,
                 DATE_FORMAT(archived_at, "%Y-%m-%dT%H:%i:%s") AS archived_at,
                 DATE_FORMAT(deleted_at, "%Y-%m-%dT%H:%i:%s") AS deleted_at
             FROM events
@@ -158,11 +159,17 @@ try {
         ');
         $stmt->execute(['id' => $eventId]);
 
-        return $stmt->fetch();
+        $event = $stmt->fetch();
+        if ($event === false) {
+            return false;
+        }
+
+        $event['is_test'] = (bool)($event['is_test'] ?? false);
+        return $event;
     };
 
     $loadAllEvents = static function (PDO $pdo): array {
-        return $pdo->query('
+        $events = $pdo->query('
             SELECT
                 id,
                 name,
@@ -170,6 +177,7 @@ try {
                 organization_id,
                 DATE_FORMAT(office_open_at, "%Y-%m-%dT%H:%i:%s") AS office_open_at,
                 DATE_FORMAT(office_close_at, "%Y-%m-%dT%H:%i:%s") AS office_close_at,
+                is_test,
                 DATE_FORMAT(archived_at, "%Y-%m-%dT%H:%i:%s") AS archived_at,
                 DATE_FORMAT(deleted_at, "%Y-%m-%dT%H:%i:%s") AS deleted_at
             FROM events
@@ -177,10 +185,15 @@ try {
               AND deleted_at IS NULL
             ORDER BY event_date ASC
         ')->fetchAll();
+
+        return array_map(static function (array $event): array {
+            $event['is_test'] = (bool)($event['is_test'] ?? false);
+            return $event;
+        }, $events);
     };
 
     $loadAllArchivedEvents = static function (PDO $pdo): array {
-        return $pdo->query('
+        $events = $pdo->query('
             SELECT
                 id,
                 name,
@@ -188,6 +201,7 @@ try {
                 organization_id,
                 DATE_FORMAT(office_open_at, "%Y-%m-%dT%H:%i:%s") AS office_open_at,
                 DATE_FORMAT(office_close_at, "%Y-%m-%dT%H:%i:%s") AS office_close_at,
+                is_test,
                 DATE_FORMAT(archived_at, "%Y-%m-%dT%H:%i:%s") AS archived_at,
                 DATE_FORMAT(deleted_at, "%Y-%m-%dT%H:%i:%s") AS deleted_at
             FROM events
@@ -195,6 +209,11 @@ try {
               AND deleted_at IS NULL
             ORDER BY archived_at DESC, event_date DESC
         ')->fetchAll();
+
+        return array_map(static function (array $event): array {
+            $event['is_test'] = (bool)($event['is_test'] ?? false);
+            return $event;
+        }, $events);
     };
 
     $participantStatuses = [
@@ -474,6 +493,7 @@ try {
 
     $isArchivedEvent = static fn(array $event): bool => trim((string)($event['archived_at'] ?? '')) !== '';
     $isDeletedEvent = static fn(array $event): bool => trim((string)($event['deleted_at'] ?? '')) !== '';
+    $isTestEvent = static fn(array $event): bool => filter_var($event['is_test'] ?? false, FILTER_VALIDATE_BOOLEAN);
 
     $isEventOfficeOpenNow = static function (array $event): bool {
         $openAt = parseLocalDateTimeString((string)($event['office_open_at'] ?? ''));
@@ -1087,6 +1107,7 @@ try {
             FROM events
             WHERE archived_at IS NULL
               AND deleted_at IS NULL
+              AND is_test = FALSE
               AND office_close_at <= DATE_SUB(NOW(), INTERVAL 1 MONTH)
         ');
         $eventsToArchive = $eventsToArchiveStmt->fetchAll();
@@ -3244,6 +3265,110 @@ try {
         ], null];
     };
 
+    $buildTestEventSeedMappings = static function (): array {
+        return [
+            [
+                'source_column_name' => 'Email',
+                'alias' => 'Email',
+                'field_role' => 'email',
+                'field_type' => 'text',
+                'validation_rules' => [],
+                'display_order' => 0,
+                'is_required' => true,
+                'is_active' => true,
+            ],
+            [
+                'source_column_name' => 'Imie',
+                'alias' => 'Imie',
+                'field_role' => 'display_name_part',
+                'field_type' => 'text',
+                'validation_rules' => [],
+                'display_order' => 1,
+                'is_required' => true,
+                'is_active' => true,
+            ],
+            [
+                'source_column_name' => 'Nazwisko',
+                'alias' => 'Nazwisko',
+                'field_role' => 'display_name_part',
+                'field_type' => 'text',
+                'validation_rules' => [],
+                'display_order' => 2,
+                'is_required' => true,
+                'is_active' => true,
+            ],
+            [
+                'source_column_name' => 'Numer',
+                'alias' => 'Numer startowy',
+                'field_role' => 'bib_number',
+                'field_type' => 'text',
+                'validation_rules' => [],
+                'display_order' => 3,
+                'is_required' => false,
+                'is_active' => true,
+            ],
+            [
+                'source_column_name' => 'Dystans',
+                'alias' => 'Dystans',
+                'field_role' => 'important_custom',
+                'field_type' => 'select',
+                'validation_rules' => ['options' => ['5 km', '10 km', '21 km']],
+                'display_order' => 4,
+                'is_required' => true,
+                'is_active' => true,
+            ],
+            [
+                'source_column_name' => 'Klub',
+                'alias' => 'Klub',
+                'field_role' => 'custom',
+                'field_type' => 'text',
+                'validation_rules' => [],
+                'display_order' => 5,
+                'is_required' => false,
+                'is_active' => true,
+            ],
+        ];
+    };
+
+    $buildTestEventSeedRows = static function (): array {
+        return [
+            ['Email' => 'anna.test@example.com', 'Imie' => 'Anna', 'Nazwisko' => 'Testowa', 'Numer' => '101', 'Dystans' => '5 km', 'Klub' => 'Demo Team'],
+            ['Email' => 'bartek.test@example.com', 'Imie' => 'Bartek', 'Nazwisko' => 'Przykladowy', 'Numer' => '102', 'Dystans' => '10 km', 'Klub' => 'Run Demo'],
+            ['Email' => 'celina.test@example.com', 'Imie' => 'Celina', 'Nazwisko' => 'Sandbox', 'Numer' => '103', 'Dystans' => '21 km', 'Klub' => ''],
+            ['Email' => 'dawid.test@example.com', 'Imie' => 'Dawid', 'Nazwisko' => 'Kontrolny', 'Numer' => '', 'Dystans' => '10 km', 'Klub' => 'QA Sport'],
+        ];
+    };
+
+    $resetTestEventSeedData = static function (PDO $pdo, string $eventId, array $authUser) use (
+        $deleteEventParticipantList,
+        $insertParticipantImportMappings,
+        $importParticipantsFromRows,
+        $buildTestEventSeedMappings,
+        $buildTestEventSeedRows
+    ): array {
+        $resetSummary = $deleteEventParticipantList($pdo, $eventId, $authUser);
+        $mappings = $buildTestEventSeedMappings();
+        $insertParticipantImportMappings($pdo, $eventId, $mappings);
+        [$importSummary, $importError] = $importParticipantsFromRows(
+            $pdo,
+            $eventId,
+            $buildTestEventSeedRows(),
+            $mappings,
+            $authUser,
+            false
+        );
+
+        if ($importError !== null || $importSummary === null) {
+            throw new RuntimeException($importError ?? 'Nie udało się przygotować danych testowych');
+        }
+
+        return [
+            'reset' => $resetSummary,
+            ...$importSummary,
+            'mappings' => $mappings,
+        ];
+    };
+
     if (preg_match('#^/qr-images/([A-Za-z0-9_%-]+)\.svg$#', $path, $matches) === 1 && $method === 'GET') {
         $qrCode = rawurldecode((string)$matches[1]);
         $participant = $loadParticipantByQrCode($pdo, $qrCode);
@@ -3720,6 +3845,7 @@ try {
             ) oc ON oc.event_id = e.id
             WHERE e.archived_at IS NULL
               AND e.deleted_at IS NULL
+              AND e.is_test = FALSE
               AND e.office_close_at >= UTC_TIMESTAMP()
               AND e.office_open_at <= DATE_ADD(UTC_TIMESTAMP(), INTERVAL 7 DAY)
             ORDER BY e.office_open_at ASC
@@ -3788,6 +3914,7 @@ try {
             LEFT JOIN events e
                 ON e.organization_id = o.id
                AND e.deleted_at IS NULL
+               AND e.is_test = FALSE
             GROUP BY o.id, o.name, o.event_limit
             HAVING o.event_limit > 0
                AND COUNT(e.id) >= o.event_limit
@@ -3866,6 +3993,7 @@ try {
                 GROUP BY event_id
             ) ob ON ob.event_id = ess.event_id
             WHERE e.deleted_at IS NULL
+              AND e.is_test = FALSE
             ORDER BY
                 CASE ess.sync_status WHEN 'conflict' THEN 0 WHEN 'pending' THEN 1 WHEN 'syncing' THEN 2 ELSE 3 END,
                 e.name ASC
@@ -3939,6 +4067,7 @@ try {
             INNER JOIN events e ON e.id = duplicates.event_id
             INNER JOIN organizations o ON o.id = e.organization_id
             WHERE e.deleted_at IS NULL
+              AND e.is_test = FALSE
             GROUP BY e.id, e.name, e.organization_id, o.name
             ORDER BY affected_count DESC
         ");
@@ -3980,6 +4109,7 @@ try {
             INNER JOIN events e ON e.id = duplicates.event_id
             INNER JOIN organizations o ON o.id = e.organization_id
             WHERE e.deleted_at IS NULL
+              AND e.is_test = FALSE
             GROUP BY e.id, e.name, e.organization_id, o.name
             ORDER BY affected_count DESC
         ");
@@ -4015,6 +4145,7 @@ try {
             INNER JOIN organizations o ON o.id = e.organization_id
             WHERE e.archived_at IS NULL
               AND e.deleted_at IS NULL
+              AND e.is_test = FALSE
               AND (p.qr_code IS NULL OR TRIM(p.qr_code) = '')
             GROUP BY e.id, e.name, e.organization_id, o.name
             ORDER BY affected_count DESC
@@ -5178,7 +5309,7 @@ try {
             $eventLimitValue = (int)$eventLimit;
         }
 
-        $eventCountStmt = $pdo->prepare('SELECT COUNT(*) AS total FROM events WHERE organization_id = :organization_id AND deleted_at IS NULL');
+        $eventCountStmt = $pdo->prepare('SELECT COUNT(*) AS total FROM events WHERE organization_id = :organization_id AND deleted_at IS NULL AND is_test = FALSE');
         $eventCountStmt->execute(['organization_id' => $organizationId]);
         $eventCount = (int)($eventCountStmt->fetch()['total'] ?? 0);
         if ($eventLimitValue < $eventCount) {
@@ -5334,7 +5465,7 @@ try {
             exit;
         }
 
-        $eventCountStmt = $pdo->prepare('SELECT COUNT(*) AS total FROM events WHERE organization_id = :organization_id AND deleted_at IS NULL');
+        $eventCountStmt = $pdo->prepare('SELECT COUNT(*) AS total FROM events WHERE organization_id = :organization_id AND deleted_at IS NULL AND is_test = FALSE');
         $eventCountStmt->execute(['organization_id' => $organizationId]);
         $eventCount = (int)($eventCountStmt->fetch()['total'] ?? 0);
 
@@ -5406,6 +5537,100 @@ try {
                 'organization_id' => $organizationId,
                 'office_open_at' => str_replace(' ', 'T', $normalizedOfficeOpenAt),
                 'office_close_at' => str_replace(' ', 'T', $normalizedOfficeCloseAt),
+                'is_test' => false,
+            ],
+        ]);
+        exit;
+    }
+
+    if ($path === '/events/test' && $method === 'POST') {
+        $authUser = requireAnyRole(['superadmin', 'admin', 'editor'], $resolveAuthenticatedUser);
+        $input = readJsonBody();
+
+        $organizationId = trim((string)($input['organization_id'] ?? ''));
+        if ($organizationId === '') {
+            jsonResponse(422, ['error' => 'Pole organization_id jest wymagane']);
+            exit;
+        }
+
+        if (!$canAccessOrganization($authUser, $organizationId)) {
+            jsonResponse(403, ['error' => 'Brak uprawnień']);
+            exit;
+        }
+
+        $organization = $loadOrganizationById($pdo, $organizationId);
+        if ($organization === false) {
+            jsonResponse(422, ['error' => 'Nie znaleziono organizacji']);
+            exit;
+        }
+
+        $now = new DateTimeImmutable();
+        $officeOpenAt = $now->setTime(
+            (int)$now->format('H'),
+            (int)$now->format('i'),
+            0
+        );
+        $officeCloseAt = $officeOpenAt->modify('+2 hours');
+        $eventId = 'evt-test-' . bin2hex(random_bytes(8));
+        $eventName = sprintf('Wydarzenie testowe - %s', (string)$organization['name']);
+        $location = 'Sandbox biura zawodów';
+
+        $pdo->beginTransaction();
+
+        try {
+            $insertEventStmt = $pdo->prepare('
+                INSERT INTO events (id, name, event_date, location, organization_id, office_open_at, office_close_at, is_test)
+                VALUES (:id, :name, :event_date, :location, :organization_id, :office_open_at, :office_close_at, TRUE)
+            ');
+            $insertEventStmt->execute([
+                'id' => $eventId,
+                'name' => $eventName,
+                'event_date' => $officeOpenAt->format('Y-m-d'),
+                'location' => $location,
+                'organization_id' => $organizationId,
+                'office_open_at' => $officeOpenAt->format('Y-m-d H:i:s'),
+                'office_close_at' => $officeCloseAt->format('Y-m-d H:i:s'),
+            ]);
+
+            $mappings = $buildTestEventSeedMappings();
+            $insertParticipantImportMappings($pdo, $eventId, $mappings);
+            [$importSummary, $importError] = $importParticipantsFromRows(
+                $pdo,
+                $eventId,
+                $buildTestEventSeedRows(),
+                $mappings,
+                $authUser,
+                false
+            );
+
+            if ($importError !== null || $importSummary === null) {
+                throw new RuntimeException($importError ?? 'Nie udało się przygotować danych testowych');
+            }
+
+            $addActivityLog(
+                $pdo,
+                sprintf('Utworzono wydarzenie testowe: %s', $eventName),
+                $eventId,
+                null,
+                null,
+                (string)$authUser['id'],
+                (string)$authUser['name']
+            );
+
+            $pdo->commit();
+        } catch (Throwable $exception) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+
+            throw $exception;
+        }
+
+        jsonResponse(201, [
+            'data' => [
+                'event' => $loadEventById($pdo, $eventId),
+                'participants' => $loadParticipantsByEventId($pdo, $eventId),
+                'mappings' => $loadParticipantFieldMappings($pdo, $eventId),
             ],
         ]);
         exit;
@@ -5559,6 +5784,86 @@ try {
         );
 
         jsonResponse(200, ['data' => $loadEventById($pdo, $eventId)]);
+        exit;
+    }
+
+    if (preg_match('#^/events/([^/]+)/test-reset$#', $path, $matches) === 1 && $method === 'POST') {
+        $authUser = requireAnyRole(['superadmin', 'admin', 'editor'], $resolveAuthenticatedUser);
+        $eventId = (string)$matches[1];
+        $event = $loadEventById($pdo, $eventId);
+
+        if ($event === false) {
+            jsonResponse(404, ['error' => 'Nie znaleziono wydarzenia']);
+            exit;
+        }
+
+        if (!$canManageEventParticipants($authUser, $event)) {
+            jsonResponse(403, ['error' => 'Brak uprawnień']);
+            exit;
+        }
+
+        if (!$isTestEvent($event)) {
+            jsonResponse(422, ['error' => 'Reset danych jest dostępny tylko dla wydarzeń testowych']);
+            exit;
+        }
+
+        $now = new DateTimeImmutable();
+        $officeOpenAt = $now->setTime(
+            (int)$now->format('H'),
+            (int)$now->format('i'),
+            0
+        );
+        $officeCloseAt = $officeOpenAt->modify('+2 hours');
+
+        $pdo->beginTransaction();
+
+        try {
+            $updateEventStmt = $pdo->prepare('
+                UPDATE events
+                SET event_date = :event_date,
+                    office_open_at = :office_open_at,
+                    office_close_at = :office_close_at,
+                    archived_at = NULL,
+                    deleted_at = NULL
+                WHERE id = :id
+                  AND is_test = TRUE
+                LIMIT 1
+            ');
+            $updateEventStmt->execute([
+                'id' => $eventId,
+                'event_date' => $officeOpenAt->format('Y-m-d'),
+                'office_open_at' => $officeOpenAt->format('Y-m-d H:i:s'),
+                'office_close_at' => $officeCloseAt->format('Y-m-d H:i:s'),
+            ]);
+
+            $seedSummary = $resetTestEventSeedData($pdo, $eventId, $authUser);
+            $addActivityLog(
+                $pdo,
+                sprintf('Zresetowano dane testowe wydarzenia: %s', (string)$event['name']),
+                $eventId,
+                null,
+                null,
+                (string)$authUser['id'],
+                (string)$authUser['name']
+            );
+
+            $pdo->commit();
+        } catch (Throwable $exception) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+
+            throw $exception;
+        }
+
+        jsonResponse(200, [
+            'data' => [
+                'event' => $loadEventById($pdo, $eventId),
+                'participants' => $loadParticipantsByEventId($pdo, $eventId),
+                'mappings' => $loadParticipantFieldMappings($pdo, $eventId),
+                'summary' => $seedSummary,
+            ],
+        ]);
         exit;
     }
 
@@ -5732,7 +6037,7 @@ try {
 
         $officeCloseAt = parseLocalDateTimeString((string)($event['office_close_at'] ?? ''));
         $now = new DateTimeImmutable();
-        if ($officeCloseAt !== null && $now > $officeCloseAt) {
+        if ($officeCloseAt !== null && $now > $officeCloseAt && !$isTestEvent($event)) {
             jsonResponse(422, ['error' => 'Zakończone wydarzenia trzeba przenieść do archiwum']);
             exit;
         }
@@ -6851,7 +7156,7 @@ try {
             exit;
         }
 
-        $eventCountStmt = $pdo->prepare('SELECT COUNT(*) AS total FROM events WHERE organization_id = :organization_id AND deleted_at IS NULL');
+        $eventCountStmt = $pdo->prepare('SELECT COUNT(*) AS total FROM events WHERE organization_id = :organization_id AND deleted_at IS NULL AND is_test = FALSE');
         $eventCountStmt->execute(['organization_id' => $organizationId]);
         $eventCount = (int)($eventCountStmt->fetch()['total'] ?? 0);
         $eventLimitValue = (int)$eventLimit;
@@ -7566,6 +7871,28 @@ try {
         try {
             $wasAlreadySent = (string)($participant['email_status'] ?? '') === 'sent';
 
+            if ($isTestEvent($event)) {
+                $updateStmt = $pdo->prepare('UPDATE participants SET email_status = :email_status WHERE id = :id');
+                $updateStmt->execute([
+                    'email_status' => 'sent',
+                    'id' => (int)$participant['id'],
+                ]);
+                $participant['email_status'] = 'sent';
+
+                $addActivityLog(
+                    $pdo,
+                    $wasAlreadySent ? 'Ponownie zasymulowano wysylke kodu QR' : 'Zasymulowano wysylke kodu QR',
+                    (string)$event['id'],
+                    (int)$participant['id'],
+                    (string)$participant['display_name'],
+                    (string)$authUser['id'],
+                    (string)$authUser['name']
+                );
+
+                jsonResponse(200, ['data' => $participant, 'test_mode' => true]);
+                exit;
+            }
+
             MailService::sendParticipantQrEmail(
                 recipientEmail: (string)$participant['email'],
                 recipientName: (string)$participant['display_name'],
@@ -7688,6 +8015,37 @@ try {
                 'participantImportantFieldAliases' => is_array($participantRow['important_field_aliases'] ?? null) ? $participantRow['important_field_aliases'] : [],
             ];
             $queuedParticipantRows[] = $participantRow;
+        }
+
+        if ($isTestEvent($event)) {
+            foreach ($queuedParticipantRows as $participantRow) {
+                $updateSentEmailStatusStmt->execute([
+                    'email_status' => 'sent',
+                    'id' => (int)$participantRow['id'],
+                ]);
+            }
+
+            if ($queuedParticipantRows !== []) {
+                $addActivityLog(
+                    $pdo,
+                    $resendAll ? 'Zasymulowano ponowna wysylke kodow QR dla wydarzenia' : 'Zasymulowano wysylke kodow QR dla wydarzenia',
+                    $eventId,
+                    null,
+                    null,
+                    (string)$authUser['id'],
+                    (string)$authUser['name']
+                );
+            }
+
+            jsonResponse(200, [
+                'test_mode' => true,
+                'data' => [
+                    'sent_count' => count($queuedParticipantRows),
+                    'error_count' => 0,
+                    'errors' => [],
+                ],
+            ]);
+            exit;
         }
 
         try {

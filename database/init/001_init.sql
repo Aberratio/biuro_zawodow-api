@@ -38,6 +38,7 @@ CREATE TABLE events (
     organization_id VARCHAR(64) NOT NULL,
     office_open_at DATETIME NOT NULL,
     office_close_at DATETIME NOT NULL,
+    is_test BOOLEAN NOT NULL DEFAULT FALSE,
     archived_at DATETIME NULL,
     deleted_at DATETIME NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -383,18 +384,19 @@ ON DUPLICATE KEY UPDATE
     name = VALUES(name),
     event_limit = VALUES(event_limit);
 
-INSERT INTO events (id, name, event_date, location, organization_id, office_open_at, office_close_at)
+INSERT INTO events (id, name, event_date, location, organization_id, office_open_at, office_close_at, is_test)
 VALUES
-    ('evt-1', 'Bieg Piastowski 10km', '2026-04-12', 'Gniezno, Park Miejski', 'org-1', '2026-03-28 07:00:00', '2026-03-28 18:00:00'),
-    ('evt-2', 'Triathlon Poznań Sprint', '2026-05-18', 'Poznań, Malta', 'org-1', '2026-05-18 06:30:00', '2026-05-18 14:30:00'),
-    ('evt-3', 'Maraton Wrocław', '2026-06-07', 'Wrocław, Hala Stulecia', 'org-2', '2026-06-07 05:30:00', '2026-06-07 16:00:00')
+    ('evt-1', 'Bieg Piastowski 10km', '2026-04-12', 'Gniezno, Park Miejski', 'org-1', '2026-03-28 07:00:00', '2026-03-28 18:00:00', FALSE),
+    ('evt-2', 'Triathlon Poznań Sprint', '2026-05-18', 'Poznań, Malta', 'org-1', '2026-05-18 06:30:00', '2026-05-18 14:30:00', FALSE),
+    ('evt-3', 'Maraton Wrocław', '2026-06-07', 'Wrocław, Hala Stulecia', 'org-2', '2026-06-07 05:30:00', '2026-06-07 16:00:00', FALSE)
 ON DUPLICATE KEY UPDATE
     name = VALUES(name),
     event_date = VALUES(event_date),
     location = VALUES(location),
     organization_id = VALUES(organization_id),
     office_open_at = VALUES(office_open_at),
-    office_close_at = VALUES(office_close_at);
+    office_close_at = VALUES(office_close_at),
+    is_test = VALUES(is_test);
 
 INSERT INTO users (id, name, email, password, role, organization_id)
 VALUES

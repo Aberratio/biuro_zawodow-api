@@ -1505,6 +1505,41 @@ function openApiDocument(): array
                     ],
                 ],
             ],
+            '/events/test' => [
+                'post' => [
+                    'tags' => ['Events'],
+                    'summary' => 'Create test event sandbox with sample participants',
+                    'security' => [
+                        ['bearerAuth' => []],
+                    ],
+                    'requestBody' => [
+                        'required' => true,
+                        'content' => [
+                            'application/json' => [
+                                'schema' => [
+                                    'type' => 'object',
+                                    'required' => ['organization_id'],
+                                    'properties' => [
+                                        'organization_id' => ['type' => 'string', 'example' => 'org-1'],
+                                    ],
+                                ],
+                            ],
+                        ],
+                    ],
+                    'responses' => [
+                        '201' => [
+                            'description' => 'Test event created',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => ['$ref' => '#/components/schemas/TestEventSandboxResponse'],
+                                ],
+                            ],
+                        ],
+                        '403' => ['$ref' => '#/components/responses/Forbidden'],
+                        '422' => ['description' => 'Validation error'],
+                    ],
+                ],
+            ],
             '/events/{id}' => [
                 'get' => [
                     'tags' => ['Events'],
@@ -1645,6 +1680,35 @@ function openApiDocument(): array
                         '401' => [
                             '$ref' => '#/components/responses/Brak autoryzacji',
                         ],
+                    ],
+                ],
+            ],
+            '/events/{id}/test-reset' => [
+                'post' => [
+                    'tags' => ['Events'],
+                    'summary' => 'Reset sample data and office window for a test event',
+                    'security' => [
+                        ['bearerAuth' => []],
+                    ],
+                    'parameters' => [
+                        [
+                            'name' => 'id',
+                            'in' => 'path',
+                            'required' => true,
+                            'schema' => ['type' => 'string'],
+                        ],
+                    ],
+                    'responses' => [
+                        '200' => [
+                            'description' => 'Test event reset',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => ['$ref' => '#/components/schemas/TestEventSandboxResponse'],
+                                ],
+                            ],
+                        ],
+                        '403' => ['$ref' => '#/components/responses/Forbidden'],
+                        '422' => ['description' => 'Not a test event'],
                     ],
                 ],
             ],
@@ -3678,7 +3742,7 @@ function openApiDocument(): array
                 ],
                 'Event' => [
                     'type' => 'object',
-                    'required' => ['id', 'name', 'location', 'organization_id', 'office_open_at', 'office_close_at'],
+                    'required' => ['id', 'name', 'location', 'organization_id', 'office_open_at', 'office_close_at', 'is_test'],
                     'properties' => [
                         'id' => ['type' => 'string', 'example' => 'evt-1'],
                         'name' => ['type' => 'string', 'example' => 'Bieg Piastowski 10km'],
@@ -3686,6 +3750,7 @@ function openApiDocument(): array
                         'organization_id' => ['type' => 'string', 'example' => 'org-1'],
                         'office_open_at' => ['type' => 'string', 'format' => 'date-time', 'example' => '2026-04-12T07:00:00'],
                         'office_close_at' => ['type' => 'string', 'format' => 'date-time', 'example' => '2026-04-12T15:00:00'],
+                        'is_test' => ['type' => 'boolean', 'example' => false],
                     ],
                 ],
                 'EventResponse' => [
@@ -3706,6 +3771,27 @@ function openApiDocument(): array
                         'organization_id' => ['type' => 'string', 'example' => 'org-1'],
                         'office_open_at' => ['type' => 'string', 'format' => 'date-time', 'example' => '2026-09-20T08:00:00'],
                         'office_close_at' => ['type' => 'string', 'format' => 'date-time', 'example' => '2026-09-20T16:00:00'],
+                    ],
+                ],
+                'TestEventSandboxResponse' => [
+                    'type' => 'object',
+                    'required' => ['data'],
+                    'properties' => [
+                        'data' => [
+                            'type' => 'object',
+                            'required' => ['event', 'participants', 'mappings'],
+                            'properties' => [
+                                'event' => ['$ref' => '#/components/schemas/Event'],
+                                'participants' => [
+                                    'type' => 'array',
+                                    'items' => ['$ref' => '#/components/schemas/Participant'],
+                                ],
+                                'mappings' => [
+                                    'type' => 'array',
+                                    'items' => ['$ref' => '#/components/schemas/ParticipantFieldMapping'],
+                                ],
+                            ],
+                        ],
                     ],
                 ],
                 'UpdateOrganizationEventLimitRequest' => [
