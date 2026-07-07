@@ -22,3 +22,24 @@ test('documents and migrates test event sandbox support', function (): void {
     assertTrue(in_array('is_test', $eventSchema['required'] ?? [], true));
     assertSame('boolean', $eventSchema['properties']['is_test']['type'] ?? null);
 });
+
+test('keeps test event QR sending on the simulated path', function (): void {
+    $source = file_get_contents(__DIR__ . '/../public/index.php');
+    assertTrue(is_string($source));
+
+    assertStringContains("'test_mode' => true", $source);
+    assertStringContains('Zasymulowano wysylke kodu QR', $source);
+    assertStringContains('Zasymulowano wysylke kodow QR dla wydarzenia', $source);
+
+    $singleSimulation = strpos($source, "jsonResponse(200, ['data' => \$participant, 'test_mode' => true]);");
+    $singleMailSend = strpos($source, 'MailService::sendParticipantQrEmail(');
+    assertTrue($singleSimulation !== false, 'Single QR simulated response is missing');
+    assertTrue($singleMailSend !== false, 'Single QR MailService call is missing');
+    assertTrue($singleSimulation < $singleMailSend, 'Single QR simulation must happen before MailService call');
+
+    $batchSimulation = strpos($source, "'test_mode' => true", $singleMailSend);
+    $batchMailSend = strpos($source, 'MailService::sendParticipantQrEmailBatch(');
+    assertTrue($batchSimulation !== false, 'Batch QR simulated response is missing');
+    assertTrue($batchMailSend !== false, 'Batch QR MailService call is missing');
+    assertTrue($batchSimulation < $batchMailSend, 'Batch QR simulation must happen before MailService batch call');
+});
