@@ -1438,6 +1438,17 @@ function openApiDocument(): array
                     ],
                 ],
             ],
+            '/superadmin/database' => [
+                'get' => [
+                    'tags' => ['Superadmin'],
+                    'summary' => 'Load masked database diagnostics',
+                    'security' => [['bearerAuth' => []]],
+                    'responses' => [
+                        '200' => ['description' => 'Database table list and masked paginated rows'],
+                        '403' => ['$ref' => '#/components/responses/Forbidden'],
+                    ],
+                ],
+            ],
             '/superadmin/logging-status' => [
                 'get' => [
                     'tags' => ['Superadmin'],
@@ -3782,9 +3793,29 @@ function openApiDocument(): array
                         ],
                     ],
                 ],
+                'EventOfficeHourRange' => [
+                    'type' => 'object',
+                    'required' => ['opens_at', 'closes_at'],
+                    'properties' => [
+                        'opens_at' => ['type' => 'string', 'format' => 'date-time', 'example' => '2026-04-12T07:00:00'],
+                        'closes_at' => ['type' => 'string', 'format' => 'date-time', 'example' => '2026-04-12T15:00:00'],
+                    ],
+                ],
+                'EventOfficeLocation' => [
+                    'type' => 'object',
+                    'required' => ['name', 'hours'],
+                    'properties' => [
+                        'name' => ['type' => 'string', 'example' => 'Gniezno, Park Miejski'],
+                        'google_maps_url' => ['type' => 'string', 'nullable' => true, 'example' => 'https://maps.google.com/?q=Park+Miejski+Gniezno'],
+                        'hours' => [
+                            'type' => 'array',
+                            'items' => ['$ref' => '#/components/schemas/EventOfficeHourRange'],
+                        ],
+                    ],
+                ],
                 'Event' => [
                     'type' => 'object',
-                    'required' => ['id', 'name', 'location', 'organization_id', 'office_open_at', 'office_close_at', 'is_test'],
+                    'required' => ['id', 'name', 'location', 'organization_id', 'office_open_at', 'office_close_at', 'office_locations', 'is_test'],
                     'properties' => [
                         'id' => ['type' => 'string', 'example' => 'evt-1'],
                         'name' => ['type' => 'string', 'example' => 'Bieg Piastowski 10km'],
@@ -3792,6 +3823,10 @@ function openApiDocument(): array
                         'organization_id' => ['type' => 'string', 'example' => 'org-1'],
                         'office_open_at' => ['type' => 'string', 'format' => 'date-time', 'example' => '2026-04-12T07:00:00'],
                         'office_close_at' => ['type' => 'string', 'format' => 'date-time', 'example' => '2026-04-12T15:00:00'],
+                        'office_locations' => [
+                            'type' => 'array',
+                            'items' => ['$ref' => '#/components/schemas/EventOfficeLocation'],
+                        ],
                         'is_test' => ['type' => 'boolean', 'example' => false],
                     ],
                 ],
@@ -3806,13 +3841,15 @@ function openApiDocument(): array
                 ],
                 'CreateEventRequest' => [
                     'type' => 'object',
-                    'required' => ['name', 'location', 'organization_id', 'office_open_at', 'office_close_at'],
+                    'required' => ['name', 'location', 'organization_id', 'office_locations'],
                     'properties' => [
                         'name' => ['type' => 'string', 'example' => 'Bieg Jesienny 5km'],
                         'location' => ['type' => 'string', 'example' => 'Krakow, Blonia'],
                         'organization_id' => ['type' => 'string', 'example' => 'org-1'],
-                        'office_open_at' => ['type' => 'string', 'format' => 'date-time', 'example' => '2026-09-20T08:00:00'],
-                        'office_close_at' => ['type' => 'string', 'format' => 'date-time', 'example' => '2026-09-20T16:00:00'],
+                        'office_locations' => [
+                            'type' => 'array',
+                            'items' => ['$ref' => '#/components/schemas/EventOfficeLocation'],
+                        ],
                     ],
                 ],
                 'TestEventSandboxResponse' => [
@@ -3951,12 +3988,15 @@ function openApiDocument(): array
                 ],
                 'UpdateEventRequest' => [
                     'type' => 'object',
-                    'required' => ['name', 'location', 'office_open_at', 'office_close_at'],
+                    'required' => ['name', 'location', 'office_locations'],
                     'properties' => [
                         'name' => ['type' => 'string', 'example' => 'Bieg Jesienny 5km'],
                         'location' => ['type' => 'string', 'example' => 'Krakow, Blonia'],
-                        'office_open_at' => ['type' => 'string', 'format' => 'date-time', 'example' => '2026-09-20T08:00:00'],
-                        'office_close_at' => ['type' => 'string', 'format' => 'date-time', 'example' => '2026-09-20T16:00:00'],
+                        'office_locations' => [
+                            'type' => 'array',
+                            'items' => ['$ref' => '#/components/schemas/EventOfficeLocation'],
+                        ],
+                        'reopen_office' => ['type' => 'boolean', 'example' => false],
                     ],
                 ],
                 'UpdateOrganizationRequest' => [

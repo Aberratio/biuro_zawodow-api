@@ -68,6 +68,221 @@ try {
         return null;
     };
 
+    $isValidHttpUrl = static function (string $value): bool {
+        if (filter_var($value, FILTER_VALIDATE_URL) === false) {
+            return false;
+        }
+
+        $scheme = strtolower((string)parse_url($value, PHP_URL_SCHEME));
+        return $scheme === 'http' || $scheme === 'https';
+    };
+
+    $validateEventOfficeLocationsInput = static function ($rawLocations) use ($isValidHttpUrl): array {
+        if (!is_array($rawLocations) || $rawLocations === []) {
+            return [null, 'Dodaj co najmniej jedną lokalizację biura zawodów'];
+        }
+
+        $normalizedLocations = [];
+
+        foreach ($rawLocations as $rawLocation) {
+            if (!is_array($rawLocation)) {
+                return [null, 'Nieprawidłowe dane lokalizacji biura zawodów'];
+            }
+
+            $name = trim((string)($rawLocation['name'] ?? ''));
+            if ($name === '') {
+                return [null, 'Nazwa lokalizacji biura zawodów jest wymagana'];
+            }
+
+            if (mb_strlen($name) > 190) {
+                return [null, 'Nazwa lokalizacji biura zawodów może mieć maksymalnie 190 znaków'];
+            }
+
+            $googleMapsUrl = trim((string)($rawLocation['google_maps_url'] ?? ''));
+            if ($googleMapsUrl !== '') {
+                if (mb_strlen($googleMapsUrl) > 2048) {
+                    return [null, sprintf('Link do Google Maps dla lokalizacji "%s" jest zbyt długi', $name)];
+                }
+
+                if (!$isValidHttpUrl($googleMapsUrl)) {
+                    return [null, sprintf('Link do Google Maps dla lokalizacji "%s" jest nieprawidłowy', $name)];
+                }
+            }
+
+            $rawHours = $rawLocation['hours'] ?? null;
+            if (!is_array($rawHours) || $rawHours === []) {
+                return [null, sprintf('Dodaj co najmniej jeden zakres godzin dla lokalizacji "%s"', $name)];
+            }
+
+            $normalizedHours = [];
+            foreach ($rawHours as $rawHour) {
+                if (!is_array($rawHour)) {
+                    return [null, sprintf('Nieprawidłowy zakres godzin dla lokalizacji "%s"', $name)];
+                }
+
+                $opensAt = trim((string)($rawHour['opens_at'] ?? ''));
+                $closesAt = trim((string)($rawHour['closes_at'] ?? ''));
+
+                if (!isValidLocalDateTimeString($opensAt) || !isValidLocalDateTimeString($closesAt)) {
+                    return [null, sprintf('Zakres godzin dla lokalizacji "%s" musi mieć prawidłową datę i godzinę', $name)];
+                }
+
+                $normalizedOpensAt = normalizeLocalDateTimeString($opensAt);
+                $normalizedClosesAt = normalizeLocalDateTimeString($closesAt);
+                if ($normalizedOpensAt === null || $normalizedClosesAt === null) {
+                    return [null, sprintf('Zakres godzin dla lokalizacji "%s" musi mieć prawidłową datę i godzinę', $name)];
+                }
+
+                if ($normalizedClosesAt <= $normalizedOpensAt) {
+                    return [null, sprintf('Zamknięcie musi być późniejsze niż otwarcie w lokalizacji "%s"', $name)];
+                }
+
+                $normalizedHours[] = [
+                    'opens_at' => $normalizedOpensAt,
+                    'closes_at' => $normalizedClosesAt,
+                ];
+            }
+
+            $normalizedLocations[] = [
+                'name' => $name,
+                'google_maps_url' => $googleMapsUrl !== '' ? $googleMapsUrl : null,
+                'hours' => $normalizedHours,
+            ];
+        }
+
+        return [$normalizedLocations, null];
+    };
+
+    $computeEventOfficeWindowFromLocations = static function (array $locations): array {
+        $opensAtValues = [];
+        $closesAtValues = [];
+
+        foreach ($locations as $location) {
+            foreach ($location['hours'] as $hour) {
+                $opensAtValues[] = $hour['opens_at'];
+                $closesAtValues[] = $hour['closes_at'];
+            }
+        }
+
+        if ($opensAtValues === [] || $closesAtValues === []) {
+            return [null, null];
+        }
+
+        sort($opensAtValues);
+        rsort($closesAtValues);
+
+        return [$opensAtValues[0], $closesAtValues[0]];
+    };
+
+    $loadEventOfficeLocations = static function (PDO $pdo, string $eventId): array {
+        $locationsStmt = $pdo->prepare('
+            SELECT id, name, google_maps_url
+            FROM event_office_locations
+            WHERE event_id = :event_id
+            ORDER BY display_order ASC, id ASC
+        ');
+        $locationsStmt->execute(['event_id' => $eventId]);
+        $locationRows = $locationsStmt->fetchAll();
+
+        if ($locationRows === []) {
+            return [];
+        }
+
+        $locationIds = array_map(static fn(array $row): int => (int)$row['id'], $locationRows);
+        $placeholders = implode(',', array_fill(0, count($locationIds), '?'));
+
+        $hoursStmt = $pdo->prepare("
+            SELECT
+                id,
+                location_id,
+                DATE_FORMAT(opens_at, '%Y-%m-%dT%H:%i:%s') AS opens_at,
+                DATE_FORMAT(closes_at, '%Y-%m-%dT%H:%i:%s') AS closes_at
+            FROM event_office_location_hours
+            WHERE location_id IN ($placeholders)
+            ORDER BY display_order ASC, id ASC
+        ");
+        $hoursStmt->execute($locationIds);
+        $hourRows = $hoursStmt->fetchAll();
+
+        $hoursByLocationId = [];
+        foreach ($hourRows as $hourRow) {
+            $hoursByLocationId[(int)$hourRow['location_id']][] = [
+                'id' => (string)$hourRow['id'],
+                'opens_at' => (string)$hourRow['opens_at'],
+                'closes_at' => (string)$hourRow['closes_at'],
+            ];
+        }
+
+        return array_map(static function (array $row) use ($hoursByLocationId): array {
+            $locationId = (int)$row['id'];
+            return [
+                'id' => (string)$locationId,
+                'name' => (string)$row['name'],
+                'google_maps_url' => $row['google_maps_url'] !== null ? (string)$row['google_maps_url'] : null,
+                'hours' => $hoursByLocationId[$locationId] ?? [],
+            ];
+        }, $locationRows);
+    };
+
+    $replaceEventOfficeLocations = static function (PDO $pdo, string $eventId, array $locations): void {
+        $deleteStmt = $pdo->prepare('DELETE FROM event_office_locations WHERE event_id = :event_id');
+        $deleteStmt->execute(['event_id' => $eventId]);
+
+        $insertLocationStmt = $pdo->prepare('
+            INSERT INTO event_office_locations (event_id, name, google_maps_url, display_order)
+            VALUES (:event_id, :name, :google_maps_url, :display_order)
+        ');
+        $insertHourStmt = $pdo->prepare('
+            INSERT INTO event_office_location_hours (location_id, opens_at, closes_at, display_order)
+            VALUES (:location_id, :opens_at, :closes_at, :display_order)
+        ');
+
+        foreach (array_values($locations) as $locationIndex => $location) {
+            $insertLocationStmt->execute([
+                'event_id' => $eventId,
+                'name' => $location['name'],
+                'google_maps_url' => $location['google_maps_url'],
+                'display_order' => $locationIndex,
+            ]);
+            $locationId = (int)$pdo->lastInsertId();
+
+            foreach (array_values($location['hours']) as $hourIndex => $hour) {
+                $insertHourStmt->execute([
+                    'location_id' => $locationId,
+                    'opens_at' => $hour['opens_at'],
+                    'closes_at' => $hour['closes_at'],
+                    'display_order' => $hourIndex,
+                ]);
+            }
+        }
+    };
+
+    $formatEventOfficeLocationsForEmail = static function (array $locations): array {
+        return array_map(static function (array $location): array {
+            $ranges = array_map(static function (array $hour): string {
+                $opensAt = parseLocalDateTimeString((string)$hour['opens_at']);
+                $closesAt = parseLocalDateTimeString((string)$hour['closes_at']);
+                if ($opensAt === null || $closesAt === null) {
+                    return 'Godziny biura zawodów niedostępne';
+                }
+
+                return sprintf(
+                    '%s %s – %s %s',
+                    $opensAt->format('d.m.Y'),
+                    $opensAt->format('H:i'),
+                    $closesAt->format('d.m.Y'),
+                    $closesAt->format('H:i')
+                );
+            }, $location['hours']);
+
+            return [
+                'name' => (string)$location['name'],
+                'google_maps_url' => $location['google_maps_url'] ?? null,
+                'ranges' => $ranges,
+            ];
+        }, $locations);
+    };
+
     $loadAssignedEvents = static function (PDO $pdo, string $userId) use ($currentLocalDateTime): array {
         $stmt = $pdo->prepare('
             SELECT uea.event_id
@@ -141,7 +356,7 @@ try {
         ')->fetchAll();
     };
 
-    $loadEventById = static function (PDO $pdo, string $eventId): array|false {
+    $loadEventById = static function (PDO $pdo, string $eventId) use ($loadEventOfficeLocations): array|false {
         $stmt = $pdo->prepare('
             SELECT
                 id,
@@ -165,10 +380,11 @@ try {
         }
 
         $event['is_test'] = (bool)($event['is_test'] ?? false);
+        $event['office_locations'] = $loadEventOfficeLocations($pdo, $eventId);
         return $event;
     };
 
-    $loadAllEvents = static function (PDO $pdo): array {
+    $loadAllEvents = static function (PDO $pdo) use ($loadEventOfficeLocations): array {
         $events = $pdo->query('
             SELECT
                 id,
@@ -186,13 +402,14 @@ try {
             ORDER BY event_date ASC
         ')->fetchAll();
 
-        return array_map(static function (array $event): array {
+        return array_map(static function (array $event) use ($pdo, $loadEventOfficeLocations): array {
             $event['is_test'] = (bool)($event['is_test'] ?? false);
+            $event['office_locations'] = $loadEventOfficeLocations($pdo, (string)$event['id']);
             return $event;
         }, $events);
     };
 
-    $loadAllArchivedEvents = static function (PDO $pdo): array {
+    $loadAllArchivedEvents = static function (PDO $pdo) use ($loadEventOfficeLocations): array {
         $events = $pdo->query('
             SELECT
                 id,
@@ -210,8 +427,9 @@ try {
             ORDER BY archived_at DESC, event_date DESC
         ')->fetchAll();
 
-        return array_map(static function (array $event): array {
+        return array_map(static function (array $event) use ($pdo, $loadEventOfficeLocations): array {
             $event['is_test'] = (bool)($event['is_test'] ?? false);
+            $event['office_locations'] = $loadEventOfficeLocations($pdo, (string)$event['id']);
             return $event;
         }, $events);
     };
@@ -534,22 +752,6 @@ try {
         }
 
         return $canAccessOrganization($authUser, (string)$event['organization_id']);
-    };
-
-    $formatEventOfficeWindow = static function (array $event): string {
-        $openAt = parseLocalDateTimeString((string)($event['office_open_at'] ?? ''));
-        $closeAt = parseLocalDateTimeString((string)($event['office_close_at'] ?? ''));
-        if ($openAt === null || $closeAt === null) {
-            return 'Godziny biura zawodów niedostępne';
-        }
-
-        return sprintf(
-            'Otwarcie: %s %s, zamknięcie: %s %s',
-            $openAt->format('d.m.Y'),
-            $openAt->format('H:i'),
-            $closeAt->format('d.m.Y'),
-            $closeAt->format('H:i')
-        );
     };
 
     $canAccessEvent = static function (array $authUser, array $event) use ($canAccessOrganization, $isDeletedEvent, $isEventOfficeOpenNow, $isArchivedEvent, $isScannerRole): bool {
@@ -4434,7 +4636,24 @@ try {
         return [$conditions === [] ? '' : 'WHERE ' . implode(' AND ', $conditions), $params];
     };
 
-    $loadAuditRows = static function (PDO $pdo, string $where, array $params, int $limit, int $offset = 0): array {
+    $resolveAuditOrderSql = static function (): string {
+        $sort = trim((string)($_GET['sort'] ?? 'time'));
+        $direction = strtolower(trim((string)($_GET['direction'] ?? 'desc'))) === 'asc' ? 'ASC' : 'DESC';
+        $sortColumns = [
+            'time' => 'al.created_at',
+            'severity' => 'al.severity',
+            'category' => 'al.category',
+            'outcome' => 'al.outcome',
+            'actor' => 'COALESCE(u.name, al.actor_name_snapshot)',
+        ];
+        $column = $sortColumns[$sort] ?? $sortColumns['time'];
+        $idDirection = $direction === 'ASC' ? 'ASC' : 'DESC';
+
+        return "ORDER BY {$column} {$direction}, al.id {$idDirection}";
+    };
+
+    $loadAuditRows = static function (PDO $pdo, string $where, array $params, int $limit, int $offset = 0, ?string $orderSql = null): array {
+        $orderSql = $orderSql ?: 'ORDER BY al.created_at DESC, al.id DESC';
         $stmt = $pdo->prepare("
             SELECT
                 'audit' AS source, al.id, al.action, DATE_FORMAT(al.created_at, '%Y-%m-%dT%H:%i:%sZ') AS timestamp,
@@ -4449,7 +4668,7 @@ try {
             LEFT JOIN participants p ON p.id = al.participant_id
             LEFT JOIN users u ON u.id = al.actor_user_id
             {$where}
-            ORDER BY al.created_at DESC, al.id DESC
+            {$orderSql}
             LIMIT {$limit} OFFSET {$offset}
         ");
         $stmt->execute($params);
@@ -4459,6 +4678,42 @@ try {
             unset($entry['metadata_json']);
         }
         unset($entry);
+        return $entries;
+    };
+
+    $sortServerLogEntries = static function (array $entries): array {
+        $sort = trim((string)($_GET['sort'] ?? 'time'));
+        $direction = strtolower(trim((string)($_GET['direction'] ?? 'desc'))) === 'asc' ? 'asc' : 'desc';
+        $allowedSorts = ['time', 'level', 'status', 'path'];
+        if (!in_array($sort, $allowedSorts, true)) {
+            $sort = 'time';
+        }
+
+        usort($entries, static function (array $left, array $right) use ($sort, $direction): int {
+            $valueForSort = static function (array $entry) use ($sort): string {
+                if ($sort === 'level') {
+                    $weights = ['debug' => 100, 'info' => 200, 'notice' => 250, 'warning' => 300, 'error' => 400, 'critical' => 500];
+                    return str_pad((string)($weights[strtolower((string)($entry['level'] ?? ''))] ?? 0), 3, '0', STR_PAD_LEFT);
+                }
+                if ($sort === 'status') {
+                    $status = $entry['context']['status'] ?? '';
+                    return (string)$status;
+                }
+                if ($sort === 'path') {
+                    return (string)($entry['path'] ?? '');
+                }
+
+                return (string)($entry['timestamp'] ?? '');
+            };
+
+            $comparison = strcmp($valueForSort($left), $valueForSort($right));
+            if ($comparison === 0) {
+                $comparison = strcmp((string)($left['id'] ?? ''), (string)($right['id'] ?? ''));
+            }
+
+            return $direction === 'asc' ? $comparison : -$comparison;
+        });
+
         return $entries;
     };
 
@@ -4622,6 +4877,7 @@ try {
             'event_code' => $_GET['event_code'] ?? '',
             'q' => $_GET['q'] ?? '',
         ], 5000);
+        $entries = $sortServerLogEntries($entries);
         $total = count($entries);
         $totalPages = max(1, (int)ceil($total / $limit));
         $page = min($page, $totalPages);
@@ -4658,6 +4914,7 @@ try {
             'event_code' => $_GET['event_code'] ?? '',
             'q' => $_GET['q'] ?? '',
         ], 10000);
+        $entries = $sortServerLogEntries($entries);
         addAuditLog($pdo, [
             'category' => 'system', 'action_code' => 'server_logs.exported', 'action' => 'Wyeksportowano logi serwera',
             'actor_user_id' => $authUser['id'], 'actor_name' => $authUser['name'], 'actor_role' => $authUser['role'],
@@ -4704,7 +4961,7 @@ try {
     if ($path === '/superadmin/audit/export.csv' && $method === 'GET') {
         $authUser = requireAnyRole(['superadmin'], $resolveAuthenticatedUser);
         [$where, $params] = $buildAuditQuery();
-        $entries = $loadAuditRows($pdo, $where, $params, 10000);
+        $entries = $loadAuditRows($pdo, $where, $params, 10000, 0, $resolveAuditOrderSql());
         addAuditLog($pdo, [
             'category' => 'system', 'action_code' => 'audit.exported', 'action' => 'Wyeksportowano audyt systemowy',
             'actor_user_id' => $authUser['id'], 'actor_name' => $authUser['name'], 'actor_role' => $authUser['role'],
@@ -4763,7 +5020,7 @@ try {
         $total = (int)($countStmt->fetch()['total'] ?? 0);
         $totalPages = max(1, (int)ceil($total / $limit));
         $page = min($page, $totalPages);
-        $entries = $loadAuditRows($pdo, $where, $params, $limit, ($page - 1) * $limit);
+        $entries = $loadAuditRows($pdo, $where, $params, $limit, ($page - 1) * $limit, $resolveAuditOrderSql());
         jsonResponse(200, [
             'data' => $entries,
             'meta' => ['page' => $page, 'per_page' => $limit, 'total' => $total, 'total_pages' => $totalPages],
@@ -5532,28 +5789,21 @@ try {
         $name = trim((string)($input['name'] ?? ''));
         $location = trim((string)($input['location'] ?? ''));
         $organizationId = trim((string)($input['organization_id'] ?? ''));
-        $officeOpenAt = trim((string)($input['office_open_at'] ?? ''));
-        $officeCloseAt = trim((string)($input['office_close_at'] ?? ''));
 
-        if ($name === '' || $location === '' || $organizationId === '' || $officeOpenAt === '' || $officeCloseAt === '') {
-            jsonResponse(422, ['error' => 'Nazwa, lokalizacja, organization_id, office_open_at i office_close_at są wymagane']);
+        if ($name === '' || $location === '' || $organizationId === '') {
+            jsonResponse(422, ['error' => 'Nazwa, lokalizacja i organization_id są wymagane']);
             exit;
         }
 
-        if (!isValidLocalDateTimeString($officeOpenAt) || !isValidLocalDateTimeString($officeCloseAt)) {
-            jsonResponse(422, ['error' => 'office_open_at i office_close_at muszą być prawidłowymi lokalnymi datami i godzinami']);
+        [$officeLocations, $officeLocationsError] = $validateEventOfficeLocationsInput($input['office_locations'] ?? null);
+        if ($officeLocationsError !== null || $officeLocations === null) {
+            jsonResponse(422, ['error' => $officeLocationsError ?? 'Nieprawidłowe lokalizacje biura zawodów']);
             exit;
         }
 
-        $normalizedOfficeOpenAt = normalizeLocalDateTimeString($officeOpenAt);
-        $normalizedOfficeCloseAt = normalizeLocalDateTimeString($officeCloseAt);
+        [$normalizedOfficeOpenAt, $normalizedOfficeCloseAt] = $computeEventOfficeWindowFromLocations($officeLocations);
         if ($normalizedOfficeOpenAt === null || $normalizedOfficeCloseAt === null) {
-            jsonResponse(422, ['error' => 'office_open_at i office_close_at muszą być prawidłowymi lokalnymi datami i godzinami']);
-            exit;
-        }
-
-        if ($normalizedOfficeOpenAt >= $normalizedOfficeCloseAt) {
-            jsonResponse(422, ['error' => 'Godzina otwarcia biura musi być wcześniejsza niż godzina zamknięcia']);
+            jsonResponse(422, ['error' => 'Nie udało się wyznaczyć okna otwarcia biura zawodów']);
             exit;
         }
 
@@ -5604,6 +5854,8 @@ try {
                 'office_close_at' => $normalizedOfficeCloseAt,
             ]);
 
+            $replaceEventOfficeLocations($pdo, $eventId, $officeLocations);
+
             $activityStmt = $pdo->prepare('
                 INSERT INTO activity_logs (
                     id,
@@ -5648,6 +5900,7 @@ try {
                 'organization_id' => $organizationId,
                 'office_open_at' => str_replace(' ', 'T', $normalizedOfficeOpenAt),
                 'office_close_at' => str_replace(' ', 'T', $normalizedOfficeCloseAt),
+                'office_locations' => $loadEventOfficeLocations($pdo, $eventId),
                 'is_test' => false,
             ],
         ]);
@@ -5702,6 +5955,15 @@ try {
                 'office_open_at' => $officeOpenAt->format('Y-m-d H:i:s'),
                 'office_close_at' => $officeCloseAt->format('Y-m-d H:i:s'),
             ]);
+
+            $replaceEventOfficeLocations($pdo, $eventId, [[
+                'name' => $location,
+                'google_maps_url' => null,
+                'hours' => [[
+                    'opens_at' => $officeOpenAt->format('Y-m-d H:i:s'),
+                    'closes_at' => $officeCloseAt->format('Y-m-d H:i:s'),
+                ]],
+            ]]);
 
             $mappings = $buildTestEventSeedMappings();
             $insertParticipantImportMappings($pdo, $eventId, $mappings);
@@ -5821,29 +6083,22 @@ try {
 
         $name = trim((string)($input['name'] ?? ''));
         $location = trim((string)($input['location'] ?? ''));
-        $officeOpenAt = trim((string)($input['office_open_at'] ?? ''));
-        $officeCloseAt = trim((string)($input['office_close_at'] ?? ''));
         $reopenOffice = (bool)($input['reopen_office'] ?? false);
 
-        if ($name === '' || $location === '' || $officeOpenAt === '' || $officeCloseAt === '') {
-            jsonResponse(422, ['error' => 'Nazwa, lokalizacja, office_open_at i office_close_at są wymagane']);
+        if ($name === '' || $location === '') {
+            jsonResponse(422, ['error' => 'Nazwa i lokalizacja są wymagane']);
             exit;
         }
 
-        if (!isValidLocalDateTimeString($officeOpenAt) || !isValidLocalDateTimeString($officeCloseAt)) {
-            jsonResponse(422, ['error' => 'office_open_at i office_close_at muszą być prawidłowymi lokalnymi datami i godzinami']);
+        [$officeLocations, $officeLocationsError] = $validateEventOfficeLocationsInput($input['office_locations'] ?? null);
+        if ($officeLocationsError !== null || $officeLocations === null) {
+            jsonResponse(422, ['error' => $officeLocationsError ?? 'Nieprawidłowe lokalizacje biura zawodów']);
             exit;
         }
 
-        $normalizedOfficeOpenAt = normalizeLocalDateTimeString($officeOpenAt);
-        $normalizedOfficeCloseAt = normalizeLocalDateTimeString($officeCloseAt);
+        [$normalizedOfficeOpenAt, $normalizedOfficeCloseAt] = $computeEventOfficeWindowFromLocations($officeLocations);
         if ($normalizedOfficeOpenAt === null || $normalizedOfficeCloseAt === null) {
-            jsonResponse(422, ['error' => 'office_open_at i office_close_at muszą być prawidłowymi lokalnymi datami i godzinami']);
-            exit;
-        }
-
-        if ($normalizedOfficeOpenAt >= $normalizedOfficeCloseAt) {
-            jsonResponse(422, ['error' => 'Godzina otwarcia biura musi być wcześniejsza niż godzina zamknięcia']);
+            jsonResponse(422, ['error' => 'Nie udało się wyznaczyć okna otwarcia biura zawodów']);
             exit;
         }
 
@@ -5864,35 +6119,49 @@ try {
 
         $eventDate = substr($normalizedOfficeOpenAt, 0, 10);
 
-        $stmt = $pdo->prepare('
-            UPDATE events
-            SET
-                name = :name,
-                event_date = :event_date,
-                location = :location,
-                office_open_at = :office_open_at,
-                office_close_at = :office_close_at
-            WHERE id = :id
-            LIMIT 1
-        ');
-        $stmt->execute([
-            'id' => $eventId,
-            'name' => $name,
-            'event_date' => $eventDate,
-            'location' => $location,
-            'office_open_at' => $normalizedOfficeOpenAt,
-            'office_close_at' => $normalizedOfficeCloseAt,
-        ]);
+        $pdo->beginTransaction();
 
-        $addActivityLog(
-            $pdo,
-            sprintf('Zaktualizowano wydarzenie: %s', $name),
-            $eventId,
-            null,
-            null,
-            (string)$authUser['id'],
-            (string)$authUser['name']
-        );
+        try {
+            $stmt = $pdo->prepare('
+                UPDATE events
+                SET
+                    name = :name,
+                    event_date = :event_date,
+                    location = :location,
+                    office_open_at = :office_open_at,
+                    office_close_at = :office_close_at
+                WHERE id = :id
+                LIMIT 1
+            ');
+            $stmt->execute([
+                'id' => $eventId,
+                'name' => $name,
+                'event_date' => $eventDate,
+                'location' => $location,
+                'office_open_at' => $normalizedOfficeOpenAt,
+                'office_close_at' => $normalizedOfficeCloseAt,
+            ]);
+
+            $replaceEventOfficeLocations($pdo, $eventId, $officeLocations);
+
+            $addActivityLog(
+                $pdo,
+                sprintf('Zaktualizowano wydarzenie: %s', $name),
+                $eventId,
+                null,
+                null,
+                (string)$authUser['id'],
+                (string)$authUser['name']
+            );
+
+            $pdo->commit();
+        } catch (Throwable $exception) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+
+            throw $exception;
+        }
 
         jsonResponse(200, ['data' => $loadEventById($pdo, $eventId)]);
         exit;
@@ -5946,6 +6215,15 @@ try {
                 'office_open_at' => $officeOpenAt->format('Y-m-d H:i:s'),
                 'office_close_at' => $officeCloseAt->format('Y-m-d H:i:s'),
             ]);
+
+            $replaceEventOfficeLocations($pdo, $eventId, [[
+                'name' => (string)$event['location'],
+                'google_maps_url' => null,
+                'hours' => [[
+                    'opens_at' => $officeOpenAt->format('Y-m-d H:i:s'),
+                    'closes_at' => $officeCloseAt->format('Y-m-d H:i:s'),
+                ]],
+            ]]);
 
             $seedSummary = $resetTestEventSeedData($pdo, $eventId, $authUser);
             $addActivityLog(
@@ -8011,7 +8289,7 @@ try {
                 recipientEmail: (string)$participant['email'],
                 recipientName: (string)$participant['display_name'],
                 eventName: (string)$event['name'],
-                eventOfficeWindow: $formatEventOfficeWindow($event),
+                officeLocations: $formatEventOfficeLocationsForEmail($event['office_locations']),
                 eventLocation: (string)$event['location'],
                 bibNumber: (string)($participant['bib_number'] ?? ''),
                 qrToken: (string)$participant['qr_code'],
@@ -8181,6 +8459,7 @@ try {
         }
 
         $updateSentEmailStatusStmt = $pdo->prepare('UPDATE participants SET email_status = :email_status WHERE id = :id');
+        $eventOfficeLocationsForEmail = $formatEventOfficeLocationsForEmail($event['office_locations']);
         $qrEmailMessages = [];
         $queuedParticipantRows = [];
 
@@ -8212,7 +8491,7 @@ try {
                 'recipientEmail' => (string)$participantRow['email'],
                 'recipientName' => (string)$participantRow['display_name'],
                 'eventName' => (string)$event['name'],
-                'eventOfficeWindow' => $formatEventOfficeWindow($event),
+                'officeLocations' => $eventOfficeLocationsForEmail,
                 'eventLocation' => (string)$event['location'],
                 'bibNumber' => (string)($participantRow['bib_number'] ?? ''),
                 'qrToken' => (string)$participantRow['qr_code'],

@@ -53,7 +53,7 @@ final class MailService
         string $recipientEmail,
         string $recipientName,
         string $eventName,
-        string $eventOfficeWindow,
+        array $officeLocations,
         string $eventLocation,
         string $bibNumber,
         string $qrToken,
@@ -66,7 +66,7 @@ final class MailService
             recipientEmail: $recipientEmail,
             recipientName: $recipientName,
             eventName: $eventName,
-            eventOfficeWindow: $eventOfficeWindow,
+            officeLocations: $officeLocations,
             eventLocation: $eventLocation,
             bibNumber: $bibNumber,
             qrToken: $qrToken,
@@ -93,7 +93,7 @@ final class MailService
                 recipientEmail: (string)($message['recipientEmail'] ?? ''),
                 recipientName: (string)($message['recipientName'] ?? ''),
                 eventName: (string)($message['eventName'] ?? ''),
-                eventOfficeWindow: (string)($message['eventOfficeWindow'] ?? ''),
+                officeLocations: is_array($message['officeLocations'] ?? null) ? $message['officeLocations'] : [],
                 eventLocation: (string)($message['eventLocation'] ?? ''),
                 bibNumber: (string)($message['bibNumber'] ?? ''),
                 qrToken: (string)($message['qrToken'] ?? ''),
@@ -162,7 +162,7 @@ final class MailService
         string $recipientEmail,
         string $recipientName,
         string $eventName,
-        string $eventOfficeWindow,
+        array $officeLocations,
         string $eventLocation,
         string $bibNumber,
         string $qrToken,
@@ -184,7 +184,7 @@ final class MailService
                 $recipientName,
                 $recipientEmail,
                 $eventName,
-                $eventOfficeWindow,
+                $officeLocations,
                 $eventLocation,
                 $bibNumber,
                 'cid:' . $qrContentId,
@@ -195,7 +195,7 @@ final class MailService
                 $recipientName,
                 $recipientEmail,
                 $eventName,
-                $eventOfficeWindow,
+                $officeLocations,
                 $eventLocation,
                 $bibNumber,
                 $participantCustomFields,
@@ -379,7 +379,7 @@ HTML;
         string $recipientName,
         string $recipientEmail,
         string $eventName,
-        string $eventOfficeWindow,
+        array $officeLocations,
         string $eventLocation,
         string $bibNumber,
         string $qrImageUrl,
@@ -389,11 +389,11 @@ HTML;
         $safeName = self::escape($recipientName !== '' ? $recipientName : 'Zawodniku');
         $safeEmail = self::escape($recipientEmail !== '' ? $recipientEmail : '-');
         $safeEventName = self::escape($eventName !== '' ? $eventName : 'Wydarzenie sportowe');
-        $safeEventOfficeWindow = self::escape($eventOfficeWindow !== '' ? $eventOfficeWindow : 'Do potwierdzenia');
         $safeEventLocation = self::escape($eventLocation !== '' ? $eventLocation : 'Do potwierdzenia');
         $safeBibNumber = self::escape($bibNumber !== '' ? $bibNumber : '-');
         $safeQrImageUrl = self::escape($qrImageUrl);
         $importantFieldRows = self::participantImportantFieldRows($participantCustomFields, $participantImportantFieldAliases);
+        $officeLocationsRows = self::officeLocationsHtmlRows($officeLocations);
 
         return <<<HTML
 <!doctype html>
@@ -419,7 +419,7 @@ HTML;
             <tr><td style="padding:14px 16px;border-bottom:1px solid #26231f;overflow-wrap:anywhere;word-break:break-word;"><strong>Uczestnik</strong><br>{$safeName}</td></tr>
             <tr><td style="padding:14px 16px;border-bottom:1px solid #26231f;overflow-wrap:anywhere;word-break:break-word;"><strong>E-mail</strong><br>{$safeEmail}</td></tr>
             {$importantFieldRows}
-            <tr><td style="padding:14px 16px;border-bottom:1px solid #26231f;overflow-wrap:anywhere;word-break:break-word;"><strong>Biuro zawodów</strong><br>{$safeEventOfficeWindow}</td></tr>
+            {$officeLocationsRows}
             <tr><td style="padding:14px 16px;overflow-wrap:anywhere;word-break:break-word;"><strong>Lokalizacja</strong><br>{$safeEventLocation}</td></tr>
           </table>
           <p style="margin:12px 0 0;font-size:12px;line-height:18px;color:#a79d91;text-align:center;">Kod QR jest też w załączniku.</p>
@@ -430,6 +430,33 @@ HTML;
 </body>
 </html>
 HTML;
+    }
+
+    private static function officeLocationsHtmlRows(array $officeLocations): string
+    {
+        if ($officeLocations === []) {
+            return '<tr><td style="padding:14px 16px;border-bottom:1px solid #26231f;overflow-wrap:anywhere;word-break:break-word;"><strong>Biuro zawodów</strong><br>Do potwierdzenia</td></tr>';
+        }
+
+        $rows = [];
+        foreach ($officeLocations as $location) {
+            $name = self::escape((string)($location['name'] ?? 'Biuro zawodów'));
+            $googleMapsUrl = trim((string)($location['google_maps_url'] ?? ''));
+            $ranges = is_array($location['ranges'] ?? null) ? $location['ranges'] : [];
+
+            $nameHtml = $googleMapsUrl !== ''
+                ? '<a href="' . self::escape($googleMapsUrl) . '" style="color:#e5b761;text-decoration:none;">' . $name . ' &#8599;</a>'
+                : $name;
+
+            $rangesHtml = implode('<br>', array_map(
+                static fn(string $range): string => self::escape($range),
+                $ranges
+            ));
+
+            $rows[] = '<tr><td style="padding:14px 16px;border-bottom:1px solid #26231f;overflow-wrap:anywhere;word-break:break-word;"><strong>' . $nameHtml . '</strong><br>' . $rangesHtml . '</td></tr>';
+        }
+
+        return implode("\n", $rows);
     }
 
     private static function participantImportantFieldRows(array $customFields, array $importantFieldAliases): string
@@ -481,7 +508,7 @@ HTML;
         string $recipientName,
         string $recipientEmail,
         string $eventName,
-        string $eventOfficeWindow,
+        array $officeLocations,
         string $eventLocation,
         string $bibNumber,
         array $participantCustomFields,
@@ -490,10 +517,10 @@ HTML;
         $name = $recipientName !== '' ? $recipientName : 'Zawodniku';
         $email = $recipientEmail !== '' ? $recipientEmail : '-';
         $resolvedEventName = $eventName !== '' ? $eventName : 'Wydarzenie sportowe';
-        $resolvedEventOfficeWindow = $eventOfficeWindow !== '' ? $eventOfficeWindow : 'Do potwierdzenia';
         $resolvedEventLocation = $eventLocation !== '' ? $eventLocation : 'Do potwierdzenia';
         $resolvedBibNumber = $bibNumber !== '' ? $bibNumber : '-';
         $importantFieldLines = self::participantImportantFieldTextLines($participantCustomFields, $participantImportantFieldAliases);
+        $officeLocationsLines = self::officeLocationsTextLines($officeLocations);
 
         return implode("\n\n", [
             "Cześć {$name},",
@@ -502,12 +529,36 @@ HTML;
             "Uczestnik: {$name}",
             "E-mail: {$email}",
             ...$importantFieldLines,
-            "Biuro zawodów: {$resolvedEventOfficeWindow}",
+            ...$officeLocationsLines,
             "Miejsce: {$resolvedEventLocation}",
             "Numer startowy: #{$resolvedBibNumber}",
             'Zachowaj tą wiadomość i pokaś kod QR przy wejściu lub w biurze zawodów.',
             'Kod QR jest dołączony do tej wiadomości jako załącznik.',
         ]);
+    }
+
+    private static function officeLocationsTextLines(array $officeLocations): array
+    {
+        if ($officeLocations === []) {
+            return ['Biuro zawodów: Do potwierdzenia'];
+        }
+
+        $lines = [];
+        foreach ($officeLocations as $location) {
+            $name = (string)($location['name'] ?? 'Biuro zawodów');
+            $googleMapsUrl = trim((string)($location['google_maps_url'] ?? ''));
+            $ranges = is_array($location['ranges'] ?? null) ? $location['ranges'] : [];
+
+            $lines[] = $googleMapsUrl !== ''
+                ? "Biuro zawodów - {$name} ({$googleMapsUrl}):"
+                : "Biuro zawodów - {$name}:";
+
+            foreach ($ranges as $range) {
+                $lines[] = '  ' . (string)$range;
+            }
+        }
+
+        return $lines;
     }
 
     private static function extractHttpStatusCode(array $headers): int

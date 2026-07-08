@@ -119,6 +119,7 @@ test('documents critical API paths in the generated OpenAPI document', function 
         '/superadmin/audit',
         '/superadmin/audit/{id}',
         '/superadmin/server-logs',
+        '/superadmin/database',
         '/superadmin/logging-status',
         '/events/{id}/participant-imports/analyze',
         '/events/{id}/participant-imports/run',

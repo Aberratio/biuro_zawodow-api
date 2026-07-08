@@ -249,6 +249,7 @@ The full and current contract lives in Swagger. The most important route groups 
   - `GET /superadmin/server-logs`
   - `GET /superadmin/server-logs/{source}/{date}/{id}`
   - `GET /superadmin/server-logs/export.csv`
+  - `GET /superadmin/database`
   - `GET /superadmin/logging-status`
 
 ## API behavior worth knowing
