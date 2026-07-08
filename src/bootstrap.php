@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 require_once __DIR__ . '/Database.php';
 require_once __DIR__ . '/MailService.php';
+require_once __DIR__ . '/QrEmailDeliveryReport.php';
 require_once __DIR__ . '/QrCodeService.php';
 require_once __DIR__ . '/RequestContext.php';
 require_once __DIR__ . '/SentryBridge.php';
@@ -2298,6 +2299,47 @@ function openApiDocument(): array
                     ],
                 ],
             ],
+            '/events/{id}/qr-email-deliveries' => [
+                'get' => [
+                    'tags' => ['Events'],
+                    'summary' => 'QR email delivery statuses for event participants',
+                    'description' => 'Zwraca statusy dostarczenia maili z kodami QR per uczestnik (na zywo z central-mailera), wraz z informacja czy mail poszedl w wysylce masowej. Gdy mailer jest niedostepny, zwraca mailer_available=false i lokalny stan wysylki.',
+                    'security' => [
+                        ['bearerAuth' => []],
+                    ],
+                    'parameters' => [
+                        [
+                            'name' => 'id',
+                            'in' => 'path',
+                            'required' => true,
+                            'schema' => [
+                                'type' => 'string',
+                            ],
+                        ],
+                    ],
+                    'responses' => [
+                        '200' => [
+                            'description' => 'Delivery status report',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => [
+                                        '$ref' => '#/components/schemas/EventQrEmailDeliveriesResponse',
+                                    ],
+                                ],
+                            ],
+                        ],
+                        '403' => [
+                            '$ref' => '#/components/responses/Brak uprawnień',
+                        ],
+                        '404' => [
+                            '$ref' => '#/components/responses/NotFound',
+                        ],
+                        '401' => [
+                            '$ref' => '#/components/responses/Brak autoryzacji',
+                        ],
+                    ],
+                ],
+            ],
             '/events/{id}/send-qr-emails' => [
                 'post' => [
                     'tags' => ['Events'],
@@ -3877,6 +3919,7 @@ function openApiDocument(): array
                         ],
                         'status' => ['type' => 'string', 'enum' => ['not_checked_in', 'checked_in', 'checked_in_not_starting']],
                         'email_status' => ['type' => 'string', 'enum' => ['not_sent', 'sent']],
+                        'payment_status' => ['type' => 'string', 'enum' => ['unknown', 'paid', 'unpaid']],
                         'checked_in_at' => ['type' => 'string', 'format' => 'date-time', 'nullable' => true],
                         'created_at' => ['type' => 'string', 'format' => 'date-time'],
                         'updated_at' => ['type' => 'string', 'format' => 'date-time'],
@@ -3900,7 +3943,7 @@ function openApiDocument(): array
                     'properties' => [
                         'source_column_name' => ['type' => 'string', 'example' => 'Imię'],
                         'alias' => ['type' => 'string', 'example' => 'Imię'],
-                        'field_role' => ['type' => 'string', 'enum' => ['email', 'display_name_part', 'bib_number', 'custom', 'important_custom']],
+                        'field_role' => ['type' => 'string', 'enum' => ['email', 'display_name_part', 'bib_number', 'payment_status', 'custom', 'important_custom']],
                         'display_order' => ['type' => 'integer', 'example' => 1],
                         'is_required' => ['type' => 'boolean'],
                         'is_active' => ['type' => 'boolean'],
@@ -3988,6 +4031,7 @@ function openApiDocument(): array
                         ],
                         'status' => ['type' => 'string', 'enum' => ['not_checked_in', 'checked_in', 'checked_in_not_starting']],
                         'email_status' => ['type' => 'string', 'enum' => ['not_sent', 'sent']],
+                        'payment_status' => ['type' => 'string', 'enum' => ['unknown', 'paid', 'unpaid']],
                         'checked_in_at' => ['type' => 'string', 'format' => 'date-time', 'nullable' => true],
                         'qr_code' => ['type' => 'string'],
                     ],
@@ -4017,6 +4061,7 @@ function openApiDocument(): array
                     'type' => 'object',
                     'properties' => [
                         'resend_all' => ['type' => 'boolean', 'default' => false],
+                        'payment_scope' => ['type' => 'string', 'enum' => ['all', 'paid_only'], 'default' => 'all'],
                     ],
                 ],
                 'EventQrEmailResponse' => [
@@ -4029,6 +4074,9 @@ function openApiDocument(): array
                             'properties' => [
                                 'sent_count' => ['type' => 'integer'],
                                 'error_count' => ['type' => 'integer'],
+                                'unpaid_count' => ['type' => 'integer'],
+                                'unknown_payment_count' => ['type' => 'integer'],
+                                'skipped_unpaid_count' => ['type' => 'integer'],
                                 'errors' => [
                                     'type' => 'array',
                                     'items' => [
@@ -4038,6 +4086,68 @@ function openApiDocument(): array
                                             'participant_id' => ['type' => 'integer', 'format' => 'int64'],
                                             'participant_name' => ['type' => 'string'],
                                             'error' => ['type' => 'string'],
+                                        ],
+                                    ],
+                                ],
+                            ],
+                        ],
+                    ],
+                ],
+                'EventQrEmailDeliveriesResponse' => [
+                    'type' => 'object',
+                    'required' => ['data'],
+                    'properties' => [
+                        'data' => [
+                            'type' => 'object',
+                            'required' => ['event_id', 'generated_at', 'mailer_available', 'mailer_error', 'summary', 'participants'],
+                            'properties' => [
+                                'event_id' => ['type' => 'string'],
+                                'generated_at' => ['type' => 'string', 'format' => 'date-time'],
+                                'mailer_available' => ['type' => 'boolean'],
+                                'mailer_error' => ['type' => 'string', 'nullable' => true],
+                                'summary' => [
+                                    'type' => 'object',
+                                    'required' => ['participants_total', 'sent', 'queued', 'failed', 'bounced', 'unknown', 'no_data'],
+                                    'properties' => [
+                                        'participants_total' => ['type' => 'integer'],
+                                        'sent' => ['type' => 'integer'],
+                                        'queued' => ['type' => 'integer'],
+                                        'failed' => ['type' => 'integer'],
+                                        'bounced' => ['type' => 'integer'],
+                                        'unknown' => ['type' => 'integer'],
+                                        'no_data' => ['type' => 'integer'],
+                                    ],
+                                ],
+                                'participants' => [
+                                    'type' => 'array',
+                                    'items' => [
+                                        'type' => 'object',
+                                        'required' => ['participant_id', 'name', 'email', 'bib_number', 'local_email_status', 'delivery'],
+                                        'properties' => [
+                                            'participant_id' => ['type' => 'integer', 'format' => 'int64'],
+                                            'name' => ['type' => 'string'],
+                                            'email' => ['type' => 'string'],
+                                            'bib_number' => ['type' => 'string'],
+                                            'local_email_status' => ['type' => 'string', 'enum' => ['not_sent', 'sent']],
+                                            'delivery' => [
+                                                'type' => 'object',
+                                                'nullable' => true,
+                                                'required' => ['email_id', 'status', 'effective_status', 'is_batch', 'batch_id', 'sent_at', 'created_at', 'last_error', 'send_count'],
+                                                'properties' => [
+                                                    'email_id' => ['type' => 'string'],
+                                                    'status' => ['type' => 'string'],
+                                                    'effective_status' => [
+                                                        'type' => 'string',
+                                                        'enum' => ['pending', 'processing', 'retry', 'sent', 'failed', 'bounced', 'suppressed', 'unknown'],
+                                                    ],
+                                                    'is_batch' => ['type' => 'boolean'],
+                                                    'batch_id' => ['type' => 'string', 'nullable' => true],
+                                                    'sent_at' => ['type' => 'string', 'nullable' => true],
+                                                    'created_at' => ['type' => 'string', 'nullable' => true],
+                                                    'last_error' => ['type' => 'string', 'nullable' => true],
+                                                    'send_count' => ['type' => 'integer'],
+                                                ],
+                                            ],
                                         ],
                                     ],
                                 ],
@@ -4123,7 +4233,7 @@ function openApiDocument(): array
                     'properties' => [
                         'source_column_name' => ['type' => 'string'],
                         'alias' => ['type' => 'string'],
-                        'field_role' => ['type' => 'string', 'enum' => ['display_name_part', 'bib_number', 'custom', 'important_custom']],
+                        'field_role' => ['type' => 'string', 'enum' => ['display_name_part', 'bib_number', 'payment_status', 'custom', 'important_custom']],
                         'is_active' => ['type' => 'boolean'],
                     ],
                 ],

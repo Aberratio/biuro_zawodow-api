@@ -128,6 +128,7 @@ CREATE TABLE event_participant_import_baseline_records (
     display_name VARCHAR(255) NOT NULL,
     email VARCHAR(190) NOT NULL,
     bib_number VARCHAR(32) NULL,
+    payment_status ENUM('unknown', 'paid', 'unpaid') NOT NULL DEFAULT 'unknown',
     custom_fields_json LONGTEXT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (id),
@@ -154,6 +155,7 @@ CREATE TABLE participants (
     custom_fields_json LONGTEXT NULL,
     status ENUM('not_checked_in', 'checked_in', 'checked_in_not_starting') NOT NULL DEFAULT 'not_checked_in',
     email_status ENUM('not_sent', 'sent') NOT NULL DEFAULT 'not_sent',
+    payment_status ENUM('unknown', 'paid', 'unpaid') NOT NULL DEFAULT 'unknown',
     checked_in_at DATETIME NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -163,6 +165,7 @@ CREATE TABLE participants (
     KEY idx_participants_event_bib (event_id, bib_number),
     KEY idx_participants_event_id (event_id),
     KEY idx_participants_event_email (event_id, email),
+    KEY idx_participants_event_payment_status (event_id, payment_status),
     KEY idx_participants_baseline_import_record_id (baseline_import_record_id),
     CONSTRAINT fk_participants_event
         FOREIGN KEY (event_id) REFERENCES events(id)
@@ -256,7 +259,7 @@ CREATE TABLE event_participant_field_mappings (
     event_id VARCHAR(64) NOT NULL,
     source_column_name VARCHAR(190) NOT NULL,
     alias VARCHAR(190) NOT NULL,
-    field_role ENUM('email', 'display_name_part', 'bib_number', 'custom', 'important_custom') NOT NULL,
+    field_role ENUM('email', 'display_name_part', 'bib_number', 'payment_status', 'custom', 'important_custom') NOT NULL,
     field_type ENUM('text', 'number', 'date', 'select') NOT NULL DEFAULT 'text',
     validation_rules_json LONGTEXT NULL,
     display_order INT UNSIGNED NOT NULL DEFAULT 0,
@@ -434,11 +437,12 @@ INSERT INTO participants (
     qr_code,
     custom_fields_json,
     status,
-    email_status
+    email_status,
+    payment_status
 )
 VALUES
-    ('evt-1', 'audit-evt-1-anna-kowalska', 'Anna', 'Kowalska', 'Anna Kowalska', 'anna.kowalska@example.com', 'Politechnika Warszawska', '101', 'QR-evt-1-101', NULL, 'not_checked_in', 'not_sent'),
-    ('evt-2', 'audit-evt-2-jan-nowak', 'Jan', 'Nowak', 'Jan Nowak', 'jan.nowak@example.com', 'Uniwersytet Warszawski', '201', 'QR-evt-2-201', NULL, 'not_checked_in', 'not_sent')
+    ('evt-1', 'audit-evt-1-anna-kowalska', 'Anna', 'Kowalska', 'Anna Kowalska', 'anna.kowalska@example.com', 'Politechnika Warszawska', '101', 'QR-evt-1-101', NULL, 'not_checked_in', 'not_sent', 'unknown'),
+    ('evt-2', 'audit-evt-2-jan-nowak', 'Jan', 'Nowak', 'Jan Nowak', 'jan.nowak@example.com', 'Uniwersytet Warszawski', '201', 'QR-evt-2-201', NULL, 'not_checked_in', 'not_sent', 'unknown')
 ON DUPLICATE KEY UPDATE
     first_name = VALUES(first_name),
     last_name = VALUES(last_name),
@@ -448,7 +452,8 @@ ON DUPLICATE KEY UPDATE
     qr_code = VALUES(qr_code),
     custom_fields_json = VALUES(custom_fields_json),
     status = VALUES(status),
-    email_status = VALUES(email_status);
+    email_status = VALUES(email_status),
+    payment_status = VALUES(payment_status);
 
 INSERT INTO activity_logs (id, action, participant_id, participant_name_snapshot, user_id, user_name_snapshot)
 SELECT

@@ -59,27 +59,33 @@ final class MailService
         string $qrToken,
         array $participantCustomFields = [],
         array $participantImportantFieldAliases = [],
-        ?int $participantId = null
+        ?int $participantId = null,
+        ?string $eventId = null
     ): void {
+        $payload = self::participantQrPayload(
+            recipientEmail: $recipientEmail,
+            recipientName: $recipientName,
+            eventName: $eventName,
+            eventOfficeWindow: $eventOfficeWindow,
+            eventLocation: $eventLocation,
+            bibNumber: $bibNumber,
+            qrToken: $qrToken,
+            participantCustomFields: $participantCustomFields,
+            participantImportantFieldAliases: $participantImportantFieldAliases,
+            participantId: $participantId,
+            eventId: $eventId
+        );
+        if ($eventId !== null && $eventId !== '') {
+            $payload['contextId'] = $eventId;
+        }
         self::sendQueuedEmail(
             endpoint: '/emails',
-            payload: self::participantQrPayload(
-                recipientEmail: $recipientEmail,
-                recipientName: $recipientName,
-                eventName: $eventName,
-                eventOfficeWindow: $eventOfficeWindow,
-                eventLocation: $eventLocation,
-                bibNumber: $bibNumber,
-                qrToken: $qrToken,
-                participantCustomFields: $participantCustomFields,
-                participantImportantFieldAliases: $participantImportantFieldAliases,
-                participantId: $participantId
-            ),
+            payload: $payload,
             idempotencyKey: self::idempotencyKey('participant-qr', $recipientEmail . '|' . $eventName . '|' . $qrToken . '|' . bin2hex(random_bytes(8)))
         );
     }
 
-    public static function sendParticipantQrEmailBatch(array $messages): void
+    public static function sendParticipantQrEmailBatch(array $messages, ?string $eventId = null): void
     {
         $recipients = [];
         foreach ($messages as $message) {
@@ -93,10 +99,10 @@ final class MailService
                 qrToken: (string)($message['qrToken'] ?? ''),
                 participantCustomFields: is_array($message['participantCustomFields'] ?? null) ? $message['participantCustomFields'] : [],
                 participantImportantFieldAliases: is_array($message['participantImportantFieldAliases'] ?? null) ? $message['participantImportantFieldAliases'] : [],
-                participantId: isset($message['participantId']) ? (int)$message['participantId'] : null
+                participantId: isset($message['participantId']) ? (int)$message['participantId'] : null,
+                eventId: $eventId
             );
             unset($payload['priority']);
-            $payload['metadata']['participantId'] = $message['participantId'] ?? null;
             $recipients[] = $payload;
         }
 
@@ -106,16 +112,20 @@ final class MailService
 
         $batchSize = max(1, (int)(getenv('CENTRAL_MAILER_BATCH_SIZE') ?: 500));
         foreach (array_chunk($recipients, $batchSize) as $index => $recipientChunk) {
+            $payload = [
+                'subject' => 'Kody QR uczestnikow',
+                'html' => '<p>Kod QR uczestnika jest gotowy.</p>',
+                'text' => 'Kod QR uczestnika jest gotowy.',
+                'priority' => self::PRIORITY_NORMAL,
+                'metadata' => ['type' => 'participant_qr_batch', 'chunkIndex' => $index],
+                'recipients' => $recipientChunk,
+            ];
+            if ($eventId !== null && $eventId !== '') {
+                $payload['contextId'] = $eventId;
+            }
             self::sendQueuedEmail(
                 endpoint: '/emails/batch',
-                payload: [
-                    'subject' => 'Kody QR uczestnikow',
-                    'html' => '<p>Kod QR uczestnika jest gotowy.</p>',
-                    'text' => 'Kod QR uczestnika jest gotowy.',
-                    'priority' => self::PRIORITY_NORMAL,
-                    'metadata' => ['type' => 'participant_qr_batch', 'chunkIndex' => $index],
-                    'recipients' => $recipientChunk,
-                ],
+                payload: $payload,
                 idempotencyKey: self::idempotencyKey('participant-qr-batch', json_encode($recipientChunk, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR) . '|' . $index . '|' . bin2hex(random_bytes(8)))
             );
         }
@@ -158,7 +168,8 @@ final class MailService
         string $qrToken,
         array $participantCustomFields,
         array $participantImportantFieldAliases,
-        ?int $participantId = null
+        ?int $participantId = null,
+        ?string $eventId = null
     ): array {
         $qrImage = QrCodeService::renderPng($qrToken, 320, 10);
         $qrBase64 = base64_encode($qrImage);
@@ -196,6 +207,9 @@ final class MailService
                 'recipientName' => $recipientName,
                 'eventName' => $eventName,
                 'bibNumber' => $bibNumber,
+                // eventId + participantId pozwalaja skorelowac status z mailera z uczestnikiem.
+                'eventId' => $eventId,
+                'participantId' => $participantId,
             ],
             'attachments' => [
                 [
@@ -212,7 +226,28 @@ final class MailService
         ];
     }
 
-    private static function sendQueuedEmail(string $endpoint, array $payload, ?string $idempotencyKey = null): void
+    /**
+     * Zwraca zdekodowana odpowiedz central-mailera (m.in. id maila / batcha),
+     * dzieki czemu wysylki mozna pozniej odpytac o status dostarczenia.
+     */
+    private static function sendQueuedEmail(string $endpoint, array $payload, ?string $idempotencyKey = null): array
+    {
+        $payload['metadata'] = array_merge([
+            'source' => 'biuro_zawodow',
+            'requestId' => class_exists('RequestContext') ? RequestContext::id() : null,
+        ], is_array($payload['metadata'] ?? null) ? $payload['metadata'] : []);
+
+        return self::request('POST', $endpoint, $payload, $idempotencyKey);
+    }
+
+    public static function getContextEmailStatuses(string $contextId, int $limit = 1000, int $offset = 0): array
+    {
+        $query = http_build_query(['limit' => max(1, $limit), 'offset' => max(0, $offset)]);
+
+        return self::request('GET', '/emails/context/' . rawurlencode($contextId) . '?' . $query);
+    }
+
+    private static function request(string $method, string $endpoint, ?array $payload = null, ?string $idempotencyKey = null): array
     {
         $baseUrl = rtrim(trim((string)(getenv('CENTRAL_MAILER_URL') ?: '')), '/');
         $apiKey = trim((string)(getenv('CENTRAL_MAILER_API_KEY') ?: ''));
@@ -222,30 +257,26 @@ final class MailService
             throw new RuntimeException('Central-mailer nie jest skonfigurowany. Uzupelnij CENTRAL_MAILER_URL oraz CENTRAL_MAILER_API_KEY.');
         }
 
-        $payload['metadata'] = array_merge([
-            'source' => 'biuro_zawodow',
-            'requestId' => class_exists('RequestContext') ? RequestContext::id() : null,
-        ], is_array($payload['metadata'] ?? null) ? $payload['metadata'] : []);
-
-        $json = json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
-        $headers = [
-            'Content-Type: application/json',
-            'Accept: application/json',
-            'X-API-Key: ' . $apiKey,
-        ];
+        $isEnqueue = $method === 'POST';
+        $json = $payload === null ? null : json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+        $headers = ['Accept: application/json', 'X-API-Key: ' . $apiKey];
+        if ($json !== null) {
+            $headers[] = 'Content-Type: application/json';
+        }
         if ($idempotencyKey !== null) {
             $headers[] = 'Idempotency-Key: ' . $idempotencyKey;
         }
 
-        $context = stream_context_create([
-            'http' => [
-                'method' => 'POST',
-                'header' => implode("\r\n", $headers),
-                'content' => $json,
-                'timeout' => $timeoutSeconds,
-                'ignore_errors' => true,
-            ],
-        ]);
+        $httpOptions = [
+            'method' => $method,
+            'header' => implode("\r\n", $headers),
+            'timeout' => $timeoutSeconds,
+            'ignore_errors' => true,
+        ];
+        if ($json !== null) {
+            $httpOptions['content'] = $json;
+        }
+        $context = stream_context_create(['http' => $httpOptions]);
 
         set_error_handler(static function (int $severity, string $message): bool {
             throw new RuntimeException($message, $severity);
@@ -255,12 +286,14 @@ final class MailService
             $responseHeaders = $http_response_header ?? [];
         } catch (Throwable $exception) {
             $runtimeException = new CentralMailerRequestException(
-                'Nie udalo sie przekazac wiadomosci do central-mailer: ' . $exception->getMessage(),
+                ($isEnqueue
+                    ? 'Nie udalo sie przekazac wiadomosci do central-mailer: '
+                    : 'Nie udalo sie polaczyc z central-mailer: ') . $exception->getMessage(),
                 503,
                 0,
                 $exception
             );
-            self::logException($runtimeException, 'central_mailer.enqueue_failed');
+            self::logException($runtimeException, $isEnqueue ? 'central_mailer.enqueue_failed' : 'central_mailer.request_failed');
             throw $runtimeException;
         } finally {
             restore_error_handler();
@@ -269,11 +302,23 @@ final class MailService
         $statusCode = self::extractHttpStatusCode($responseHeaders);
         if ($responseBody === false || $statusCode < 200 || $statusCode >= 300) {
             $error = self::extractErrorMessage(is_string($responseBody) ? $responseBody : '');
-            $message = sprintf('Central-mailer odrzucil wiadomosc e-mail (HTTP %d)%s.', $statusCode, $error !== '' ? ': ' . $error : '');
+            $message = sprintf(
+                $isEnqueue ? 'Central-mailer odrzucil wiadomosc e-mail (HTTP %d)%s.' : 'Central-mailer zwrocil blad (HTTP %d)%s.',
+                $statusCode,
+                $error !== '' ? ': ' . $error : ''
+            );
             $runtimeException = new CentralMailerRequestException($message, self::apiStatusForCentralMailerStatus($statusCode));
-            self::logException($runtimeException, 'central_mailer.enqueue_rejected');
+            self::logException($runtimeException, $isEnqueue ? 'central_mailer.enqueue_rejected' : 'central_mailer.request_rejected');
             throw $runtimeException;
         }
+
+        try {
+            $decoded = json_decode((string)$responseBody, true, 512, JSON_THROW_ON_ERROR);
+        } catch (Throwable) {
+            $decoded = null;
+        }
+
+        return is_array($decoded) ? $decoded : [];
     }
 
     private static function actionHtml(

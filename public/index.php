@@ -1221,6 +1221,53 @@ try {
         return in_array($fieldRole, ['custom', 'important_custom'], true);
     };
 
+    $isValidParticipantPaymentStatus = static function (string $value): bool {
+        return in_array($value, ['unknown', 'paid', 'unpaid'], true);
+    };
+
+    $normalizeParticipantPaymentStatus = static function (mixed $value, bool $emptyMeansUnpaid = false): ?string {
+        $normalized = normalizeUtf8String(trim((string)$value));
+        if ($normalized === '') {
+            return $emptyMeansUnpaid ? 'unpaid' : 'unknown';
+        }
+
+        $key = strtolower($normalized);
+        $key = strtr($key, [
+            'ą' => 'a',
+            'ć' => 'c',
+            'ę' => 'e',
+            'ł' => 'l',
+            'ń' => 'n',
+            'ó' => 'o',
+            'ś' => 's',
+            'ż' => 'z',
+            'ź' => 'z',
+        ]);
+        $key = preg_replace('/\s+/u', ' ', $key) ?? $key;
+
+        if (in_array($key, ['tak', 't', 'yes', 'y', 'true', '1', 'x', 'ok', 'oplacone', 'oplacony', 'oplacona', 'zapłacone', 'zaplacone', 'paid'], true)) {
+            return 'paid';
+        }
+
+        if (in_array($key, ['nie', 'n', 'no', 'false', '0', 'nieoplacone', 'nieoplacony', 'nieoplacona', 'nie zaplacone', 'nie zaplacono', 'unpaid'], true)) {
+            return 'unpaid';
+        }
+
+        if (in_array($key, ['unknown', 'nieznane', 'brak danych', 'n/a', 'na'], true)) {
+            return 'unknown';
+        }
+
+        return null;
+    };
+
+    $formatParticipantPaymentStatus = static function (string $paymentStatus): string {
+        return match ($paymentStatus) {
+            'paid' => 'opłacony',
+            'unpaid' => 'nieopłacony',
+            default => 'nieznany',
+        };
+    };
+
     $normalizeParticipantFieldType = static function (string $fieldRole, mixed $fieldType) use ($isParticipantConfigurableFieldRole): string {
         if (!$isParticipantConfigurableFieldRole($fieldRole)) {
             return 'text';
@@ -1396,13 +1443,19 @@ try {
         return function_exists('mb_strlen') ? mb_strlen($value, 'UTF-8') : strlen($value);
     };
 
-    $validateParticipantFieldValue = static function (array $mapping, string $value) use ($countParticipantFieldValueCharacters, $normalizeParticipantDateValue): array {
+    $validateParticipantFieldValue = static function (array $mapping, string $value) use ($countParticipantFieldValueCharacters, $normalizeParticipantDateValue, $normalizeParticipantPaymentStatus): array {
         $alias = trim((string)($mapping['alias'] ?? ''));
         if ($alias === '') {
             $alias = trim((string)($mapping['source_column_name'] ?? 'pole'));
         }
 
         $trimmedValue = trim($value);
+        if (($mapping['field_role'] ?? '') === 'payment_status') {
+            return $normalizeParticipantPaymentStatus($trimmedValue, true) === null
+                ? [sprintf('Pole "%s" zawiera nierozpoznaną wartość opłaty: "%s". Użyj np. TAK, NIE albo zostaw puste.', $alias, $trimmedValue)]
+                : [];
+        }
+
         if ($trimmedValue === '') {
             return (bool)($mapping['is_required'] ?? false)
                 ? [sprintf('Pole "%s" jest wymagane.', $alias)]
@@ -1540,10 +1593,11 @@ try {
         array $fieldValues,
         bool $requireAllActiveFields = false,
         ?string $preservedBibNumber = null
-    ) use ($normalizeParticipantFieldValueForStorage, $validateParticipantFieldValue): array {
+    ) use ($normalizeParticipantFieldValueForStorage, $validateParticipantFieldValue, $normalizeParticipantPaymentStatus): array {
         $displayNameParts = [];
         $customFields = [];
         $bibNumber = $preservedBibNumber;
+        $paymentStatus = null;
         $missingFields = [];
         $validationErrors = [];
         $importantFieldAliases = [];
@@ -1576,6 +1630,11 @@ try {
                 $validationErrors = [...$validationErrors, ...$fieldValidationErrors];
             }
 
+            if ($mapping['field_role'] === 'payment_status' && $value === '') {
+                $paymentStatus = 'unpaid';
+                continue;
+            }
+
             if ($value === '') {
                 if ($isRequired) {
                     $missingFields[] = $alias;
@@ -1593,6 +1652,11 @@ try {
                 $bibNumber = $value;
             }
 
+            if ($mapping['field_role'] === 'payment_status') {
+                $paymentStatus = $normalizeParticipantPaymentStatus($value, true) ?? 'unknown';
+                continue;
+            }
+
             $customFields[$alias] = $value;
             if ($mapping['field_role'] === 'important_custom') {
                 $importantFieldAliases[] = $alias;
@@ -1603,6 +1667,7 @@ try {
             'display_name' => trim(implode(' ', $displayNameParts)),
             'custom_fields' => $customFields,
             'bib_number' => $bibNumber,
+            'payment_status' => $paymentStatus,
             'missing_fields' => $missingFields,
             'validation_errors' => $validationErrors,
             'important_field_aliases' => $importantFieldAliases,
@@ -1663,6 +1728,7 @@ try {
                 custom_fields_json,
                 status,
                 email_status,
+                payment_status,
                 checked_in_at,
                 created_at,
                 updated_at
@@ -1701,6 +1767,7 @@ try {
                 custom_fields_json,
                 status,
                 email_status,
+                payment_status,
                 checked_in_at,
                 created_at,
                 updated_at
@@ -1741,6 +1808,7 @@ try {
                 custom_fields_json,
                 status,
                 email_status,
+                payment_status,
                 checked_in_at,
                 created_at,
                 updated_at
@@ -1790,6 +1858,7 @@ try {
                 custom_fields_json,
                 status,
                 email_status,
+                payment_status,
                 checked_in_at,
                 created_at,
                 updated_at
@@ -1840,6 +1909,7 @@ try {
                 'important_field_aliases' => $participant['important_field_aliases'] ?? [],
                 'status' => (string)$participant['status'],
                 'email_status' => (string)$participant['email_status'],
+                'payment_status' => (string)($participant['payment_status'] ?? 'unknown'),
                 'checked_in_at' => $participant['checked_in_at'],
                 'qr_code' => (string)$participant['qr_code'],
             ],
@@ -1939,6 +2009,9 @@ try {
             'display_name' => trim((string)($participant['display_name'] ?? '')),
             'email' => normalizeEmailAddress((string)($participant['email'] ?? '')),
             'bib_number' => $normalizeParticipantBibNumber($participant['bib_number'] ?? null),
+            'payment_status' => in_array((string)($participant['payment_status'] ?? ''), ['unknown', 'paid', 'unpaid'], true)
+                ? (string)$participant['payment_status']
+                : 'unknown',
             'custom_fields' => $customFields,
             'important_field_aliases' => $importantFieldAliases,
         ];
@@ -1947,7 +2020,7 @@ try {
     $diffParticipantChangeStates = static function (array $beforeState, array $afterState): array {
         $changedFields = [];
 
-        foreach (['display_name', 'email', 'bib_number'] as $fieldName) {
+        foreach (['display_name', 'email', 'bib_number', 'payment_status'] as $fieldName) {
             if (($beforeState[$fieldName] ?? null) !== ($afterState[$fieldName] ?? null)) {
                 $changedFields[] = $fieldName;
             }
@@ -1999,6 +2072,7 @@ try {
                 display_name,
                 email,
                 bib_number,
+                payment_status,
                 custom_fields_json
             ) VALUES (
                 :event_id,
@@ -2007,6 +2081,7 @@ try {
                 :display_name,
                 :email,
                 :bib_number,
+                :payment_status,
                 :custom_fields_json
             )
         ');
@@ -2016,6 +2091,7 @@ try {
         $stmt->bindValue(':display_name', trim((string)($participantState['display_name'] ?? '')));
         $stmt->bindValue(':email', normalizeEmailAddress((string)($participantState['email'] ?? '')));
         $stmt->bindValue(':bib_number', $participantState['bib_number'] ?? null, ($participantState['bib_number'] ?? null) === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
+        $stmt->bindValue(':payment_status', in_array((string)($participantState['payment_status'] ?? ''), ['unknown', 'paid', 'unpaid'], true) ? (string)$participantState['payment_status'] : 'unknown');
         $stmt->bindValue(':custom_fields_json', $encodedCustomFields !== [] ? encodeJsonValue($encodedCustomFields) : null, $encodedCustomFields !== [] ? PDO::PARAM_STR : PDO::PARAM_NULL);
         $stmt->execute();
 
@@ -2121,6 +2197,7 @@ try {
                 display_name,
                 email,
                 bib_number,
+                payment_status,
                 custom_fields_json,
                 created_at
             FROM event_participant_import_baseline_records
@@ -2224,6 +2301,7 @@ try {
                 custom_fields_json,
                 status,
                 email_status,
+                payment_status,
                 checked_in_at,
                 created_at,
                 updated_at
@@ -2381,9 +2459,10 @@ try {
         return trim(implode(' ', $parts));
     };
 
-    $normalizeCustomFieldsFromMapping = static function (array $row, array $mappings): array {
+    $normalizeCustomFieldsFromMapping = static function (array $row, array $mappings) use ($normalizeParticipantPaymentStatus): array {
         $customFields = [];
         $importantFieldAliases = [];
+        $paymentStatus = 'unknown';
 
         foreach ($mappings as $mapping) {
             if (!($mapping['is_active'] ?? true)) {
@@ -2391,7 +2470,7 @@ try {
             }
 
             $role = (string)$mapping['field_role'];
-            if (!in_array($role, ['display_name_part', 'bib_number', 'custom', 'important_custom'], true)) {
+            if (!in_array($role, ['display_name_part', 'bib_number', 'payment_status', 'custom', 'important_custom'], true)) {
                 continue;
             }
 
@@ -2401,6 +2480,11 @@ try {
             }
 
             $value = trim((string)($row[(string)$mapping['source_column_name']] ?? ''));
+            if ($role === 'payment_status') {
+                $paymentStatus = $normalizeParticipantPaymentStatus($value, true) ?? 'unknown';
+                continue;
+            }
+
             if ($value === '') {
                 continue;
             }
@@ -2414,6 +2498,7 @@ try {
         return [
             'custom_fields' => $customFields,
             'important_field_aliases' => $importantFieldAliases,
+            'payment_status' => $paymentStatus,
         ];
     };
 
@@ -2424,11 +2509,12 @@ try {
         string $email,
         ?string $bibNumber,
         array $customFields,
+        string $paymentStatus = 'unknown',
         string $organization = '',
         ?string $qrCode = null,
         ?string $participantAuditKey = null,
         ?int $baselineImportRecordId = null
-    ) use ($loadParticipantById, $generateUniqueParticipantQrCode, $encodeParticipantCustomFields): array {
+    ) use ($loadParticipantById, $generateUniqueParticipantQrCode, $encodeParticipantCustomFields, $isValidParticipantPaymentStatus): array {
         $nameParts = splitParticipantDisplayName($displayName);
         $resolvedBibNumber = $bibNumber !== null && trim($bibNumber) !== ''
             ? trim($bibNumber)
@@ -2445,6 +2531,7 @@ try {
         $resolvedParticipantAuditKey = is_string($participantAuditKey) && trim($participantAuditKey) !== ''
             ? trim($participantAuditKey)
             : 'pa-' . bin2hex(random_bytes(12));
+        $resolvedPaymentStatus = $isValidParticipantPaymentStatus($paymentStatus) ? $paymentStatus : 'unknown';
 
         $stmt = $pdo->prepare('
             INSERT INTO participants (
@@ -2460,7 +2547,8 @@ try {
                 qr_code,
                 custom_fields_json,
                 status,
-                email_status
+                email_status,
+                payment_status
             ) VALUES (
                 :event_id,
                 :participant_audit_key,
@@ -2474,7 +2562,8 @@ try {
                 :qr_code,
                 :custom_fields_json,
                 :status,
-                :email_status
+                :email_status,
+                :payment_status
             )
         ');
         $stmt->execute([
@@ -2491,6 +2580,7 @@ try {
             'custom_fields_json' => $encodedCustomFields !== [] ? encodeJsonValue($encodedCustomFields) : null,
             'status' => 'not_checked_in',
             'email_status' => 'not_sent',
+            'payment_status' => $resolvedPaymentStatus,
         ]);
 
         $participantId = (int)$pdo->lastInsertId();
@@ -2525,6 +2615,7 @@ try {
         ]];
 
         $displayNamePartCount = 0;
+        $paymentStatusMappingCount = 0;
         $seenColumns = [$emailColumn => true];
         $displayOrder = 1;
 
@@ -2552,12 +2643,15 @@ try {
                 return [null, sprintf('Alias jest wymagany dla aktywnej kolumny "%s"', $sourceColumnName)];
             }
 
-            if (!in_array($fieldRole, ['display_name_part', 'bib_number', 'custom', 'important_custom'], true)) {
+            if (!in_array($fieldRole, ['display_name_part', 'bib_number', 'payment_status', 'custom', 'important_custom'], true)) {
                 return [null, sprintf('Nieprawidłowa rola pola dla kolumny "%s"', $sourceColumnName)];
             }
 
             if ($fieldRole === 'display_name_part') {
                 $displayNamePartCount++;
+            }
+            if ($fieldRole === 'payment_status') {
+                $paymentStatusMappingCount++;
             }
 
             $fieldType = $normalizeParticipantFieldType($fieldRole, $field['field_type'] ?? 'text');
@@ -2590,6 +2684,10 @@ try {
 
         if ($displayNamePartCount === 0) {
             return [null, 'Wymagane jest co najmniej jedno aktywne mapowanie display_name_part'];
+        }
+
+        if ($paymentStatusMappingCount > 1) {
+            return [null, 'Mapowanie może zawierać tylko jedną kolumnę opłaty'];
         }
 
         return [$mappingsToSave, null];
@@ -2862,6 +2960,10 @@ try {
             } elseif ($nextRole === 'bib_number') {
                 $nextFieldType = 'text';
                 $nextValidationRules = [];
+            } elseif ($nextRole === 'payment_status') {
+                $nextIsRequired = false;
+                $nextFieldType = 'text';
+                $nextValidationRules = [];
             }
 
             $updatesBySourceColumn[$sourceColumnName] = [
@@ -2884,6 +2986,7 @@ try {
         }
 
         $activeDisplayNamePartCount = 0;
+        $activePaymentStatusCount = 0;
         $activeAliases = [];
         foreach ($updatesBySourceColumn as $mapping) {
             if (!($mapping['is_active'] ?? false) || ($mapping['field_role'] ?? '') === 'email') {
@@ -2892,6 +2995,9 @@ try {
 
             if (($mapping['field_role'] ?? '') === 'display_name_part') {
                 $activeDisplayNamePartCount++;
+            }
+            if (($mapping['field_role'] ?? '') === 'payment_status') {
+                $activePaymentStatusCount++;
             }
 
             $normalizedAlias = strtolower(trim((string)$mapping['alias']));
@@ -2905,6 +3011,10 @@ try {
 
         if ($activeDisplayNamePartCount === 0) {
             return [null, 'Mapowanie musi zawierać co najmniej jedną aktywną kolumnę budującą nazwę uczestnika'];
+        }
+
+        if ($activePaymentStatusCount > 1) {
+            return [null, 'Mapowanie może zawierać tylko jedną aktywną kolumnę opłaty'];
         }
 
         return [array_values($updatesBySourceColumn), null];
@@ -3205,7 +3315,8 @@ try {
                 [
                     'important_field_aliases' => $customFieldData['important_field_aliases'] ?? [],
                     ...($customFieldData['custom_fields'] ?? []),
-                ]
+                ],
+                (string)($customFieldData['payment_status'] ?? 'unknown')
             );
             if ($participant === []) {
                 $invalidCount++;
@@ -6132,6 +6243,7 @@ try {
             'bib_number' => 'Numer startowy',
             'status' => 'Status',
             'email_status' => 'Status e-maila',
+            'payment_status' => 'Status opłaty',
             'checked_in_at' => 'Czas odprawy',
             'qr_code' => 'Kod QR',
             'created_at' => 'Utworzono',
@@ -6167,6 +6279,7 @@ try {
                 'bib_number' => (string)($participant['bib_number'] ?? ''),
                 'status' => $translateExportValue((string)($participant['status'] ?? ''), 'participant_status'),
                 'email_status' => $translateExportValue((string)($participant['email_status'] ?? ''), 'email_status'),
+                'payment_status' => $formatParticipantPaymentStatus((string)($participant['payment_status'] ?? 'unknown')),
                 'checked_in_at' => (string)($participant['checked_in_at'] ?? ''),
                 'qr_code' => (string)($participant['qr_code'] ?? ''),
                 'created_at' => (string)($participant['created_at'] ?? ''),
@@ -7058,7 +7171,7 @@ try {
     }
 
     if (preg_match('#^/events/([^/]+)/participants/manual$#', $path, $matches) === 1 && $method === 'POST') {
-        $authUser = requireAnyRole(['superadmin', 'admin', 'editor'], $resolveAuthenticatedUser);
+        $authUser = requireAnyRole(['superadmin', 'admin', 'editor', 'scanner_plus'], $resolveAuthenticatedUser);
         $eventId = (string)$matches[1];
         $event = $loadEventById($pdo, $eventId);
 
@@ -7103,7 +7216,8 @@ try {
             [
                 'important_field_aliases' => is_array($resolvedData['important_field_aliases'] ?? null) ? $resolvedData['important_field_aliases'] : [],
                 ...(is_array($resolvedData['custom_fields']) ? $resolvedData['custom_fields'] : []),
-            ]
+            ],
+            (string)($resolvedData['payment_status'] ?? 'unknown')
         );
         if ($eventHasParticipantImportBaseline($pdo, $eventId)) {
             $addParticipantChangeLog(
@@ -7903,7 +8017,8 @@ try {
                 qrToken: (string)$participant['qr_code'],
                 participantCustomFields: is_array($participant['custom_fields'] ?? null) ? $participant['custom_fields'] : [],
                 participantImportantFieldAliases: is_array($participant['important_field_aliases'] ?? null) ? $participant['important_field_aliases'] : [],
-                participantId: (int)$participant['id']
+                participantId: (int)$participant['id'],
+                eventId: (string)$event['id']
             );
 
             $updateStmt = $pdo->prepare('UPDATE participants SET email_status = :email_status WHERE id = :id');
@@ -7931,6 +8046,76 @@ try {
         exit;
     }
 
+    if (preg_match('#^/events/([^/]+)/qr-email-deliveries$#', $path, $matches) === 1 && $method === 'GET') {
+        $authUser = requireAnyRole(['superadmin', 'admin', 'editor'], $resolveAuthenticatedUser);
+        $eventId = (string)$matches[1];
+        $event = $loadEventById($pdo, $eventId);
+
+        if ($event === false) {
+            jsonResponse(404, ['error' => 'Nie znaleziono wydarzenia']);
+            exit;
+        }
+
+        if (!$canManageEventParticipants($authUser, $event)) {
+            jsonResponse(403, ['error' => 'Brak uprawnień']);
+            exit;
+        }
+
+        $stmt = $pdo->prepare('
+            SELECT id, display_name, email, bib_number, email_status, payment_status
+            FROM participants
+            WHERE event_id = :event_id
+            ORDER BY id ASC
+        ');
+        $stmt->execute(['event_id' => $eventId]);
+        $participants = $stmt->fetchAll();
+
+        $mailerAvailable = true;
+        $mailerError = null;
+        $mailerEmails = [];
+
+        if ($isTestEvent($event)) {
+            $mailerAvailable = false;
+            $mailerError = 'test_mode';
+        } else {
+            try {
+                $offset = 0;
+                $pageLimit = 1000;
+                // Twardy limit stron chroni przed patologicznie duzymi kontekstami.
+                for ($page = 0; $page < 20; $page++) {
+                    $response = MailService::getContextEmailStatuses($eventId, $pageLimit, $offset);
+                    $emails = is_array($response['emails'] ?? null) ? $response['emails'] : [];
+                    foreach ($emails as $email) {
+                        $mailerEmails[] = $email;
+                    }
+                    if (($response['hasMore'] ?? false) !== true || $emails === []) {
+                        break;
+                    }
+                    $offset += $pageLimit;
+                }
+            } catch (Throwable $exception) {
+                // Degradacja: biuro zobaczy lokalny stan wysylki zamiast bledu.
+                $mailerAvailable = false;
+                $mailerError = $exception->getMessage();
+                $mailerEmails = [];
+            }
+        }
+
+        $report = QrEmailDeliveryReport::build($participants, $mailerAvailable ? $mailerEmails : []);
+
+        jsonResponse(200, [
+            'data' => [
+                'event_id' => $eventId,
+                'generated_at' => gmdate('Y-m-d\TH:i:s\Z'),
+                'mailer_available' => $mailerAvailable,
+                'mailer_error' => $mailerError,
+                'summary' => $report['summary'],
+                'participants' => $report['participants'],
+            ],
+        ]);
+        exit;
+    }
+
     if (preg_match('#^/events/([^/]+)/send-qr-emails$#', $path, $matches) === 1 && $method === 'POST') {
         $authUser = requireAnyRole(['superadmin', 'admin', 'editor'], $resolveAuthenticatedUser);
         $eventId = (string)$matches[1];
@@ -7948,6 +8133,11 @@ try {
 
         $input = readJsonBody();
         $resendAll = (bool)($input['resend_all'] ?? false);
+        $paymentScope = (string)($input['payment_scope'] ?? 'all');
+        if (!in_array($paymentScope, ['all', 'paid_only'], true)) {
+            jsonResponse(422, ['error' => 'Nieprawidłowy zakres opłaty']);
+            exit;
+        }
 
         if ($resendAll && $isEventOfficeOpenNow($event)) {
             jsonResponse(422, ['error' => 'W godzinach działania biura nie można ponownie wysłać kodów QR do wszystkich uczestników.']);
@@ -7968,6 +8158,7 @@ try {
                 custom_fields_json,
                 status,
                 email_status,
+                payment_status,
                 checked_in_at,
                 created_at,
                 updated_at
@@ -7981,6 +8172,9 @@ try {
         $sentCount = 0;
         $errorCount = 0;
         $errors = [];
+        $unpaidCount = 0;
+        $unknownPaymentCount = 0;
+        $skippedUnpaidCount = 0;
 
         if (function_exists('set_time_limit')) {
             @set_time_limit(0);
@@ -7997,6 +8191,17 @@ try {
             $participantRow['important_field_aliases'] = $participantFieldMetadata['important_field_aliases'];
             unset($participantRow['custom_fields_json']);
             $participantRow = $ensureParticipantQrCode($pdo, $participantRow);
+            $participantPaymentStatus = (string)($participantRow['payment_status'] ?? 'unknown');
+            if ($participantPaymentStatus === 'unpaid') {
+                $unpaidCount++;
+            } elseif ($participantPaymentStatus === 'unknown') {
+                $unknownPaymentCount++;
+            }
+
+            if ($paymentScope === 'paid_only' && $participantPaymentStatus !== 'paid') {
+                $skippedUnpaidCount++;
+                continue;
+            }
 
             if (!$resendAll && (string)$participantRow['email_status'] === 'sent') {
                 continue;
@@ -8043,13 +8248,16 @@ try {
                     'sent_count' => count($queuedParticipantRows),
                     'error_count' => 0,
                     'errors' => [],
+                    'unpaid_count' => $unpaidCount,
+                    'unknown_payment_count' => $unknownPaymentCount,
+                    'skipped_unpaid_count' => $skippedUnpaidCount,
                 ],
             ]);
             exit;
         }
 
         try {
-            MailService::sendParticipantQrEmailBatch($qrEmailMessages);
+            MailService::sendParticipantQrEmailBatch($qrEmailMessages, $eventId);
             foreach ($queuedParticipantRows as $participantRow) {
                 $updateSentEmailStatusStmt->execute([
                     'email_status' => 'sent',
@@ -8071,7 +8279,9 @@ try {
         if ($sentCount > 0) {
             $addActivityLog(
                 $pdo,
-                $resendAll ? 'Wyslano ponownie kody QR dla wydarzenia' : 'Wyslano kody QR dla wydarzenia',
+                $paymentScope === 'paid_only'
+                    ? ($resendAll ? 'Wyslano ponownie kody QR tylko do oplaconych' : 'Wyslano kody QR tylko do oplaconych')
+                    : ($resendAll ? sprintf('Wyslano ponownie kody QR dla wydarzenia, nieoplaconych: %d', $unpaidCount) : sprintf('Wyslano kody QR dla wydarzenia, nieoplaconych: %d', $unpaidCount)),
                 $eventId,
                 null,
                 null,
@@ -8085,6 +8295,9 @@ try {
                 'sent_count' => $sentCount,
                 'error_count' => $errorCount,
                 'errors' => $errors,
+                'unpaid_count' => $unpaidCount,
+                'unknown_payment_count' => $unknownPaymentCount,
+                'skipped_unpaid_count' => $skippedUnpaidCount,
             ],
         ]);
         exit;
@@ -8674,6 +8887,9 @@ try {
                 (string)($participant['display_name'] ?? ''),
                 (string)($participant['email'] ?? '')
             );
+            $resolvedPaymentStatus = in_array((string)($resolvedData['payment_status'] ?? ''), ['unknown', 'paid', 'unpaid'], true)
+                ? (string)$resolvedData['payment_status']
+                : (string)($participant['payment_status'] ?? 'unknown');
             $encodedCustomFields = $encodeParticipantCustomFields(
                 $resolvedCustomFields,
                 $resolvedImportantFieldAliases
@@ -8690,7 +8906,8 @@ try {
                     display_name = :display_name,
                     email = :email,
                     custom_fields_json = :custom_fields_json,
-                    email_status = :email_status
+                    email_status = :email_status,
+                    payment_status = :payment_status
                 WHERE id = :id
             ');
             $updateStmt->execute([
@@ -8700,6 +8917,7 @@ try {
                 'email' => $resolvedEmail,
                 'custom_fields_json' => $encodedCustomFields !== [] ? encodeJsonValue($encodedCustomFields) : null,
                 'email_status' => $emailChanged ? 'not_sent' : (string)$participant['email_status'],
+                'payment_status' => $resolvedPaymentStatus,
                 'id' => (int)$participant['id'],
             ]);
 
@@ -8724,9 +8942,12 @@ try {
                     );
                 }
             }
+            $paymentStatusChanged = (string)($participantStateBeforeDataUpdate['payment_status'] ?? 'unknown') !== (string)($participant['payment_status'] ?? 'unknown');
             $addActivityLog(
                 $pdo,
-                'Zaktualizowano dane uczestnika',
+                $paymentStatusChanged
+                    ? sprintf('Zmieniono status opłaty uczestnika na %s', $formatParticipantPaymentStatus((string)($participant['payment_status'] ?? 'unknown')))
+                    : 'Zaktualizowano dane uczestnika',
                 (string)$participant['event_id'],
                 (int)$participant['id'],
                 (string)$participant['display_name'],
@@ -8812,7 +9033,7 @@ try {
     }
 
     if ($path === '/participants' && $method === 'POST') {
-        $authUser = requireAnyRole(['superadmin', 'admin', 'editor'], $resolveAuthenticatedUser);
+        $authUser = requireAnyRole(['superadmin', 'admin', 'editor', 'scanner_plus'], $resolveAuthenticatedUser);
 
         $input = readJsonBody();
         $firstName = trim((string)($input['first_name'] ?? ''));
@@ -8852,6 +9073,7 @@ try {
             $email,
             $bibNumber === '' ? null : $bibNumber,
             [],
+            'unknown',
             $organization,
             $qrCode === '' ? null : $qrCode
         );
