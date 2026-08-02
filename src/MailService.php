@@ -338,6 +338,7 @@ final class MailService
 <!doctype html>
 <html lang="pl">
 <head>
+  <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
 </head>
 <body style="margin:0;padding:0;background:#07090d;color:#f8f5ef;font-family:Arial,Helvetica,sans-serif;">
@@ -399,6 +400,7 @@ HTML;
 <!doctype html>
 <html lang="pl">
 <head>
+  <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
 </head>
 <body style="margin:0;padding:0;background:#07090d;color:#f8f5ef;font-family:Arial,Helvetica,sans-serif;">
@@ -445,7 +447,7 @@ HTML;
             $ranges = is_array($location['ranges'] ?? null) ? $location['ranges'] : [];
 
             $nameHtml = $googleMapsUrl !== ''
-                ? '<a href="' . self::escape($googleMapsUrl) . '" style="color:#e5b761;text-decoration:none;">' . $name . ' &#8599;</a>'
+                ? '<a href="' . self::escape($googleMapsUrl) . '" style="color:#7fb8e5;text-decoration:underline;">' . $name . ' &#8599;</a>'
                 : $name;
 
             $rangesHtml = implode('<br>', array_map(
