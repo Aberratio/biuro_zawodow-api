@@ -176,6 +176,11 @@ final class MailService
         $qrContentId = $participantId !== null && $participantId > 0
             ? 'participant-qr-' . $participantId
             : 'participant-qr-' . substr(hash('sha256', $qrToken), 0, 24);
+        // Obrazek w tresci wskazuje na publiczny endpoint /qr-images/<token>.png zamiast na
+        // "cid:" osadzonego zalacznika - Gmail nie renderowal czesci cid i uczestnik widzial
+        // w mailu pusty placeholder zamiast kodu. Zalacznik zostaje bez zmian (nadal inline
+        // z Content-ID), wiec kod QR jest dostepny takze, gdy klient poczty blokuje obrazki.
+        $qrImageUrl = qrCodeImageUrl($qrToken);
 
         return [
             'to' => $recipientEmail,
@@ -187,7 +192,7 @@ final class MailService
                 $officeLocations,
                 $eventLocation,
                 $bibNumber,
-                'cid:' . $qrContentId,
+                $qrImageUrl,
                 $participantCustomFields,
                 $participantImportantFieldAliases
             ),

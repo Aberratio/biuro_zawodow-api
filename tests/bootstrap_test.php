@@ -107,6 +107,33 @@ test('builds app URLs and password reset helpers from environment', function ():
     assertMatches('/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/', passwordResetExpiresAt(60));
 });
 
+test('embeds the QR code in the participant email body as a public image url', function (): void {
+    putenv('APP_URL=https://api.example.com/');
+    $qrToken = 'pqr_' . str_repeat('ab', 24);
+
+    $payload = (new ReflectionMethod(MailService::class, 'participantQrPayload'))->invoke(
+        null,
+        'adam@example.com',
+        'Adam',
+        '20260813-1',
+        [],
+        'Opole',
+        '127',
+        $qrToken,
+        [],
+        [],
+        127,
+        'event-1'
+    );
+
+    assertStringContains('src="https://api.example.com/qr-images/' . $qrToken . '.png"', $payload['html']);
+    assertFalse(str_contains($payload['html'], 'cid:'));
+    // Zalacznik zostaje bez zmian: nadal inline, z wlasnym Content-ID i nazwa pliku.
+    assertSame('kod-qr.png', $payload['attachments'][0]['filename']);
+    assertSame('participant-qr-127', $payload['attachments'][0]['contentId']);
+    assertTrue($payload['attachments'][0]['inline']);
+});
+
 test('documents critical API paths in the generated OpenAPI document', function (): void {
     $document = openApiDocument();
     $paths = array_keys($document['paths'] ?? []);
