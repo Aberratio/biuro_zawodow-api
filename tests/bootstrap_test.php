@@ -196,6 +196,50 @@ test('masks sensitive database values without changing ordinary columns', functi
     ]], maskSensitiveDatabaseRows($rows, $columns));
 });
 
+test('treats multi-day office hours with an overnight gap as closed between days', function (): void {
+    $locations = [
+        [
+            'hours' => [
+                ['opens_at' => '2026-09-11T15:00:00', 'closes_at' => '2026-09-11T19:00:00'],
+                ['opens_at' => '2026-09-12T07:00:00', 'closes_at' => '2026-09-12T10:00:00'],
+            ],
+        ],
+    ];
+
+    assertTrue(isAnyEventOfficeLocationHourRangeOpenAt(
+        $locations,
+        new DateTimeImmutable('2026-09-11T16:00:00')
+    ));
+    assertTrue(isAnyEventOfficeLocationHourRangeOpenAt(
+        $locations,
+        new DateTimeImmutable('2026-09-12T08:00:00')
+    ));
+    assertFalse(isAnyEventOfficeLocationHourRangeOpenAt(
+        $locations,
+        new DateTimeImmutable('2026-09-11T23:00:00')
+    ));
+    assertFalse(isAnyEventOfficeLocationHourRangeOpenAt(
+        $locations,
+        new DateTimeImmutable('2026-09-12T11:00:00')
+    ));
+});
+
+test('treats any matching location as open when locations run in parallel', function (): void {
+    $locations = [
+        ['hours' => [['opens_at' => '2026-09-11T09:00:00', 'closes_at' => '2026-09-11T12:00:00']]],
+        ['hours' => [['opens_at' => '2026-09-11T13:00:00', 'closes_at' => '2026-09-11T18:00:00']]],
+    ];
+
+    assertTrue(isAnyEventOfficeLocationHourRangeOpenAt(
+        $locations,
+        new DateTimeImmutable('2026-09-11T14:00:00')
+    ));
+    assertFalse(isAnyEventOfficeLocationHourRangeOpenAt(
+        $locations,
+        new DateTimeImmutable('2026-09-11T12:30:00')
+    ));
+});
+
 test('generates and validates participant QR tokens', function (): void {
     $token = QrCodeService::generateToken();
 

@@ -211,16 +211,14 @@ final class MailService
                 'eventId' => $eventId,
                 'participantId' => $participantId,
             ],
+            // Jeden zalacznik: osadzony w tresci przez cid i jednoczesnie widoczny na liscie
+            // zalacznikow. Osobna kopia "do pobrania" dawala dwa identyczne kody QR w Gmailu.
             'attachments' => [
-                [
-                    'filename' => 'kod-qr-inline.png',
-                    'contentBase64' => $qrBase64,
-                    'contentId' => $qrContentId,
-                    'inline' => true,
-                ],
                 [
                     'filename' => 'kod-qr.png',
                     'contentBase64' => $qrBase64,
+                    'contentId' => $qrContentId,
+                    'inline' => true,
                 ],
             ],
         ];
@@ -390,11 +388,13 @@ HTML;
         $safeName = self::escape($recipientName !== '' ? $recipientName : 'Zawodniku');
         $safeEmail = self::escape($recipientEmail !== '' ? $recipientEmail : '-');
         $safeEventName = self::escape($eventName !== '' ? $eventName : 'Wydarzenie sportowe');
-        $safeEventLocation = self::escape($eventLocation !== '' ? $eventLocation : 'Do potwierdzenia');
         $safeBibNumber = self::escape($bibNumber !== '' ? $bibNumber : '-');
         $safeQrImageUrl = self::escape($qrImageUrl);
+        $participantRow = self::detailHtmlRow('Uczestnik', $safeName);
+        $emailRow = self::detailHtmlRow('E-mail', $safeEmail);
         $importantFieldRows = self::participantImportantFieldRows($participantCustomFields, $participantImportantFieldAliases);
-        $officeLocationsRows = self::officeLocationsHtmlRows($officeLocations);
+        $eventLocationRow = self::eventLocationHtmlRow($eventLocation);
+        $officeLocationsCard = self::officeLocationsHtmlCard($officeLocations);
 
         return <<<HTML
 <!doctype html>
@@ -418,13 +418,13 @@ HTML;
             <p style="margin:0;font-size:38px;line-height:42px;font-weight:800;color:#f8f5ef;overflow-wrap:anywhere;word-break:break-word;">#{$safeBibNumber}</p>
           </div>
           <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;background:#0b0d12;border:1px solid #2e2a25;border-radius:14px;table-layout:fixed;">
-            <tr><td style="padding:14px 16px;border-bottom:1px solid #26231f;overflow-wrap:anywhere;word-break:break-word;"><strong>Uczestnik</strong><br>{$safeName}</td></tr>
-            <tr><td style="padding:14px 16px;border-bottom:1px solid #26231f;overflow-wrap:anywhere;word-break:break-word;"><strong>E-mail</strong><br>{$safeEmail}</td></tr>
+            {$participantRow}
+            {$emailRow}
             {$importantFieldRows}
-            {$officeLocationsRows}
-            <tr><td style="padding:14px 16px;overflow-wrap:anywhere;word-break:break-word;"><strong>Lokalizacja</strong><br>{$safeEventLocation}</td></tr>
+            {$eventLocationRow}
           </table>
-          <p style="margin:12px 0 0;font-size:12px;line-height:18px;color:#a79d91;text-align:center;">Kod QR jest też w załączniku.</p>
+          {$officeLocationsCard}
+          <p style="margin:14px 0 0;font-size:12px;line-height:18px;color:#a79d91;text-align:center;">Kod QR znajdziesz też w załączniku tej wiadomości.</p>
         </td></tr>
       </table>
     </td></tr>
@@ -434,40 +434,103 @@ HTML;
 HTML;
     }
 
-    private static function officeLocationsHtmlRows(array $officeLocations): string
+    /**
+     * Wspolny wiersz tabeli szczegolow: przygaszona etykieta nad wartoscia, zeby etykiety i
+     * wartosci nie zlewaly sie w jeden ciag pogrubionego tekstu.
+     *
+     * @param string $safeLabel juz zescape'owana etykieta
+     * @param string $valueHtml juz zescape'owana wartosc (moze zawierac wlasne znaczniki)
+     */
+    private static function detailHtmlRow(string $safeLabel, string $valueHtml, bool $isLast = false): string
     {
-        if ($officeLocations === []) {
-            return '<tr><td style="padding:14px 16px;border-bottom:1px solid #26231f;overflow-wrap:anywhere;word-break:break-word;"><strong>Biuro zawodów</strong><br>Do potwierdzenia</td></tr>';
+        $border = $isLast ? '' : 'border-bottom:1px solid #26231f;';
+
+        return '<tr><td style="padding:14px 16px;' . $border . 'overflow-wrap:anywhere;word-break:break-word;">'
+            . '<span style="display:block;font-size:11px;font-weight:700;letter-spacing:0.8px;text-transform:uppercase;color:#a79d91;">' . $safeLabel . '</span>'
+            . '<span style="display:block;margin-top:4px;font-size:15px;line-height:21px;color:#f8f5ef;">' . $valueHtml . '</span>'
+            . '</td></tr>';
+    }
+
+    /**
+     * Miejsce zawodow jako ostatni wiersz tabeli szczegolow, z linkiem do wyszukiwania w Mapach
+     * Google - sam tekst adresu nie mowil uczestnikowi, jak tam dotrzec.
+     */
+    private static function eventLocationHtmlRow(string $eventLocation): string
+    {
+        $location = trim($eventLocation);
+        if ($location === '') {
+            return self::detailHtmlRow('Miejsce zawodów', 'Do potwierdzenia', true);
         }
 
-        $rows = [];
-        foreach ($officeLocations as $location) {
-            $name = self::escape((string)($location['name'] ?? 'Biuro zawodów'));
+        $valueHtml = self::escape($location)
+            . '<br><a href="' . self::escape(self::googleMapsSearchUrl($location)) . '" style="display:inline-block;margin-top:8px;font-size:13px;color:#e5b761;text-decoration:underline;">Pokaż na mapie</a>';
+
+        return self::detailHtmlRow('Miejsce zawodów', $valueHtml, true);
+    }
+
+    /**
+     * Biuro zawodow ma wlasna kartę zamiast wierszy w tabeli szczegolow - nazwa lokalizacji
+     * wygladala tam jak etykieta pola, a godziny jak jej wartosc.
+     */
+    private static function officeLocationsHtmlCard(array $officeLocations): string
+    {
+        $header = '<p style="margin:0 0 10px;font-size:11px;font-weight:700;letter-spacing:0.8px;text-transform:uppercase;color:#e5b761;">Biuro zawodów &middot; odbiór pakietu</p>';
+
+        if ($officeLocations === []) {
+            $body = '<p style="margin:0;font-size:15px;color:#f8f5ef;">Do potwierdzenia</p>';
+
+            return self::officeLocationsCardWrapper($header . $body);
+        }
+
+        $blocks = [];
+        foreach ($officeLocations as $index => $location) {
+            $name = trim((string)($location['name'] ?? ''));
+            $safeName = self::escape($name !== '' ? $name : 'Biuro zawodów');
             $googleMapsUrl = trim((string)($location['google_maps_url'] ?? ''));
+            if ($googleMapsUrl === '' && $name !== '') {
+                $googleMapsUrl = self::googleMapsSearchUrl($name);
+            }
             $ranges = is_array($location['ranges'] ?? null) ? $location['ranges'] : [];
 
-            $nameHtml = $googleMapsUrl !== ''
-                ? '<a href="' . self::escape($googleMapsUrl) . '" style="color:#7fb8e5;text-decoration:underline;">' . $name . ' &#8599;</a>'
-                : $name;
+            $block = $index > 0
+                ? '<div style="height:1px;background:#26231f;margin:16px 0;"></div>'
+                : '';
+            $block .= '<p style="margin:0;font-size:17px;line-height:23px;font-weight:700;color:#f8f5ef;overflow-wrap:anywhere;word-break:break-word;">' . $safeName . '</p>';
 
-            $rangesHtml = implode('<br>', array_map(
-                static fn(string $range): string => self::escape($range),
-                $ranges
-            ));
+            if ($ranges !== []) {
+                $block .= '<p style="margin:12px 0 6px;font-size:11px;font-weight:700;letter-spacing:0.8px;text-transform:uppercase;color:#a79d91;">Godziny otwarcia</p>';
+                foreach ($ranges as $range) {
+                    $block .= '<p style="margin:0 0 4px;font-size:14px;line-height:20px;color:#e7e1d8;overflow-wrap:anywhere;word-break:break-word;">'
+                        . self::escape((string)$range) . '</p>';
+                }
+            }
 
-            $rows[] = '<tr><td style="padding:14px 16px;border-bottom:1px solid #26231f;overflow-wrap:anywhere;word-break:break-word;"><strong>' . $nameHtml . '</strong><br>' . $rangesHtml . '</td></tr>';
+            if ($googleMapsUrl !== '') {
+                $block .= '<a href="' . self::escape($googleMapsUrl) . '" style="display:inline-block;margin-top:12px;padding:9px 16px;background:#e5b761;color:#111419;font-size:13px;font-weight:700;text-decoration:none;border-radius:8px;">Pokaż na mapie</a>';
+            }
+
+            $blocks[] = $block;
         }
 
-        return implode("\n", $rows);
+        return self::officeLocationsCardWrapper($header . implode('', $blocks));
+    }
+
+    private static function officeLocationsCardWrapper(string $innerHtml): string
+    {
+        return '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;margin-top:14px;background:#0b0d12;border:1px solid #2e2a25;border-radius:14px;table-layout:fixed;">'
+            . '<tr><td style="padding:16px;">' . $innerHtml . '</td></tr></table>';
+    }
+
+    private static function googleMapsSearchUrl(string $query): string
+    {
+        return 'https://www.google.com/maps/search/?api=1&query=' . rawurlencode($query);
     }
 
     private static function participantImportantFieldRows(array $customFields, array $importantFieldAliases): string
     {
         $rows = [];
         foreach (self::participantImportantFields($customFields, $importantFieldAliases) as $label => $value) {
-            $safeLabel = self::escape($label);
-            $safeValue = self::escape($value);
-            $rows[] = '<tr><td style="padding:14px 16px;border-bottom:1px solid #26231f;overflow-wrap:anywhere;word-break:break-word;"><strong>' . $safeLabel . '</strong><br>' . $safeValue . '</td></tr>';
+            $rows[] = self::detailHtmlRow(self::escape($label), self::escape($value));
         }
 
         return implode("\n", $rows);
@@ -531,10 +594,10 @@ HTML;
             "Uczestnik: {$name}",
             "E-mail: {$email}",
             ...$importantFieldLines,
-            ...$officeLocationsLines,
-            "Miejsce: {$resolvedEventLocation}",
             "Numer startowy: #{$resolvedBibNumber}",
-            'Zachowaj tą wiadomość i pokaś kod QR przy wejściu lub w biurze zawodów.',
+            "Miejsce zawodów: {$resolvedEventLocation}",
+            implode("\n", $officeLocationsLines),
+            'Zachowaj tę wiadomość i pokaż kod QR przy wejściu lub w biurze zawodów.',
             'Kod QR jest dołączony do tej wiadomości jako załącznik.',
         ]);
     }
@@ -542,21 +605,28 @@ HTML;
     private static function officeLocationsTextLines(array $officeLocations): array
     {
         if ($officeLocations === []) {
-            return ['Biuro zawodów: Do potwierdzenia'];
+            return ['BIURO ZAWODÓW - ODBIÓR PAKIETU', 'Do potwierdzenia'];
         }
 
-        $lines = [];
+        $lines = ['BIURO ZAWODÓW - ODBIÓR PAKIETU'];
         foreach ($officeLocations as $location) {
-            $name = (string)($location['name'] ?? 'Biuro zawodów');
+            $name = trim((string)($location['name'] ?? ''));
+            $resolvedName = $name !== '' ? $name : 'Biuro zawodów';
             $googleMapsUrl = trim((string)($location['google_maps_url'] ?? ''));
+            if ($googleMapsUrl === '' && $name !== '') {
+                $googleMapsUrl = self::googleMapsSearchUrl($name);
+            }
             $ranges = is_array($location['ranges'] ?? null) ? $location['ranges'] : [];
 
-            $lines[] = $googleMapsUrl !== ''
-                ? "Biuro zawodów - {$name} ({$googleMapsUrl}):"
-                : "Biuro zawodów - {$name}:";
-
-            foreach ($ranges as $range) {
-                $lines[] = '  ' . (string)$range;
+            $lines[] = $resolvedName;
+            if ($ranges !== []) {
+                $lines[] = 'Godziny otwarcia:';
+                foreach ($ranges as $range) {
+                    $lines[] = '  ' . (string)$range;
+                }
+            }
+            if ($googleMapsUrl !== '') {
+                $lines[] = 'Mapa: ' . $googleMapsUrl;
             }
         }
 

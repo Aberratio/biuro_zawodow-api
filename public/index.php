@@ -266,6 +266,16 @@ try {
                     return 'Godziny biura zawodów niedostępne';
                 }
 
+                // Powtarzanie tej samej daty po obu stronach zakresu bylo szumem w mailu.
+                if ($opensAt->format('d.m.Y') === $closesAt->format('d.m.Y')) {
+                    return sprintf(
+                        '%s, %s – %s',
+                        $opensAt->format('d.m.Y'),
+                        $opensAt->format('H:i'),
+                        $closesAt->format('H:i')
+                    );
+                }
+
                 return sprintf(
                     '%s %s – %s %s',
                     $opensAt->format('d.m.Y'),
@@ -713,15 +723,14 @@ try {
     $isDeletedEvent = static fn(array $event): bool => trim((string)($event['deleted_at'] ?? '')) !== '';
     $isTestEvent = static fn(array $event): bool => filter_var($event['is_test'] ?? false, FILTER_VALIDATE_BOOLEAN);
 
-    $isEventOfficeOpenNow = static function (array $event): bool {
-        $openAt = parseLocalDateTimeString((string)($event['office_open_at'] ?? ''));
-        $closeAt = parseLocalDateTimeString((string)($event['office_close_at'] ?? ''));
-        if ($openAt === null || $closeAt === null) {
+    $isEventOfficeOpenNow = static function (array $event) use ($pdo, $loadEventOfficeLocations): bool {
+        $eventId = (string)($event['id'] ?? '');
+        if ($eventId === '') {
             return false;
         }
 
-        $now = new DateTimeImmutable();
-        return $now >= $openAt && $now <= $closeAt;
+        $locations = $loadEventOfficeLocations($pdo, $eventId);
+        return isAnyEventOfficeLocationHourRangeOpenAt($locations, new DateTimeImmutable());
     };
 
     $isEventFinished = static function (array $event): bool {
@@ -1427,10 +1436,14 @@ try {
         return in_array($value, ['unknown', 'paid', 'unpaid'], true);
     };
 
-    $normalizeParticipantPaymentStatus = static function (mixed $value, bool $emptyMeansUnpaid = false): ?string {
+    // $mappedColumn = wartosc pochodzi z kolumny zmapowanej jako oplata (CSV albo formularz uczestnika).
+    // W takiej kolumnie pusto znaczy "brak oplaty", a kazda inna wartosc niz jawne zaprzeczenie
+    // znaczy "oplacone" — organizatorzy wpisuja tam rozne rzeczy (kwoty, daty, nazwy platnosci),
+    // a wczesniejsze zwracanie null robilo z nich status "nieznany" i blokowalo wysylke do oplaconych.
+    $normalizeParticipantPaymentStatus = static function (mixed $value, bool $mappedColumn = false): ?string {
         $normalized = normalizeUtf8String(trim((string)$value));
         if ($normalized === '') {
-            return $emptyMeansUnpaid ? 'unpaid' : 'unknown';
+            return $mappedColumn ? 'unpaid' : 'unknown';
         }
 
         $key = strtolower($normalized);
@@ -1459,7 +1472,7 @@ try {
             return 'unknown';
         }
 
-        return null;
+        return $mappedColumn ? 'paid' : null;
     };
 
     $formatParticipantPaymentStatus = static function (string $paymentStatus): string {
@@ -1645,7 +1658,7 @@ try {
         return function_exists('mb_strlen') ? mb_strlen($value, 'UTF-8') : strlen($value);
     };
 
-    $validateParticipantFieldValue = static function (array $mapping, string $value) use ($countParticipantFieldValueCharacters, $normalizeParticipantDateValue, $normalizeParticipantPaymentStatus): array {
+    $validateParticipantFieldValue = static function (array $mapping, string $value) use ($countParticipantFieldValueCharacters, $normalizeParticipantDateValue): array {
         $alias = trim((string)($mapping['alias'] ?? ''));
         if ($alias === '') {
             $alias = trim((string)($mapping['source_column_name'] ?? 'pole'));
@@ -1653,9 +1666,9 @@ try {
 
         $trimmedValue = trim($value);
         if (($mapping['field_role'] ?? '') === 'payment_status') {
-            return $normalizeParticipantPaymentStatus($trimmedValue, true) === null
-                ? [sprintf('Pole "%s" zawiera nierozpoznaną wartość opłaty: "%s". Użyj np. TAK, NIE albo zostaw puste.', $alias, $trimmedValue)]
-                : [];
+            // Kazda wartosc w kolumnie oplaty jest interpretowalna (patrz $normalizeParticipantPaymentStatus),
+            // wiec nietypowy wpis nie moze wywalac calego wiersza z importu.
+            return [];
         }
 
         if ($trimmedValue === '') {

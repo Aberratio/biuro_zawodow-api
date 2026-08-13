@@ -43,14 +43,18 @@ final class QrEmailDeliveryReport
             $participantId = (int)$participant['id'];
             $participantEmail = strtolower(trim((string)($participant['email'] ?? '')));
 
+            $localEmailStatus = (string)($participant['email_status'] ?? 'not_sent');
+
             $candidates = $byParticipantId[$participantId] ?? [];
-            if ($candidates === [] && $participantEmail !== '') {
+            if ($candidates === [] && $participantEmail !== '' && $localEmailStatus === 'sent') {
                 // Fallback dla maili sprzed przekazywania participantId w metadata.
+                // Tylko dla uczestnikow z lokalnie odnotowana wysylka: po skasowaniu i ponownym
+                // wczytaniu listy w kontekscie wydarzenia zostaja maile z nieaktualnymi kodami QR,
+                // wyslane do tego samego adresu, ale do juz nieistniejacych rekordow uczestnikow.
                 $candidates = $byEmail[$participantEmail] ?? [];
             }
             $delivery = self::delivery($candidates);
 
-            $localEmailStatus = (string)($participant['email_status'] ?? 'not_sent');
             if ($delivery !== null) {
                 $bucket = self::summaryBucket((string)$delivery['effective_status']);
                 $summary[$bucket]++;

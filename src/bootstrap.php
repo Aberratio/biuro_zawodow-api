@@ -161,6 +161,33 @@ function normalizeLocalDateTimeString(string $value): ?string
     return $dateTime?->format('Y-m-d H:i:s');
 }
 
+/**
+ * Determines whether $now falls inside any individual location/day hour range,
+ * rather than the aggregate min(opens_at)/max(closes_at) window across all of them.
+ * A multi-day event with a gap (e.g. Fri 15:00-19:00, Sat 07:00-10:00) must be
+ * treated as closed overnight even though the aggregate window spans that gap.
+ *
+ * @param array<int, array{hours: array<int, array{opens_at: string, closes_at: string}>}> $locations
+ */
+function isAnyEventOfficeLocationHourRangeOpenAt(array $locations, DateTimeImmutable $now): bool
+{
+    foreach ($locations as $location) {
+        foreach ($location['hours'] ?? [] as $hour) {
+            $opensAt = parseLocalDateTimeString((string)($hour['opens_at'] ?? ''));
+            $closesAt = parseLocalDateTimeString((string)($hour['closes_at'] ?? ''));
+            if ($opensAt === null || $closesAt === null) {
+                continue;
+            }
+
+            if ($now >= $opensAt && $now <= $closesAt) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
 function corsOriginFromUrl(string $url): ?string
 {
     $trimmedUrl = trim($url);

@@ -55,6 +55,30 @@ test('falls back to case-insensitive recipient email correlation', function (): 
     assertSame('mail-1', $report['participants'][0]['delivery']['email_id']);
 });
 
+test('does not attribute old mailer emails to a re-imported participant', function (): void {
+    // Lista skasowana i wczytana ponownie: uczestnik ma nowe id i nowy kod QR,
+    // a w kontekscie wydarzenia zostal mail wyslany do starego rekordu.
+    $report = QrEmailDeliveryReport::build(
+        [qrDeliveryParticipant(42, 'jan@x.pl', 'not_sent')],
+        [qrDeliveryMailerEmail(['to' => 'jan@x.pl', 'metadata' => ['participantId' => 1]])]
+    );
+
+    assertNullValue($report['participants'][0]['delivery']);
+    assertSame('not_sent', $report['participants'][0]['local_email_status']);
+    assertSame(0, $report['summary']['sent']);
+    assertSame(0, $report['summary']['no_data']);
+});
+
+test('email fallback still works for legacy sends without participantId metadata', function (): void {
+    $report = QrEmailDeliveryReport::build(
+        [qrDeliveryParticipant(42, 'jan@x.pl', 'sent')],
+        [qrDeliveryMailerEmail(['to' => 'jan@x.pl', 'metadata' => []])]
+    );
+
+    assertSame('mail-1', $report['participants'][0]['delivery']['email_id']);
+    assertSame(1, $report['summary']['sent']);
+});
+
 test('latest send wins and send_count counts all attempts', function (): void {
     $report = QrEmailDeliveryReport::build(
         [qrDeliveryParticipant(1, 'jan@x.pl')],
