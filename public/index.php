@@ -68,6 +68,231 @@ try {
         return null;
     };
 
+    $isValidHttpUrl = static function (string $value): bool {
+        if (filter_var($value, FILTER_VALIDATE_URL) === false) {
+            return false;
+        }
+
+        $scheme = strtolower((string)parse_url($value, PHP_URL_SCHEME));
+        return $scheme === 'http' || $scheme === 'https';
+    };
+
+    $validateEventOfficeLocationsInput = static function ($rawLocations) use ($isValidHttpUrl): array {
+        if (!is_array($rawLocations) || $rawLocations === []) {
+            return [null, 'Dodaj co najmniej jedną lokalizację biura zawodów'];
+        }
+
+        $normalizedLocations = [];
+
+        foreach ($rawLocations as $rawLocation) {
+            if (!is_array($rawLocation)) {
+                return [null, 'Nieprawidłowe dane lokalizacji biura zawodów'];
+            }
+
+            $name = trim((string)($rawLocation['name'] ?? ''));
+            if ($name === '') {
+                return [null, 'Nazwa lokalizacji biura zawodów jest wymagana'];
+            }
+
+            if (mb_strlen($name) > 190) {
+                return [null, 'Nazwa lokalizacji biura zawodów może mieć maksymalnie 190 znaków'];
+            }
+
+            $googleMapsUrl = trim((string)($rawLocation['google_maps_url'] ?? ''));
+            if ($googleMapsUrl !== '') {
+                if (mb_strlen($googleMapsUrl) > 2048) {
+                    return [null, sprintf('Link do Google Maps dla lokalizacji "%s" jest zbyt długi', $name)];
+                }
+
+                if (!$isValidHttpUrl($googleMapsUrl)) {
+                    return [null, sprintf('Link do Google Maps dla lokalizacji "%s" jest nieprawidłowy', $name)];
+                }
+            }
+
+            $rawHours = $rawLocation['hours'] ?? null;
+            if (!is_array($rawHours) || $rawHours === []) {
+                return [null, sprintf('Dodaj co najmniej jeden zakres godzin dla lokalizacji "%s"', $name)];
+            }
+
+            $normalizedHours = [];
+            foreach ($rawHours as $rawHour) {
+                if (!is_array($rawHour)) {
+                    return [null, sprintf('Nieprawidłowy zakres godzin dla lokalizacji "%s"', $name)];
+                }
+
+                $opensAt = trim((string)($rawHour['opens_at'] ?? ''));
+                $closesAt = trim((string)($rawHour['closes_at'] ?? ''));
+
+                if (!isValidLocalDateTimeString($opensAt) || !isValidLocalDateTimeString($closesAt)) {
+                    return [null, sprintf('Zakres godzin dla lokalizacji "%s" musi mieć prawidłową datę i godzinę', $name)];
+                }
+
+                $normalizedOpensAt = normalizeLocalDateTimeString($opensAt);
+                $normalizedClosesAt = normalizeLocalDateTimeString($closesAt);
+                if ($normalizedOpensAt === null || $normalizedClosesAt === null) {
+                    return [null, sprintf('Zakres godzin dla lokalizacji "%s" musi mieć prawidłową datę i godzinę', $name)];
+                }
+
+                if ($normalizedClosesAt <= $normalizedOpensAt) {
+                    return [null, sprintf('Zamknięcie musi być późniejsze niż otwarcie w lokalizacji "%s"', $name)];
+                }
+
+                $normalizedHours[] = [
+                    'opens_at' => $normalizedOpensAt,
+                    'closes_at' => $normalizedClosesAt,
+                ];
+            }
+
+            $normalizedLocations[] = [
+                'name' => $name,
+                'google_maps_url' => $googleMapsUrl !== '' ? $googleMapsUrl : null,
+                'hours' => $normalizedHours,
+            ];
+        }
+
+        return [$normalizedLocations, null];
+    };
+
+    $computeEventOfficeWindowFromLocations = static function (array $locations): array {
+        $opensAtValues = [];
+        $closesAtValues = [];
+
+        foreach ($locations as $location) {
+            foreach ($location['hours'] as $hour) {
+                $opensAtValues[] = $hour['opens_at'];
+                $closesAtValues[] = $hour['closes_at'];
+            }
+        }
+
+        if ($opensAtValues === [] || $closesAtValues === []) {
+            return [null, null];
+        }
+
+        sort($opensAtValues);
+        rsort($closesAtValues);
+
+        return [$opensAtValues[0], $closesAtValues[0]];
+    };
+
+    $loadEventOfficeLocations = static function (PDO $pdo, string $eventId): array {
+        $locationsStmt = $pdo->prepare('
+            SELECT id, name, google_maps_url
+            FROM event_office_locations
+            WHERE event_id = :event_id
+            ORDER BY display_order ASC, id ASC
+        ');
+        $locationsStmt->execute(['event_id' => $eventId]);
+        $locationRows = $locationsStmt->fetchAll();
+
+        if ($locationRows === []) {
+            return [];
+        }
+
+        $locationIds = array_map(static fn(array $row): int => (int)$row['id'], $locationRows);
+        $placeholders = implode(',', array_fill(0, count($locationIds), '?'));
+
+        $hoursStmt = $pdo->prepare("
+            SELECT
+                id,
+                location_id,
+                DATE_FORMAT(opens_at, '%Y-%m-%dT%H:%i:%s') AS opens_at,
+                DATE_FORMAT(closes_at, '%Y-%m-%dT%H:%i:%s') AS closes_at
+            FROM event_office_location_hours
+            WHERE location_id IN ($placeholders)
+            ORDER BY display_order ASC, id ASC
+        ");
+        $hoursStmt->execute($locationIds);
+        $hourRows = $hoursStmt->fetchAll();
+
+        $hoursByLocationId = [];
+        foreach ($hourRows as $hourRow) {
+            $hoursByLocationId[(int)$hourRow['location_id']][] = [
+                'id' => (string)$hourRow['id'],
+                'opens_at' => (string)$hourRow['opens_at'],
+                'closes_at' => (string)$hourRow['closes_at'],
+            ];
+        }
+
+        return array_map(static function (array $row) use ($hoursByLocationId): array {
+            $locationId = (int)$row['id'];
+            return [
+                'id' => (string)$locationId,
+                'name' => (string)$row['name'],
+                'google_maps_url' => $row['google_maps_url'] !== null ? (string)$row['google_maps_url'] : null,
+                'hours' => $hoursByLocationId[$locationId] ?? [],
+            ];
+        }, $locationRows);
+    };
+
+    $replaceEventOfficeLocations = static function (PDO $pdo, string $eventId, array $locations): void {
+        $deleteStmt = $pdo->prepare('DELETE FROM event_office_locations WHERE event_id = :event_id');
+        $deleteStmt->execute(['event_id' => $eventId]);
+
+        $insertLocationStmt = $pdo->prepare('
+            INSERT INTO event_office_locations (event_id, name, google_maps_url, display_order)
+            VALUES (:event_id, :name, :google_maps_url, :display_order)
+        ');
+        $insertHourStmt = $pdo->prepare('
+            INSERT INTO event_office_location_hours (location_id, opens_at, closes_at, display_order)
+            VALUES (:location_id, :opens_at, :closes_at, :display_order)
+        ');
+
+        foreach (array_values($locations) as $locationIndex => $location) {
+            $insertLocationStmt->execute([
+                'event_id' => $eventId,
+                'name' => $location['name'],
+                'google_maps_url' => $location['google_maps_url'],
+                'display_order' => $locationIndex,
+            ]);
+            $locationId = (int)$pdo->lastInsertId();
+
+            foreach (array_values($location['hours']) as $hourIndex => $hour) {
+                $insertHourStmt->execute([
+                    'location_id' => $locationId,
+                    'opens_at' => $hour['opens_at'],
+                    'closes_at' => $hour['closes_at'],
+                    'display_order' => $hourIndex,
+                ]);
+            }
+        }
+    };
+
+    $formatEventOfficeLocationsForEmail = static function (array $locations): array {
+        return array_map(static function (array $location): array {
+            $ranges = array_map(static function (array $hour): string {
+                $opensAt = parseLocalDateTimeString((string)$hour['opens_at']);
+                $closesAt = parseLocalDateTimeString((string)$hour['closes_at']);
+                if ($opensAt === null || $closesAt === null) {
+                    return 'Godziny biura zawodów niedostępne';
+                }
+
+                // Powtarzanie tej samej daty po obu stronach zakresu bylo szumem w mailu.
+                if ($opensAt->format('d.m.Y') === $closesAt->format('d.m.Y')) {
+                    return sprintf(
+                        '%s, %s – %s',
+                        $opensAt->format('d.m.Y'),
+                        $opensAt->format('H:i'),
+                        $closesAt->format('H:i')
+                    );
+                }
+
+                return sprintf(
+                    '%s %s – %s %s',
+                    $opensAt->format('d.m.Y'),
+                    $opensAt->format('H:i'),
+                    $closesAt->format('d.m.Y'),
+                    $closesAt->format('H:i')
+                );
+            }, $location['hours']);
+
+            return [
+                'name' => (string)$location['name'],
+                'google_maps_url' => $location['google_maps_url'] ?? null,
+                'ranges' => $ranges,
+            ];
+        }, $locations);
+    };
+
     $loadAssignedEvents = static function (PDO $pdo, string $userId) use ($currentLocalDateTime): array {
         $stmt = $pdo->prepare('
             SELECT uea.event_id
@@ -141,7 +366,7 @@ try {
         ')->fetchAll();
     };
 
-    $loadEventById = static function (PDO $pdo, string $eventId): array|false {
+    $loadEventById = static function (PDO $pdo, string $eventId) use ($loadEventOfficeLocations): array|false {
         $stmt = $pdo->prepare('
             SELECT
                 id,
@@ -150,6 +375,7 @@ try {
                 organization_id,
                 DATE_FORMAT(office_open_at, "%Y-%m-%dT%H:%i:%s") AS office_open_at,
                 DATE_FORMAT(office_close_at, "%Y-%m-%dT%H:%i:%s") AS office_close_at,
+                is_test,
                 DATE_FORMAT(archived_at, "%Y-%m-%dT%H:%i:%s") AS archived_at,
                 DATE_FORMAT(deleted_at, "%Y-%m-%dT%H:%i:%s") AS deleted_at
             FROM events
@@ -158,11 +384,18 @@ try {
         ');
         $stmt->execute(['id' => $eventId]);
 
-        return $stmt->fetch();
+        $event = $stmt->fetch();
+        if ($event === false) {
+            return false;
+        }
+
+        $event['is_test'] = (bool)($event['is_test'] ?? false);
+        $event['office_locations'] = $loadEventOfficeLocations($pdo, $eventId);
+        return $event;
     };
 
-    $loadAllEvents = static function (PDO $pdo): array {
-        return $pdo->query('
+    $loadAllEvents = static function (PDO $pdo) use ($loadEventOfficeLocations): array {
+        $events = $pdo->query('
             SELECT
                 id,
                 name,
@@ -170,6 +403,7 @@ try {
                 organization_id,
                 DATE_FORMAT(office_open_at, "%Y-%m-%dT%H:%i:%s") AS office_open_at,
                 DATE_FORMAT(office_close_at, "%Y-%m-%dT%H:%i:%s") AS office_close_at,
+                is_test,
                 DATE_FORMAT(archived_at, "%Y-%m-%dT%H:%i:%s") AS archived_at,
                 DATE_FORMAT(deleted_at, "%Y-%m-%dT%H:%i:%s") AS deleted_at
             FROM events
@@ -177,10 +411,16 @@ try {
               AND deleted_at IS NULL
             ORDER BY event_date ASC
         ')->fetchAll();
+
+        return array_map(static function (array $event) use ($pdo, $loadEventOfficeLocations): array {
+            $event['is_test'] = (bool)($event['is_test'] ?? false);
+            $event['office_locations'] = $loadEventOfficeLocations($pdo, (string)$event['id']);
+            return $event;
+        }, $events);
     };
 
-    $loadAllArchivedEvents = static function (PDO $pdo): array {
-        return $pdo->query('
+    $loadAllArchivedEvents = static function (PDO $pdo) use ($loadEventOfficeLocations): array {
+        $events = $pdo->query('
             SELECT
                 id,
                 name,
@@ -188,6 +428,7 @@ try {
                 organization_id,
                 DATE_FORMAT(office_open_at, "%Y-%m-%dT%H:%i:%s") AS office_open_at,
                 DATE_FORMAT(office_close_at, "%Y-%m-%dT%H:%i:%s") AS office_close_at,
+                is_test,
                 DATE_FORMAT(archived_at, "%Y-%m-%dT%H:%i:%s") AS archived_at,
                 DATE_FORMAT(deleted_at, "%Y-%m-%dT%H:%i:%s") AS deleted_at
             FROM events
@@ -195,6 +436,12 @@ try {
               AND deleted_at IS NULL
             ORDER BY archived_at DESC, event_date DESC
         ')->fetchAll();
+
+        return array_map(static function (array $event) use ($pdo, $loadEventOfficeLocations): array {
+            $event['is_test'] = (bool)($event['is_test'] ?? false);
+            $event['office_locations'] = $loadEventOfficeLocations($pdo, (string)$event['id']);
+            return $event;
+        }, $events);
     };
 
     $participantStatuses = [
@@ -474,16 +721,16 @@ try {
 
     $isArchivedEvent = static fn(array $event): bool => trim((string)($event['archived_at'] ?? '')) !== '';
     $isDeletedEvent = static fn(array $event): bool => trim((string)($event['deleted_at'] ?? '')) !== '';
+    $isTestEvent = static fn(array $event): bool => filter_var($event['is_test'] ?? false, FILTER_VALIDATE_BOOLEAN);
 
-    $isEventOfficeOpenNow = static function (array $event): bool {
-        $openAt = parseLocalDateTimeString((string)($event['office_open_at'] ?? ''));
-        $closeAt = parseLocalDateTimeString((string)($event['office_close_at'] ?? ''));
-        if ($openAt === null || $closeAt === null) {
+    $isEventOfficeOpenNow = static function (array $event) use ($pdo, $loadEventOfficeLocations): bool {
+        $eventId = (string)($event['id'] ?? '');
+        if ($eventId === '') {
             return false;
         }
 
-        $now = new DateTimeImmutable();
-        return $now >= $openAt && $now <= $closeAt;
+        $locations = $loadEventOfficeLocations($pdo, $eventId);
+        return isAnyEventOfficeLocationHourRangeOpenAt($locations, new DateTimeImmutable());
     };
 
     $isEventFinished = static function (array $event): bool {
@@ -514,22 +761,6 @@ try {
         }
 
         return $canAccessOrganization($authUser, (string)$event['organization_id']);
-    };
-
-    $formatEventOfficeWindow = static function (array $event): string {
-        $openAt = parseLocalDateTimeString((string)($event['office_open_at'] ?? ''));
-        $closeAt = parseLocalDateTimeString((string)($event['office_close_at'] ?? ''));
-        if ($openAt === null || $closeAt === null) {
-            return 'Godziny biura zawodów niedostępne';
-        }
-
-        return sprintf(
-            'Otwarcie: %s %s, zamknięcie: %s %s',
-            $openAt->format('d.m.Y'),
-            $openAt->format('H:i'),
-            $closeAt->format('d.m.Y'),
-            $closeAt->format('H:i')
-        );
     };
 
     $canAccessEvent = static function (array $authUser, array $event) use ($canAccessOrganization, $isDeletedEvent, $isEventOfficeOpenNow, $isArchivedEvent, $isScannerRole): bool {
@@ -1087,6 +1318,7 @@ try {
             FROM events
             WHERE archived_at IS NULL
               AND deleted_at IS NULL
+              AND is_test = FALSE
               AND office_close_at <= DATE_SUB(NOW(), INTERVAL 1 MONTH)
         ');
         $eventsToArchive = $eventsToArchiveStmt->fetchAll();
@@ -1200,6 +1432,57 @@ try {
         return in_array($fieldRole, ['custom', 'important_custom'], true);
     };
 
+    $isValidParticipantPaymentStatus = static function (string $value): bool {
+        return in_array($value, ['unknown', 'paid', 'unpaid'], true);
+    };
+
+    // $mappedColumn = wartosc pochodzi z kolumny zmapowanej jako oplata (CSV albo formularz uczestnika).
+    // W takiej kolumnie pusto znaczy "brak oplaty", a kazda inna wartosc niz jawne zaprzeczenie
+    // znaczy "oplacone" — organizatorzy wpisuja tam rozne rzeczy (kwoty, daty, nazwy platnosci),
+    // a wczesniejsze zwracanie null robilo z nich status "nieznany" i blokowalo wysylke do oplaconych.
+    $normalizeParticipantPaymentStatus = static function (mixed $value, bool $mappedColumn = false): ?string {
+        $normalized = normalizeUtf8String(trim((string)$value));
+        if ($normalized === '') {
+            return $mappedColumn ? 'unpaid' : 'unknown';
+        }
+
+        $key = strtolower($normalized);
+        $key = strtr($key, [
+            'ą' => 'a',
+            'ć' => 'c',
+            'ę' => 'e',
+            'ł' => 'l',
+            'ń' => 'n',
+            'ó' => 'o',
+            'ś' => 's',
+            'ż' => 'z',
+            'ź' => 'z',
+        ]);
+        $key = preg_replace('/\s+/u', ' ', $key) ?? $key;
+
+        if (in_array($key, ['tak', 't', 'yes', 'y', 'true', '1', 'x', 'ok', 'oplacone', 'oplacony', 'oplacona', 'zapłacone', 'zaplacone', 'paid'], true)) {
+            return 'paid';
+        }
+
+        if (in_array($key, ['nie', 'n', 'no', 'false', '0', 'nieoplacone', 'nieoplacony', 'nieoplacona', 'nie zaplacone', 'nie zaplacono', 'unpaid'], true)) {
+            return 'unpaid';
+        }
+
+        if (in_array($key, ['unknown', 'nieznane', 'brak danych', 'n/a', 'na'], true)) {
+            return 'unknown';
+        }
+
+        return $mappedColumn ? 'paid' : null;
+    };
+
+    $formatParticipantPaymentStatus = static function (string $paymentStatus): string {
+        return match ($paymentStatus) {
+            'paid' => 'opłacony',
+            'unpaid' => 'nieopłacony',
+            default => 'nieznany',
+        };
+    };
+
     $normalizeParticipantFieldType = static function (string $fieldRole, mixed $fieldType) use ($isParticipantConfigurableFieldRole): string {
         if (!$isParticipantConfigurableFieldRole($fieldRole)) {
             return 'text';
@@ -1218,6 +1501,76 @@ try {
         return checkdate($month, $day, $year);
     };
 
+    $formatParticipantDate = static function (int $year, int $month, int $day): ?string {
+        if ($year < 1900 || $year > 2100 || !checkdate($month, $day, $year)) {
+            return null;
+        }
+
+        return sprintf('%04d-%02d-%02d', $year, $month, $day);
+    };
+
+    $normalizeParticipantDateValue = static function (string $value, string $preferredFormat = 'auto') use ($formatParticipantDate): array {
+        $trimmedValue = trim((string)preg_replace('/[T\s]+\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:\s*(?:AM|PM))?$/i', '', trim($value)));
+        if ($trimmedValue === '') {
+            return [null, null];
+        }
+
+        $preferredFormat = in_array($preferredFormat, ['auto', 'dmy', 'mdy', 'ymd'], true) ? $preferredFormat : 'auto';
+
+        if (preg_match('/^\d{4}[-\/.]\d{1,2}[-\/.]\d{1,2}$/', $trimmedValue) === 1) {
+            [$year, $month, $day] = array_map('intval', preg_split('/[-\/.]/', $trimmedValue));
+            $normalized = $formatParticipantDate($year, $month, $day);
+            return $normalized !== null ? [$normalized, null] : [null, 'nieprawidłowa data'];
+        }
+
+        if (preg_match('/^\d{1,2}[.-]\d{1,2}[.-]\d{4}$/', $trimmedValue) === 1) {
+            [$first, $second, $year] = array_map('intval', preg_split('/[.-]/', $trimmedValue));
+            [$day, $month] = $preferredFormat === 'mdy' ? [$second, $first] : [$first, $second];
+            $normalized = $formatParticipantDate($year, $month, $day);
+            return $normalized !== null ? [$normalized, null] : [null, 'nieprawidłowa data'];
+        }
+
+        if (preg_match('/^\d{1,2}\/\d{1,2}\/\d{4}$/', $trimmedValue) === 1) {
+            [$first, $second, $year] = array_map('intval', explode('/', $trimmedValue));
+            if ($preferredFormat === 'dmy') {
+                $normalized = $formatParticipantDate($year, $second, $first);
+                return $normalized !== null ? [$normalized, null] : [null, 'nieprawidłowa data'];
+            }
+            if ($preferredFormat === 'mdy') {
+                $normalized = $formatParticipantDate($year, $first, $second);
+                return $normalized !== null ? [$normalized, null] : [null, 'nieprawidłowa data'];
+            }
+            if ($first <= 12 && $second <= 12) {
+                return [null, 'niejednoznaczny format daty z ukośnikami'];
+            }
+
+            $normalized = $first > 12
+                ? $formatParticipantDate($year, $second, $first)
+                : $formatParticipantDate($year, $first, $second);
+            return $normalized !== null ? [$normalized, null] : [null, 'nieprawidłowa data'];
+        }
+
+        if (preg_match('/^\d{4,5}(?:\.\d+)?$/', $trimmedValue) === 1) {
+            $serial = (int)$trimmedValue;
+            $baseDate = DateTimeImmutable::createFromFormat('!Y-m-d', '1899-12-30');
+            if ($baseDate !== false) {
+                $date = $baseDate->modify(sprintf('+%d days', $serial));
+                if ($date !== false) {
+                    $normalized = $formatParticipantDate(
+                        (int)$date->format('Y'),
+                        (int)$date->format('m'),
+                        (int)$date->format('d')
+                    );
+                    if ($normalized !== null) {
+                        return [$normalized, null];
+                    }
+                }
+            }
+        }
+
+        return [null, 'nieobsługiwany format daty'];
+    };
+
     $normalizeParticipantValidationRules = static function (string $fieldType, mixed $rulesInput, string $fieldLabel) use ($isValidParticipantRuleDate): array {
         $rules = is_array($rulesInput) ? $rulesInput : [];
         $normalized = [];
@@ -1228,12 +1581,12 @@ try {
                     continue;
                 }
                 if (!is_int($rules[$key]) && !(is_string($rules[$key]) && preg_match('/^\d+$/', $rules[$key]) === 1)) {
-                    return [null, sprintf('ReguĹ‚a %s dla pola "%s" musi byÄ‡ liczbÄ… caĹ‚kowitÄ…', $key, $fieldLabel)];
+                    return [null, sprintf('Reguła %s dla pola "%s" musi być liczbą całkowitą', $key, $fieldLabel)];
                 }
                 $normalized[$key] = max(0, (int)$rules[$key]);
             }
             if (isset($normalized['min_length'], $normalized['max_length']) && $normalized['min_length'] > $normalized['max_length']) {
-                return [null, sprintf('Minimalna liczba znakĂłw nie moĹĽe byÄ‡ wiÄ™ksza od maksymalnej dla pola "%s"', $fieldLabel)];
+                return [null, sprintf('Minimalna liczba znaków nie może być większa od maksymalnej dla pola "%s"', $fieldLabel)];
             }
             return [$normalized, null];
         }
@@ -1245,12 +1598,12 @@ try {
                 }
                 $numberValue = is_string($rules[$key]) ? str_replace(',', '.', trim($rules[$key])) : $rules[$key];
                 if (!is_numeric($numberValue)) {
-                    return [null, sprintf('ReguĹ‚a %s dla pola "%s" musi byÄ‡ liczbÄ…', $key, $fieldLabel)];
+                    return [null, sprintf('Reguła %s dla pola "%s" musi być liczbą', $key, $fieldLabel)];
                 }
                 $normalized[$key] = (float)$numberValue;
             }
             if (isset($normalized['min'], $normalized['max']) && $normalized['min'] > $normalized['max']) {
-                return [null, sprintf('Minimalna wartoĹ›Ä‡ nie moĹĽe byÄ‡ wiÄ™ksza od maksymalnej dla pola "%s"', $fieldLabel)];
+                return [null, sprintf('Minimalna wartość nie może być większa od maksymalnej dla pola "%s"', $fieldLabel)];
             }
             return [$normalized, null];
         }
@@ -1262,12 +1615,19 @@ try {
                 }
                 $dateValue = trim((string)$rules[$key]);
                 if (!$isValidParticipantRuleDate($dateValue)) {
-                    return [null, sprintf('ReguĹ‚a %s dla pola "%s" musi byÄ‡ datÄ… w formacie RRRR-MM-DD', $key, $fieldLabel)];
+                    return [null, sprintf('Reguła %s dla pola "%s" musi być datą w formacie RRRR-MM-DD', $key, $fieldLabel)];
                 }
                 $normalized[$key] = $dateValue;
             }
+            $dateFormat = trim((string)($rules['date_format'] ?? ''));
+            if ($dateFormat !== '') {
+                if (!in_array($dateFormat, ['dmy', 'mdy', 'ymd'], true)) {
+                    return [null, sprintf('Format daty dla pola "%s" jest nieprawidłowy', $fieldLabel)];
+                }
+                $normalized['date_format'] = $dateFormat;
+            }
             if (isset($normalized['min'], $normalized['max']) && strcmp($normalized['min'], $normalized['max']) > 0) {
-                return [null, sprintf('Data poczÄ…tkowa nie moĹĽe byÄ‡ pĂłĹşniejsza od koĹ„cowej dla pola "%s"', $fieldLabel)];
+                return [null, sprintf('Data początkowa nie może być późniejsza od końcowej dla pola "%s"', $fieldLabel)];
             }
             return [$normalized, null];
         }
@@ -1281,12 +1641,12 @@ try {
                     continue;
                 }
                 if (strlen($normalizedOption) > 190) {
-                    return [null, sprintf('Opcja listy dla pola "%s" jest zbyt dĹ‚uga', $fieldLabel)];
+                    return [null, sprintf('Opcja listy dla pola "%s" jest zbyt długa', $fieldLabel)];
                 }
                 $options[$normalizedOption] = $normalizedOption;
             }
             if ($options === []) {
-                return [null, sprintf('Lista wyboru dla pola "%s" musi mieÄ‡ co najmniej jednÄ… opcjÄ™', $fieldLabel)];
+                return [null, sprintf('Lista wyboru dla pola "%s" musi mieć co najmniej jedną opcję', $fieldLabel)];
             }
             return [['options' => array_values($options)], null];
         }
@@ -1298,13 +1658,19 @@ try {
         return function_exists('mb_strlen') ? mb_strlen($value, 'UTF-8') : strlen($value);
     };
 
-    $validateParticipantFieldValue = static function (array $mapping, string $value) use ($countParticipantFieldValueCharacters, $isValidParticipantRuleDate): array {
+    $validateParticipantFieldValue = static function (array $mapping, string $value) use ($countParticipantFieldValueCharacters, $normalizeParticipantDateValue): array {
         $alias = trim((string)($mapping['alias'] ?? ''));
         if ($alias === '') {
             $alias = trim((string)($mapping['source_column_name'] ?? 'pole'));
         }
 
         $trimmedValue = trim($value);
+        if (($mapping['field_role'] ?? '') === 'payment_status') {
+            // Kazda wartosc w kolumnie oplaty jest interpretowalna (patrz $normalizeParticipantPaymentStatus),
+            // wiec nietypowy wpis nie moze wywalac calego wiersza z importu.
+            return [];
+        }
+
         if ($trimmedValue === '') {
             return (bool)($mapping['is_required'] ?? false)
                 ? [sprintf('Pole "%s" jest wymagane.', $alias)]
@@ -1317,10 +1683,10 @@ try {
         if ($fieldType === 'text') {
             $length = $countParticipantFieldValueCharacters($trimmedValue);
             if (isset($rules['min_length']) && $length < (int)$rules['min_length']) {
-                return [sprintf('Pole "%s" musi mieÄ‡ co najmniej %d znakĂłw.', $alias, (int)$rules['min_length'])];
+                return [sprintf('Pole "%s" musi mieć co najmniej %d znaków.', $alias, (int)$rules['min_length'])];
             }
             if (isset($rules['max_length']) && $length > (int)$rules['max_length']) {
-                return [sprintf('Pole "%s" moĹĽe mieÄ‡ maksymalnie %d znakĂłw.', $alias, (int)$rules['max_length'])];
+                return [sprintf('Pole "%s" może mieć maksymalnie %d znaków.', $alias, (int)$rules['max_length'])];
             }
             return [];
         }
@@ -1328,27 +1694,32 @@ try {
         if ($fieldType === 'number') {
             $numberValue = str_replace(',', '.', $trimmedValue);
             if (!is_numeric($numberValue)) {
-                return [sprintf('Pole "%s" musi byÄ‡ liczbÄ….', $alias)];
+                return [sprintf('Pole "%s" musi być liczbą.', $alias)];
             }
             $number = (float)$numberValue;
             if (isset($rules['min']) && $number < (float)$rules['min']) {
-                return [sprintf('Pole "%s" musi mieÄ‡ wartoĹ›Ä‡ nie mniejszÄ… niĹĽ %s.', $alias, (string)$rules['min'])];
+                return [sprintf('Pole "%s" musi mieć wartość nie mniejszą niż %s.', $alias, (string)$rules['min'])];
             }
             if (isset($rules['max']) && $number > (float)$rules['max']) {
-                return [sprintf('Pole "%s" musi mieÄ‡ wartoĹ›Ä‡ nie wiÄ™kszÄ… niĹĽ %s.', $alias, (string)$rules['max'])];
+                return [sprintf('Pole "%s" musi mieć wartość nie większą niż %s.', $alias, (string)$rules['max'])];
             }
             return [];
         }
 
         if ($fieldType === 'date') {
-            if (!$isValidParticipantRuleDate($trimmedValue)) {
-                return [sprintf('Pole "%s" musi byÄ‡ datÄ… w formacie RRRR-MM-DD.', $alias)];
+            $preferredFormat = is_string($rules['date_format'] ?? null) ? (string)$rules['date_format'] : 'auto';
+            [$normalizedDate, $dateError] = $normalizeParticipantDateValue($trimmedValue, $preferredFormat);
+            if ($normalizedDate === null) {
+                $formatHint = $dateError === 'niejednoznaczny format daty z ukośnikami'
+                    ? ' Użyj formatu RRRR-MM-DD albo DD.MM.RRRR.'
+                    : '';
+                return [sprintf('Pole "%s" musi być poprawną datą.%s', $alias, $formatHint)];
             }
-            if (isset($rules['min']) && strcmp($trimmedValue, (string)$rules['min']) < 0) {
-                return [sprintf('Pole "%s" nie moĹĽe byÄ‡ wczeĹ›niejsze niĹĽ %s.', $alias, (string)$rules['min'])];
+            if (isset($rules['min']) && strcmp($normalizedDate, (string)$rules['min']) < 0) {
+                return [sprintf('Pole "%s" nie może być wcześniejsze niż %s.', $alias, (string)$rules['min'])];
             }
-            if (isset($rules['max']) && strcmp($trimmedValue, (string)$rules['max']) > 0) {
-                return [sprintf('Pole "%s" nie moĹĽe byÄ‡ pĂłĹşniejsze niĹĽ %s.', $alias, (string)$rules['max'])];
+            if (isset($rules['max']) && strcmp($normalizedDate, (string)$rules['max']) > 0) {
+                return [sprintf('Pole "%s" nie może być późniejsze niż %s.', $alias, (string)$rules['max'])];
             }
             return [];
         }
@@ -1356,7 +1727,7 @@ try {
         if ($fieldType === 'select') {
             $options = is_array($rules['options'] ?? null) ? array_map('strval', $rules['options']) : [];
             if (!in_array($trimmedValue, $options, true)) {
-                return [sprintf('Pole "%s" musi byÄ‡ jednÄ… z wartoĹ›ci: %s.', $alias, implode(', ', $options))];
+                return [sprintf('Pole "%s" musi być jedną z wartości: %s.', $alias, implode(', ', $options))];
             }
         }
 
@@ -1384,6 +1755,17 @@ try {
         }
 
         return $errors;
+    };
+
+    $normalizeParticipantFieldValueForStorage = static function (array $mapping, string $value) use ($normalizeParticipantDateValue): string {
+        if ((string)($mapping['field_type'] ?? 'text') !== 'date') {
+            return $value;
+        }
+
+        $rules = is_array($mapping['validation_rules'] ?? null) ? $mapping['validation_rules'] : [];
+        $preferredFormat = is_string($rules['date_format'] ?? null) ? (string)$rules['date_format'] : 'auto';
+        [$normalizedDate] = $normalizeParticipantDateValue($value, $preferredFormat);
+        return $normalizedDate ?? $value;
     };
 
     $loadParticipantFieldMappings = static function (PDO $pdo, string $eventId) use ($normalizeParticipantFieldType): array {
@@ -1426,10 +1808,11 @@ try {
         array $fieldValues,
         bool $requireAllActiveFields = false,
         ?string $preservedBibNumber = null
-    ) use ($validateParticipantFieldValue): array {
+    ) use ($normalizeParticipantFieldValueForStorage, $validateParticipantFieldValue, $normalizeParticipantPaymentStatus): array {
         $displayNameParts = [];
         $customFields = [];
         $bibNumber = $preservedBibNumber;
+        $paymentStatus = null;
         $missingFields = [];
         $validationErrors = [];
         $importantFieldAliases = [];
@@ -1462,6 +1845,11 @@ try {
                 $validationErrors = [...$validationErrors, ...$fieldValidationErrors];
             }
 
+            if ($mapping['field_role'] === 'payment_status' && $value === '') {
+                $paymentStatus = 'unpaid';
+                continue;
+            }
+
             if ($value === '') {
                 if ($isRequired) {
                     $missingFields[] = $alias;
@@ -1469,12 +1857,19 @@ try {
                 continue;
             }
 
+            $value = $normalizeParticipantFieldValueForStorage($mapping, $value);
+
             if ($mapping['field_role'] === 'display_name_part') {
                 $displayNameParts[] = $value;
             }
 
             if ($mapping['field_role'] === 'bib_number') {
                 $bibNumber = $value;
+            }
+
+            if ($mapping['field_role'] === 'payment_status') {
+                $paymentStatus = $normalizeParticipantPaymentStatus($value, true) ?? 'unknown';
+                continue;
             }
 
             $customFields[$alias] = $value;
@@ -1487,6 +1882,7 @@ try {
             'display_name' => trim(implode(' ', $displayNameParts)),
             'custom_fields' => $customFields,
             'bib_number' => $bibNumber,
+            'payment_status' => $paymentStatus,
             'missing_fields' => $missingFields,
             'validation_errors' => $validationErrors,
             'important_field_aliases' => $importantFieldAliases,
@@ -1547,6 +1943,7 @@ try {
                 custom_fields_json,
                 status,
                 email_status,
+                payment_status,
                 checked_in_at,
                 created_at,
                 updated_at
@@ -1585,6 +1982,7 @@ try {
                 custom_fields_json,
                 status,
                 email_status,
+                payment_status,
                 checked_in_at,
                 created_at,
                 updated_at
@@ -1625,6 +2023,7 @@ try {
                 custom_fields_json,
                 status,
                 email_status,
+                payment_status,
                 checked_in_at,
                 created_at,
                 updated_at
@@ -1674,12 +2073,13 @@ try {
                 custom_fields_json,
                 status,
                 email_status,
+                payment_status,
                 checked_in_at,
                 created_at,
                 updated_at
             FROM participants
             WHERE event_id IN ($placeholders)
-            ORDER BY id DESC
+            ORDER BY id ASC
         ");
         $stmt->execute($normalizedEventIds);
         $participants = $stmt->fetchAll();
@@ -1724,6 +2124,7 @@ try {
                 'important_field_aliases' => $participant['important_field_aliases'] ?? [],
                 'status' => (string)$participant['status'],
                 'email_status' => (string)$participant['email_status'],
+                'payment_status' => (string)($participant['payment_status'] ?? 'unknown'),
                 'checked_in_at' => $participant['checked_in_at'],
                 'qr_code' => (string)$participant['qr_code'],
             ],
@@ -1823,6 +2224,9 @@ try {
             'display_name' => trim((string)($participant['display_name'] ?? '')),
             'email' => normalizeEmailAddress((string)($participant['email'] ?? '')),
             'bib_number' => $normalizeParticipantBibNumber($participant['bib_number'] ?? null),
+            'payment_status' => in_array((string)($participant['payment_status'] ?? ''), ['unknown', 'paid', 'unpaid'], true)
+                ? (string)$participant['payment_status']
+                : 'unknown',
             'custom_fields' => $customFields,
             'important_field_aliases' => $importantFieldAliases,
         ];
@@ -1831,7 +2235,7 @@ try {
     $diffParticipantChangeStates = static function (array $beforeState, array $afterState): array {
         $changedFields = [];
 
-        foreach (['display_name', 'email', 'bib_number'] as $fieldName) {
+        foreach (['display_name', 'email', 'bib_number', 'payment_status'] as $fieldName) {
             if (($beforeState[$fieldName] ?? null) !== ($afterState[$fieldName] ?? null)) {
                 $changedFields[] = $fieldName;
             }
@@ -1883,6 +2287,7 @@ try {
                 display_name,
                 email,
                 bib_number,
+                payment_status,
                 custom_fields_json
             ) VALUES (
                 :event_id,
@@ -1891,6 +2296,7 @@ try {
                 :display_name,
                 :email,
                 :bib_number,
+                :payment_status,
                 :custom_fields_json
             )
         ');
@@ -1900,6 +2306,7 @@ try {
         $stmt->bindValue(':display_name', trim((string)($participantState['display_name'] ?? '')));
         $stmt->bindValue(':email', normalizeEmailAddress((string)($participantState['email'] ?? '')));
         $stmt->bindValue(':bib_number', $participantState['bib_number'] ?? null, ($participantState['bib_number'] ?? null) === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
+        $stmt->bindValue(':payment_status', in_array((string)($participantState['payment_status'] ?? ''), ['unknown', 'paid', 'unpaid'], true) ? (string)$participantState['payment_status'] : 'unknown');
         $stmt->bindValue(':custom_fields_json', $encodedCustomFields !== [] ? encodeJsonValue($encodedCustomFields) : null, $encodedCustomFields !== [] ? PDO::PARAM_STR : PDO::PARAM_NULL);
         $stmt->execute();
 
@@ -2005,6 +2412,7 @@ try {
                 display_name,
                 email,
                 bib_number,
+                payment_status,
                 custom_fields_json,
                 created_at
             FROM event_participant_import_baseline_records
@@ -2108,6 +2516,7 @@ try {
                 custom_fields_json,
                 status,
                 email_status,
+                payment_status,
                 checked_in_at,
                 created_at,
                 updated_at
@@ -2265,9 +2674,10 @@ try {
         return trim(implode(' ', $parts));
     };
 
-    $normalizeCustomFieldsFromMapping = static function (array $row, array $mappings): array {
+    $normalizeCustomFieldsFromMapping = static function (array $row, array $mappings) use ($normalizeParticipantPaymentStatus): array {
         $customFields = [];
         $importantFieldAliases = [];
+        $paymentStatus = 'unknown';
 
         foreach ($mappings as $mapping) {
             if (!($mapping['is_active'] ?? true)) {
@@ -2275,7 +2685,7 @@ try {
             }
 
             $role = (string)$mapping['field_role'];
-            if (!in_array($role, ['display_name_part', 'bib_number', 'custom', 'important_custom'], true)) {
+            if (!in_array($role, ['display_name_part', 'bib_number', 'payment_status', 'custom', 'important_custom'], true)) {
                 continue;
             }
 
@@ -2285,6 +2695,11 @@ try {
             }
 
             $value = trim((string)($row[(string)$mapping['source_column_name']] ?? ''));
+            if ($role === 'payment_status') {
+                $paymentStatus = $normalizeParticipantPaymentStatus($value, true) ?? 'unknown';
+                continue;
+            }
+
             if ($value === '') {
                 continue;
             }
@@ -2298,6 +2713,7 @@ try {
         return [
             'custom_fields' => $customFields,
             'important_field_aliases' => $importantFieldAliases,
+            'payment_status' => $paymentStatus,
         ];
     };
 
@@ -2308,11 +2724,12 @@ try {
         string $email,
         ?string $bibNumber,
         array $customFields,
+        string $paymentStatus = 'unknown',
         string $organization = '',
         ?string $qrCode = null,
         ?string $participantAuditKey = null,
         ?int $baselineImportRecordId = null
-    ) use ($loadParticipantById, $generateUniqueParticipantQrCode, $encodeParticipantCustomFields): array {
+    ) use ($loadParticipantById, $generateUniqueParticipantQrCode, $encodeParticipantCustomFields, $isValidParticipantPaymentStatus): array {
         $nameParts = splitParticipantDisplayName($displayName);
         $resolvedBibNumber = $bibNumber !== null && trim($bibNumber) !== ''
             ? trim($bibNumber)
@@ -2329,6 +2746,7 @@ try {
         $resolvedParticipantAuditKey = is_string($participantAuditKey) && trim($participantAuditKey) !== ''
             ? trim($participantAuditKey)
             : 'pa-' . bin2hex(random_bytes(12));
+        $resolvedPaymentStatus = $isValidParticipantPaymentStatus($paymentStatus) ? $paymentStatus : 'unknown';
 
         $stmt = $pdo->prepare('
             INSERT INTO participants (
@@ -2344,7 +2762,8 @@ try {
                 qr_code,
                 custom_fields_json,
                 status,
-                email_status
+                email_status,
+                payment_status
             ) VALUES (
                 :event_id,
                 :participant_audit_key,
@@ -2358,7 +2777,8 @@ try {
                 :qr_code,
                 :custom_fields_json,
                 :status,
-                :email_status
+                :email_status,
+                :payment_status
             )
         ');
         $stmt->execute([
@@ -2375,6 +2795,7 @@ try {
             'custom_fields_json' => $encodedCustomFields !== [] ? encodeJsonValue($encodedCustomFields) : null,
             'status' => 'not_checked_in',
             'email_status' => 'not_sent',
+            'payment_status' => $resolvedPaymentStatus,
         ]);
 
         $participantId = (int)$pdo->lastInsertId();
@@ -2409,6 +2830,7 @@ try {
         ]];
 
         $displayNamePartCount = 0;
+        $paymentStatusMappingCount = 0;
         $seenColumns = [$emailColumn => true];
         $displayOrder = 1;
 
@@ -2436,12 +2858,15 @@ try {
                 return [null, sprintf('Alias jest wymagany dla aktywnej kolumny "%s"', $sourceColumnName)];
             }
 
-            if (!in_array($fieldRole, ['display_name_part', 'bib_number', 'custom', 'important_custom'], true)) {
+            if (!in_array($fieldRole, ['display_name_part', 'bib_number', 'payment_status', 'custom', 'important_custom'], true)) {
                 return [null, sprintf('Nieprawidłowa rola pola dla kolumny "%s"', $sourceColumnName)];
             }
 
             if ($fieldRole === 'display_name_part') {
                 $displayNamePartCount++;
+            }
+            if ($fieldRole === 'payment_status') {
+                $paymentStatusMappingCount++;
             }
 
             $fieldType = $normalizeParticipantFieldType($fieldRole, $field['field_type'] ?? 'text');
@@ -2451,7 +2876,7 @@ try {
                 $alias
             );
             if ($validationRulesError !== null || $validationRules === null) {
-                return [null, $validationRulesError ?? sprintf('NieprawidĹ‚owe reguĹ‚y walidacji dla kolumny "%s"', $sourceColumnName)];
+                return [null, $validationRulesError ?? sprintf('Nieprawidłowe reguły walidacji dla kolumny "%s"', $sourceColumnName)];
             }
             if (!in_array($fieldRole, ['custom', 'important_custom'], true)) {
                 $fieldType = 'text';
@@ -2474,6 +2899,10 @@ try {
 
         if ($displayNamePartCount === 0) {
             return [null, 'Wymagane jest co najmniej jedno aktywne mapowanie display_name_part'];
+        }
+
+        if ($paymentStatusMappingCount > 1) {
+            return [null, 'Mapowanie może zawierać tylko jedną kolumnę opłaty'];
         }
 
         return [$mappingsToSave, null];
@@ -2702,7 +3131,7 @@ try {
                 $nextAlias !== '' ? $nextAlias : $sourceColumnName
             );
             if ($validationRulesError !== null || $nextValidationRules === null) {
-                return [null, $validationRulesError ?? sprintf('NieprawidĹ‚owe reguĹ‚y walidacji dla kolumny "%s"', $sourceColumnName)];
+                return [null, $validationRulesError ?? sprintf('Nieprawidłowe reguły walidacji dla kolumny "%s"', $sourceColumnName)];
             }
 
             if ($currentRole === 'email') {
@@ -2746,6 +3175,10 @@ try {
             } elseif ($nextRole === 'bib_number') {
                 $nextFieldType = 'text';
                 $nextValidationRules = [];
+            } elseif ($nextRole === 'payment_status') {
+                $nextIsRequired = false;
+                $nextFieldType = 'text';
+                $nextValidationRules = [];
             }
 
             $updatesBySourceColumn[$sourceColumnName] = [
@@ -2768,6 +3201,7 @@ try {
         }
 
         $activeDisplayNamePartCount = 0;
+        $activePaymentStatusCount = 0;
         $activeAliases = [];
         foreach ($updatesBySourceColumn as $mapping) {
             if (!($mapping['is_active'] ?? false) || ($mapping['field_role'] ?? '') === 'email') {
@@ -2776,6 +3210,9 @@ try {
 
             if (($mapping['field_role'] ?? '') === 'display_name_part') {
                 $activeDisplayNamePartCount++;
+            }
+            if (($mapping['field_role'] ?? '') === 'payment_status') {
+                $activePaymentStatusCount++;
             }
 
             $normalizedAlias = strtolower(trim((string)$mapping['alias']));
@@ -2789,6 +3226,10 @@ try {
 
         if ($activeDisplayNamePartCount === 0) {
             return [null, 'Mapowanie musi zawierać co najmniej jedną aktywną kolumnę budującą nazwę uczestnika'];
+        }
+
+        if ($activePaymentStatusCount > 1) {
+            return [null, 'Mapowanie może zawierać tylko jedną aktywną kolumnę opłaty'];
         }
 
         return [array_values($updatesBySourceColumn), null];
@@ -3089,7 +3530,8 @@ try {
                 [
                     'important_field_aliases' => $customFieldData['important_field_aliases'] ?? [],
                     ...($customFieldData['custom_fields'] ?? []),
-                ]
+                ],
+                (string)($customFieldData['payment_status'] ?? 'unknown')
             );
             if ($participant === []) {
                 $invalidCount++;
@@ -3149,6 +3591,110 @@ try {
         ], null];
     };
 
+    $buildTestEventSeedMappings = static function (): array {
+        return [
+            [
+                'source_column_name' => 'Email',
+                'alias' => 'Email',
+                'field_role' => 'email',
+                'field_type' => 'text',
+                'validation_rules' => [],
+                'display_order' => 0,
+                'is_required' => true,
+                'is_active' => true,
+            ],
+            [
+                'source_column_name' => 'Imie',
+                'alias' => 'Imie',
+                'field_role' => 'display_name_part',
+                'field_type' => 'text',
+                'validation_rules' => [],
+                'display_order' => 1,
+                'is_required' => true,
+                'is_active' => true,
+            ],
+            [
+                'source_column_name' => 'Nazwisko',
+                'alias' => 'Nazwisko',
+                'field_role' => 'display_name_part',
+                'field_type' => 'text',
+                'validation_rules' => [],
+                'display_order' => 2,
+                'is_required' => true,
+                'is_active' => true,
+            ],
+            [
+                'source_column_name' => 'Numer',
+                'alias' => 'Numer startowy',
+                'field_role' => 'bib_number',
+                'field_type' => 'text',
+                'validation_rules' => [],
+                'display_order' => 3,
+                'is_required' => false,
+                'is_active' => true,
+            ],
+            [
+                'source_column_name' => 'Dystans',
+                'alias' => 'Dystans',
+                'field_role' => 'important_custom',
+                'field_type' => 'select',
+                'validation_rules' => ['options' => ['5 km', '10 km', '21 km']],
+                'display_order' => 4,
+                'is_required' => true,
+                'is_active' => true,
+            ],
+            [
+                'source_column_name' => 'Klub',
+                'alias' => 'Klub',
+                'field_role' => 'custom',
+                'field_type' => 'text',
+                'validation_rules' => [],
+                'display_order' => 5,
+                'is_required' => false,
+                'is_active' => true,
+            ],
+        ];
+    };
+
+    $buildTestEventSeedRows = static function (): array {
+        return [
+            ['Email' => 'anna.test@example.com', 'Imie' => 'Anna', 'Nazwisko' => 'Testowa', 'Numer' => '101', 'Dystans' => '5 km', 'Klub' => 'Demo Team'],
+            ['Email' => 'bartek.test@example.com', 'Imie' => 'Bartek', 'Nazwisko' => 'Przykladowy', 'Numer' => '102', 'Dystans' => '10 km', 'Klub' => 'Run Demo'],
+            ['Email' => 'celina.test@example.com', 'Imie' => 'Celina', 'Nazwisko' => 'Sandbox', 'Numer' => '103', 'Dystans' => '21 km', 'Klub' => ''],
+            ['Email' => 'dawid.test@example.com', 'Imie' => 'Dawid', 'Nazwisko' => 'Kontrolny', 'Numer' => '', 'Dystans' => '10 km', 'Klub' => 'QA Sport'],
+        ];
+    };
+
+    $resetTestEventSeedData = static function (PDO $pdo, string $eventId, array $authUser) use (
+        $deleteEventParticipantList,
+        $insertParticipantImportMappings,
+        $importParticipantsFromRows,
+        $buildTestEventSeedMappings,
+        $buildTestEventSeedRows
+    ): array {
+        $resetSummary = $deleteEventParticipantList($pdo, $eventId, $authUser);
+        $mappings = $buildTestEventSeedMappings();
+        $insertParticipantImportMappings($pdo, $eventId, $mappings);
+        [$importSummary, $importError] = $importParticipantsFromRows(
+            $pdo,
+            $eventId,
+            $buildTestEventSeedRows(),
+            $mappings,
+            $authUser,
+            false
+        );
+
+        if ($importError !== null || $importSummary === null) {
+            throw new RuntimeException($importError ?? 'Nie udało się przygotować danych testowych');
+        }
+
+        return [
+            'reset' => $resetSummary,
+            ...$importSummary,
+            'mappings' => $mappings,
+        ];
+    };
+
     if (preg_match('#^/qr-images/([A-Za-z0-9_%-]+)\.svg$#', $path, $matches) === 1 && $method === 'GET') {
         $qrCode = rawurldecode((string)$matches[1]);
         $participant = $loadParticipantByQrCode($pdo, $qrCode);
@@ -3164,6 +3710,24 @@ try {
         header('Content-Type: image/svg+xml; charset=utf-8');
         header('Cache-Control: public, max-age=300');
         echo QrCodeService::renderSvg((string)$participant['qr_code'], 320, 10);
+        exit;
+    }
+
+    if (preg_match('#^/qr-images/([A-Za-z0-9_%-]+)\.png$#', $path, $matches) === 1 && $method === 'GET') {
+        $qrCode = rawurldecode((string)$matches[1]);
+        $participant = $loadParticipantByQrCode($pdo, $qrCode);
+
+        if ($participant === false) {
+            http_response_code(404);
+            header('Content-Type: text/plain; charset=utf-8');
+            echo 'Nie znaleziono obrazu kodu QR';
+            exit;
+        }
+
+        http_response_code(200);
+        header('Content-Type: image/png');
+        header('Cache-Control: public, max-age=300');
+        echo QrCodeService::renderPng((string)$participant['qr_code'], 320, 10);
         exit;
     }
 
@@ -3607,6 +4171,7 @@ try {
             ) oc ON oc.event_id = e.id
             WHERE e.archived_at IS NULL
               AND e.deleted_at IS NULL
+              AND e.is_test = FALSE
               AND e.office_close_at >= UTC_TIMESTAMP()
               AND e.office_open_at <= DATE_ADD(UTC_TIMESTAMP(), INTERVAL 7 DAY)
             ORDER BY e.office_open_at ASC
@@ -3675,6 +4240,7 @@ try {
             LEFT JOIN events e
                 ON e.organization_id = o.id
                AND e.deleted_at IS NULL
+               AND e.is_test = FALSE
             GROUP BY o.id, o.name, o.event_limit
             HAVING o.event_limit > 0
                AND COUNT(e.id) >= o.event_limit
@@ -3753,6 +4319,7 @@ try {
                 GROUP BY event_id
             ) ob ON ob.event_id = ess.event_id
             WHERE e.deleted_at IS NULL
+              AND e.is_test = FALSE
             ORDER BY
                 CASE ess.sync_status WHEN 'conflict' THEN 0 WHEN 'pending' THEN 1 WHEN 'syncing' THEN 2 ELSE 3 END,
                 e.name ASC
@@ -3826,6 +4393,7 @@ try {
             INNER JOIN events e ON e.id = duplicates.event_id
             INNER JOIN organizations o ON o.id = e.organization_id
             WHERE e.deleted_at IS NULL
+              AND e.is_test = FALSE
             GROUP BY e.id, e.name, e.organization_id, o.name
             ORDER BY affected_count DESC
         ");
@@ -3867,6 +4435,7 @@ try {
             INNER JOIN events e ON e.id = duplicates.event_id
             INNER JOIN organizations o ON o.id = e.organization_id
             WHERE e.deleted_at IS NULL
+              AND e.is_test = FALSE
             GROUP BY e.id, e.name, e.organization_id, o.name
             ORDER BY affected_count DESC
         ");
@@ -3902,6 +4471,7 @@ try {
             INNER JOIN organizations o ON o.id = e.organization_id
             WHERE e.archived_at IS NULL
               AND e.deleted_at IS NULL
+              AND e.is_test = FALSE
               AND (p.qr_code IS NULL OR TRIM(p.qr_code) = '')
             GROUP BY e.id, e.name, e.organization_id, o.name
             ORDER BY affected_count DESC
@@ -4079,7 +4649,24 @@ try {
         return [$conditions === [] ? '' : 'WHERE ' . implode(' AND ', $conditions), $params];
     };
 
-    $loadAuditRows = static function (PDO $pdo, string $where, array $params, int $limit, int $offset = 0): array {
+    $resolveAuditOrderSql = static function (): string {
+        $sort = trim((string)($_GET['sort'] ?? 'time'));
+        $direction = strtolower(trim((string)($_GET['direction'] ?? 'desc'))) === 'asc' ? 'ASC' : 'DESC';
+        $sortColumns = [
+            'time' => 'al.created_at',
+            'severity' => 'al.severity',
+            'category' => 'al.category',
+            'outcome' => 'al.outcome',
+            'actor' => 'COALESCE(u.name, al.actor_name_snapshot)',
+        ];
+        $column = $sortColumns[$sort] ?? $sortColumns['time'];
+        $idDirection = $direction === 'ASC' ? 'ASC' : 'DESC';
+
+        return "ORDER BY {$column} {$direction}, al.id {$idDirection}";
+    };
+
+    $loadAuditRows = static function (PDO $pdo, string $where, array $params, int $limit, int $offset = 0, ?string $orderSql = null): array {
+        $orderSql = $orderSql ?: 'ORDER BY al.created_at DESC, al.id DESC';
         $stmt = $pdo->prepare("
             SELECT
                 'audit' AS source, al.id, al.action, DATE_FORMAT(al.created_at, '%Y-%m-%dT%H:%i:%sZ') AS timestamp,
@@ -4094,7 +4681,7 @@ try {
             LEFT JOIN participants p ON p.id = al.participant_id
             LEFT JOIN users u ON u.id = al.actor_user_id
             {$where}
-            ORDER BY al.created_at DESC, al.id DESC
+            {$orderSql}
             LIMIT {$limit} OFFSET {$offset}
         ");
         $stmt->execute($params);
@@ -4104,6 +4691,42 @@ try {
             unset($entry['metadata_json']);
         }
         unset($entry);
+        return $entries;
+    };
+
+    $sortServerLogEntries = static function (array $entries): array {
+        $sort = trim((string)($_GET['sort'] ?? 'time'));
+        $direction = strtolower(trim((string)($_GET['direction'] ?? 'desc'))) === 'asc' ? 'asc' : 'desc';
+        $allowedSorts = ['time', 'level', 'status', 'path'];
+        if (!in_array($sort, $allowedSorts, true)) {
+            $sort = 'time';
+        }
+
+        usort($entries, static function (array $left, array $right) use ($sort, $direction): int {
+            $valueForSort = static function (array $entry) use ($sort): string {
+                if ($sort === 'level') {
+                    $weights = ['debug' => 100, 'info' => 200, 'notice' => 250, 'warning' => 300, 'error' => 400, 'critical' => 500];
+                    return str_pad((string)($weights[strtolower((string)($entry['level'] ?? ''))] ?? 0), 3, '0', STR_PAD_LEFT);
+                }
+                if ($sort === 'status') {
+                    $status = $entry['context']['status'] ?? '';
+                    return (string)$status;
+                }
+                if ($sort === 'path') {
+                    return (string)($entry['path'] ?? '');
+                }
+
+                return (string)($entry['timestamp'] ?? '');
+            };
+
+            $comparison = strcmp($valueForSort($left), $valueForSort($right));
+            if ($comparison === 0) {
+                $comparison = strcmp((string)($left['id'] ?? ''), (string)($right['id'] ?? ''));
+            }
+
+            return $direction === 'asc' ? $comparison : -$comparison;
+        });
+
         return $entries;
     };
 
@@ -4267,6 +4890,7 @@ try {
             'event_code' => $_GET['event_code'] ?? '',
             'q' => $_GET['q'] ?? '',
         ], 5000);
+        $entries = $sortServerLogEntries($entries);
         $total = count($entries);
         $totalPages = max(1, (int)ceil($total / $limit));
         $page = min($page, $totalPages);
@@ -4303,6 +4927,7 @@ try {
             'event_code' => $_GET['event_code'] ?? '',
             'q' => $_GET['q'] ?? '',
         ], 10000);
+        $entries = $sortServerLogEntries($entries);
         addAuditLog($pdo, [
             'category' => 'system', 'action_code' => 'server_logs.exported', 'action' => 'Wyeksportowano logi serwera',
             'actor_user_id' => $authUser['id'], 'actor_name' => $authUser['name'], 'actor_role' => $authUser['role'],
@@ -4349,7 +4974,7 @@ try {
     if ($path === '/superadmin/audit/export.csv' && $method === 'GET') {
         $authUser = requireAnyRole(['superadmin'], $resolveAuthenticatedUser);
         [$where, $params] = $buildAuditQuery();
-        $entries = $loadAuditRows($pdo, $where, $params, 10000);
+        $entries = $loadAuditRows($pdo, $where, $params, 10000, 0, $resolveAuditOrderSql());
         addAuditLog($pdo, [
             'category' => 'system', 'action_code' => 'audit.exported', 'action' => 'Wyeksportowano audyt systemowy',
             'actor_user_id' => $authUser['id'], 'actor_name' => $authUser['name'], 'actor_role' => $authUser['role'],
@@ -4408,7 +5033,7 @@ try {
         $total = (int)($countStmt->fetch()['total'] ?? 0);
         $totalPages = max(1, (int)ceil($total / $limit));
         $page = min($page, $totalPages);
-        $entries = $loadAuditRows($pdo, $where, $params, $limit, ($page - 1) * $limit);
+        $entries = $loadAuditRows($pdo, $where, $params, $limit, ($page - 1) * $limit, $resolveAuditOrderSql());
         jsonResponse(200, [
             'data' => $entries,
             'meta' => ['page' => $page, 'per_page' => $limit, 'total' => $total, 'total_pages' => $totalPages],
@@ -5065,7 +5690,7 @@ try {
             $eventLimitValue = (int)$eventLimit;
         }
 
-        $eventCountStmt = $pdo->prepare('SELECT COUNT(*) AS total FROM events WHERE organization_id = :organization_id AND deleted_at IS NULL');
+        $eventCountStmt = $pdo->prepare('SELECT COUNT(*) AS total FROM events WHERE organization_id = :organization_id AND deleted_at IS NULL AND is_test = FALSE');
         $eventCountStmt->execute(['organization_id' => $organizationId]);
         $eventCount = (int)($eventCountStmt->fetch()['total'] ?? 0);
         if ($eventLimitValue < $eventCount) {
@@ -5177,28 +5802,21 @@ try {
         $name = trim((string)($input['name'] ?? ''));
         $location = trim((string)($input['location'] ?? ''));
         $organizationId = trim((string)($input['organization_id'] ?? ''));
-        $officeOpenAt = trim((string)($input['office_open_at'] ?? ''));
-        $officeCloseAt = trim((string)($input['office_close_at'] ?? ''));
 
-        if ($name === '' || $location === '' || $organizationId === '' || $officeOpenAt === '' || $officeCloseAt === '') {
-            jsonResponse(422, ['error' => 'Nazwa, lokalizacja, organization_id, office_open_at i office_close_at są wymagane']);
+        if ($name === '' || $location === '' || $organizationId === '') {
+            jsonResponse(422, ['error' => 'Nazwa, lokalizacja i organization_id są wymagane']);
             exit;
         }
 
-        if (!isValidLocalDateTimeString($officeOpenAt) || !isValidLocalDateTimeString($officeCloseAt)) {
-            jsonResponse(422, ['error' => 'office_open_at i office_close_at muszą być prawidłowymi lokalnymi datami i godzinami']);
+        [$officeLocations, $officeLocationsError] = $validateEventOfficeLocationsInput($input['office_locations'] ?? null);
+        if ($officeLocationsError !== null || $officeLocations === null) {
+            jsonResponse(422, ['error' => $officeLocationsError ?? 'Nieprawidłowe lokalizacje biura zawodów']);
             exit;
         }
 
-        $normalizedOfficeOpenAt = normalizeLocalDateTimeString($officeOpenAt);
-        $normalizedOfficeCloseAt = normalizeLocalDateTimeString($officeCloseAt);
+        [$normalizedOfficeOpenAt, $normalizedOfficeCloseAt] = $computeEventOfficeWindowFromLocations($officeLocations);
         if ($normalizedOfficeOpenAt === null || $normalizedOfficeCloseAt === null) {
-            jsonResponse(422, ['error' => 'office_open_at i office_close_at muszą być prawidłowymi lokalnymi datami i godzinami']);
-            exit;
-        }
-
-        if ($normalizedOfficeOpenAt >= $normalizedOfficeCloseAt) {
-            jsonResponse(422, ['error' => 'Godzina otwarcia biura musi być wcześniejsza niż godzina zamknięcia']);
+            jsonResponse(422, ['error' => 'Nie udało się wyznaczyć okna otwarcia biura zawodów']);
             exit;
         }
 
@@ -5221,7 +5839,7 @@ try {
             exit;
         }
 
-        $eventCountStmt = $pdo->prepare('SELECT COUNT(*) AS total FROM events WHERE organization_id = :organization_id AND deleted_at IS NULL');
+        $eventCountStmt = $pdo->prepare('SELECT COUNT(*) AS total FROM events WHERE organization_id = :organization_id AND deleted_at IS NULL AND is_test = FALSE');
         $eventCountStmt->execute(['organization_id' => $organizationId]);
         $eventCount = (int)($eventCountStmt->fetch()['total'] ?? 0);
 
@@ -5248,6 +5866,8 @@ try {
                 'office_open_at' => $normalizedOfficeOpenAt,
                 'office_close_at' => $normalizedOfficeCloseAt,
             ]);
+
+            $replaceEventOfficeLocations($pdo, $eventId, $officeLocations);
 
             $activityStmt = $pdo->prepare('
                 INSERT INTO activity_logs (
@@ -5293,6 +5913,110 @@ try {
                 'organization_id' => $organizationId,
                 'office_open_at' => str_replace(' ', 'T', $normalizedOfficeOpenAt),
                 'office_close_at' => str_replace(' ', 'T', $normalizedOfficeCloseAt),
+                'office_locations' => $loadEventOfficeLocations($pdo, $eventId),
+                'is_test' => false,
+            ],
+        ]);
+        exit;
+    }
+
+    if ($path === '/events/test' && $method === 'POST') {
+        $authUser = requireAnyRole(['superadmin', 'admin', 'editor'], $resolveAuthenticatedUser);
+        $input = readJsonBody();
+
+        $organizationId = trim((string)($input['organization_id'] ?? ''));
+        if ($organizationId === '') {
+            jsonResponse(422, ['error' => 'Pole organization_id jest wymagane']);
+            exit;
+        }
+
+        if (!$canAccessOrganization($authUser, $organizationId)) {
+            jsonResponse(403, ['error' => 'Brak uprawnień']);
+            exit;
+        }
+
+        $organization = $loadOrganizationById($pdo, $organizationId);
+        if ($organization === false) {
+            jsonResponse(422, ['error' => 'Nie znaleziono organizacji']);
+            exit;
+        }
+
+        $now = new DateTimeImmutable();
+        $officeOpenAt = $now->setTime(
+            (int)$now->format('H'),
+            (int)$now->format('i'),
+            0
+        );
+        $officeCloseAt = $officeOpenAt->modify('+2 hours');
+        $eventId = 'evt-test-' . bin2hex(random_bytes(8));
+        $eventName = sprintf('Wydarzenie testowe - %s', (string)$organization['name']);
+        $location = 'Sandbox biura zawodów';
+
+        $pdo->beginTransaction();
+
+        try {
+            $insertEventStmt = $pdo->prepare('
+                INSERT INTO events (id, name, event_date, location, organization_id, office_open_at, office_close_at, is_test)
+                VALUES (:id, :name, :event_date, :location, :organization_id, :office_open_at, :office_close_at, TRUE)
+            ');
+            $insertEventStmt->execute([
+                'id' => $eventId,
+                'name' => $eventName,
+                'event_date' => $officeOpenAt->format('Y-m-d'),
+                'location' => $location,
+                'organization_id' => $organizationId,
+                'office_open_at' => $officeOpenAt->format('Y-m-d H:i:s'),
+                'office_close_at' => $officeCloseAt->format('Y-m-d H:i:s'),
+            ]);
+
+            $replaceEventOfficeLocations($pdo, $eventId, [[
+                'name' => $location,
+                'google_maps_url' => null,
+                'hours' => [[
+                    'opens_at' => $officeOpenAt->format('Y-m-d H:i:s'),
+                    'closes_at' => $officeCloseAt->format('Y-m-d H:i:s'),
+                ]],
+            ]]);
+
+            $mappings = $buildTestEventSeedMappings();
+            $insertParticipantImportMappings($pdo, $eventId, $mappings);
+            [$importSummary, $importError] = $importParticipantsFromRows(
+                $pdo,
+                $eventId,
+                $buildTestEventSeedRows(),
+                $mappings,
+                $authUser,
+                false
+            );
+
+            if ($importError !== null || $importSummary === null) {
+                throw new RuntimeException($importError ?? 'Nie udało się przygotować danych testowych');
+            }
+
+            $addActivityLog(
+                $pdo,
+                sprintf('Utworzono wydarzenie testowe: %s', $eventName),
+                $eventId,
+                null,
+                null,
+                (string)$authUser['id'],
+                (string)$authUser['name']
+            );
+
+            $pdo->commit();
+        } catch (Throwable $exception) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+
+            throw $exception;
+        }
+
+        jsonResponse(201, [
+            'data' => [
+                'event' => $loadEventById($pdo, $eventId),
+                'participants' => $loadParticipantsByEventId($pdo, $eventId),
+                'mappings' => $loadParticipantFieldMappings($pdo, $eventId),
             ],
         ]);
         exit;
@@ -5372,29 +6096,22 @@ try {
 
         $name = trim((string)($input['name'] ?? ''));
         $location = trim((string)($input['location'] ?? ''));
-        $officeOpenAt = trim((string)($input['office_open_at'] ?? ''));
-        $officeCloseAt = trim((string)($input['office_close_at'] ?? ''));
         $reopenOffice = (bool)($input['reopen_office'] ?? false);
 
-        if ($name === '' || $location === '' || $officeOpenAt === '' || $officeCloseAt === '') {
-            jsonResponse(422, ['error' => 'Nazwa, lokalizacja, office_open_at i office_close_at są wymagane']);
+        if ($name === '' || $location === '') {
+            jsonResponse(422, ['error' => 'Nazwa i lokalizacja są wymagane']);
             exit;
         }
 
-        if (!isValidLocalDateTimeString($officeOpenAt) || !isValidLocalDateTimeString($officeCloseAt)) {
-            jsonResponse(422, ['error' => 'office_open_at i office_close_at muszą być prawidłowymi lokalnymi datami i godzinami']);
+        [$officeLocations, $officeLocationsError] = $validateEventOfficeLocationsInput($input['office_locations'] ?? null);
+        if ($officeLocationsError !== null || $officeLocations === null) {
+            jsonResponse(422, ['error' => $officeLocationsError ?? 'Nieprawidłowe lokalizacje biura zawodów']);
             exit;
         }
 
-        $normalizedOfficeOpenAt = normalizeLocalDateTimeString($officeOpenAt);
-        $normalizedOfficeCloseAt = normalizeLocalDateTimeString($officeCloseAt);
+        [$normalizedOfficeOpenAt, $normalizedOfficeCloseAt] = $computeEventOfficeWindowFromLocations($officeLocations);
         if ($normalizedOfficeOpenAt === null || $normalizedOfficeCloseAt === null) {
-            jsonResponse(422, ['error' => 'office_open_at i office_close_at muszą być prawidłowymi lokalnymi datami i godzinami']);
-            exit;
-        }
-
-        if ($normalizedOfficeOpenAt >= $normalizedOfficeCloseAt) {
-            jsonResponse(422, ['error' => 'Godzina otwarcia biura musi być wcześniejsza niż godzina zamknięcia']);
+            jsonResponse(422, ['error' => 'Nie udało się wyznaczyć okna otwarcia biura zawodów']);
             exit;
         }
 
@@ -5415,37 +6132,140 @@ try {
 
         $eventDate = substr($normalizedOfficeOpenAt, 0, 10);
 
-        $stmt = $pdo->prepare('
-            UPDATE events
-            SET
-                name = :name,
-                event_date = :event_date,
-                location = :location,
-                office_open_at = :office_open_at,
-                office_close_at = :office_close_at
-            WHERE id = :id
-            LIMIT 1
-        ');
-        $stmt->execute([
-            'id' => $eventId,
-            'name' => $name,
-            'event_date' => $eventDate,
-            'location' => $location,
-            'office_open_at' => $normalizedOfficeOpenAt,
-            'office_close_at' => $normalizedOfficeCloseAt,
-        ]);
+        $pdo->beginTransaction();
 
-        $addActivityLog(
-            $pdo,
-            sprintf('Zaktualizowano wydarzenie: %s', $name),
-            $eventId,
-            null,
-            null,
-            (string)$authUser['id'],
-            (string)$authUser['name']
-        );
+        try {
+            $stmt = $pdo->prepare('
+                UPDATE events
+                SET
+                    name = :name,
+                    event_date = :event_date,
+                    location = :location,
+                    office_open_at = :office_open_at,
+                    office_close_at = :office_close_at
+                WHERE id = :id
+                LIMIT 1
+            ');
+            $stmt->execute([
+                'id' => $eventId,
+                'name' => $name,
+                'event_date' => $eventDate,
+                'location' => $location,
+                'office_open_at' => $normalizedOfficeOpenAt,
+                'office_close_at' => $normalizedOfficeCloseAt,
+            ]);
+
+            $replaceEventOfficeLocations($pdo, $eventId, $officeLocations);
+
+            $addActivityLog(
+                $pdo,
+                sprintf('Zaktualizowano wydarzenie: %s', $name),
+                $eventId,
+                null,
+                null,
+                (string)$authUser['id'],
+                (string)$authUser['name']
+            );
+
+            $pdo->commit();
+        } catch (Throwable $exception) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+
+            throw $exception;
+        }
 
         jsonResponse(200, ['data' => $loadEventById($pdo, $eventId)]);
+        exit;
+    }
+
+    if (preg_match('#^/events/([^/]+)/test-reset$#', $path, $matches) === 1 && $method === 'POST') {
+        $authUser = requireAnyRole(['superadmin', 'admin', 'editor'], $resolveAuthenticatedUser);
+        $eventId = (string)$matches[1];
+        $event = $loadEventById($pdo, $eventId);
+
+        if ($event === false) {
+            jsonResponse(404, ['error' => 'Nie znaleziono wydarzenia']);
+            exit;
+        }
+
+        if (!$canManageEventParticipants($authUser, $event)) {
+            jsonResponse(403, ['error' => 'Brak uprawnień']);
+            exit;
+        }
+
+        if (!$isTestEvent($event)) {
+            jsonResponse(422, ['error' => 'Reset danych jest dostępny tylko dla wydarzeń testowych']);
+            exit;
+        }
+
+        $now = new DateTimeImmutable();
+        $officeOpenAt = $now->setTime(
+            (int)$now->format('H'),
+            (int)$now->format('i'),
+            0
+        );
+        $officeCloseAt = $officeOpenAt->modify('+2 hours');
+
+        $pdo->beginTransaction();
+
+        try {
+            $updateEventStmt = $pdo->prepare('
+                UPDATE events
+                SET event_date = :event_date,
+                    office_open_at = :office_open_at,
+                    office_close_at = :office_close_at,
+                    archived_at = NULL,
+                    deleted_at = NULL
+                WHERE id = :id
+                  AND is_test = TRUE
+                LIMIT 1
+            ');
+            $updateEventStmt->execute([
+                'id' => $eventId,
+                'event_date' => $officeOpenAt->format('Y-m-d'),
+                'office_open_at' => $officeOpenAt->format('Y-m-d H:i:s'),
+                'office_close_at' => $officeCloseAt->format('Y-m-d H:i:s'),
+            ]);
+
+            $replaceEventOfficeLocations($pdo, $eventId, [[
+                'name' => (string)$event['location'],
+                'google_maps_url' => null,
+                'hours' => [[
+                    'opens_at' => $officeOpenAt->format('Y-m-d H:i:s'),
+                    'closes_at' => $officeCloseAt->format('Y-m-d H:i:s'),
+                ]],
+            ]]);
+
+            $seedSummary = $resetTestEventSeedData($pdo, $eventId, $authUser);
+            $addActivityLog(
+                $pdo,
+                sprintf('Zresetowano dane testowe wydarzenia: %s', (string)$event['name']),
+                $eventId,
+                null,
+                null,
+                (string)$authUser['id'],
+                (string)$authUser['name']
+            );
+
+            $pdo->commit();
+        } catch (Throwable $exception) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+
+            throw $exception;
+        }
+
+        jsonResponse(200, [
+            'data' => [
+                'event' => $loadEventById($pdo, $eventId),
+                'participants' => $loadParticipantsByEventId($pdo, $eventId),
+                'mappings' => $loadParticipantFieldMappings($pdo, $eventId),
+                'summary' => $seedSummary,
+            ],
+        ]);
         exit;
     }
 
@@ -5619,7 +6439,7 @@ try {
 
         $officeCloseAt = parseLocalDateTimeString((string)($event['office_close_at'] ?? ''));
         $now = new DateTimeImmutable();
-        if ($officeCloseAt !== null && $now > $officeCloseAt) {
+        if ($officeCloseAt !== null && $now > $officeCloseAt && !$isTestEvent($event)) {
             jsonResponse(422, ['error' => 'Zakończone wydarzenia trzeba przenieść do archiwum']);
             exit;
         }
@@ -5714,6 +6534,7 @@ try {
             'bib_number' => 'Numer startowy',
             'status' => 'Status',
             'email_status' => 'Status e-maila',
+            'payment_status' => 'Status opłaty',
             'checked_in_at' => 'Czas odprawy',
             'qr_code' => 'Kod QR',
             'created_at' => 'Utworzono',
@@ -5749,6 +6570,7 @@ try {
                 'bib_number' => (string)($participant['bib_number'] ?? ''),
                 'status' => $translateExportValue((string)($participant['status'] ?? ''), 'participant_status'),
                 'email_status' => $translateExportValue((string)($participant['email_status'] ?? ''), 'email_status'),
+                'payment_status' => $formatParticipantPaymentStatus((string)($participant['payment_status'] ?? 'unknown')),
                 'checked_in_at' => (string)($participant['checked_in_at'] ?? ''),
                 'qr_code' => (string)($participant['qr_code'] ?? ''),
                 'created_at' => (string)($participant['created_at'] ?? ''),
@@ -6640,7 +7462,7 @@ try {
     }
 
     if (preg_match('#^/events/([^/]+)/participants/manual$#', $path, $matches) === 1 && $method === 'POST') {
-        $authUser = requireAnyRole(['superadmin', 'admin', 'editor'], $resolveAuthenticatedUser);
+        $authUser = requireAnyRole(['superadmin', 'admin', 'editor', 'scanner_plus'], $resolveAuthenticatedUser);
         $eventId = (string)$matches[1];
         $event = $loadEventById($pdo, $eventId);
 
@@ -6685,7 +7507,8 @@ try {
             [
                 'important_field_aliases' => is_array($resolvedData['important_field_aliases'] ?? null) ? $resolvedData['important_field_aliases'] : [],
                 ...(is_array($resolvedData['custom_fields']) ? $resolvedData['custom_fields'] : []),
-            ]
+            ],
+            (string)($resolvedData['payment_status'] ?? 'unknown')
         );
         if ($eventHasParticipantImportBaseline($pdo, $eventId)) {
             $addParticipantChangeLog(
@@ -6738,7 +7561,7 @@ try {
             exit;
         }
 
-        $eventCountStmt = $pdo->prepare('SELECT COUNT(*) AS total FROM events WHERE organization_id = :organization_id AND deleted_at IS NULL');
+        $eventCountStmt = $pdo->prepare('SELECT COUNT(*) AS total FROM events WHERE organization_id = :organization_id AND deleted_at IS NULL AND is_test = FALSE');
         $eventCountStmt->execute(['organization_id' => $organizationId]);
         $eventCount = (int)($eventCountStmt->fetch()['total'] ?? 0);
         $eventLimitValue = (int)$eventLimit;
@@ -7453,16 +8276,40 @@ try {
         try {
             $wasAlreadySent = (string)($participant['email_status'] ?? '') === 'sent';
 
+            if ($isTestEvent($event)) {
+                $updateStmt = $pdo->prepare('UPDATE participants SET email_status = :email_status WHERE id = :id');
+                $updateStmt->execute([
+                    'email_status' => 'sent',
+                    'id' => (int)$participant['id'],
+                ]);
+                $participant['email_status'] = 'sent';
+
+                $addActivityLog(
+                    $pdo,
+                    $wasAlreadySent ? 'Ponownie zasymulowano wysylke kodu QR' : 'Zasymulowano wysylke kodu QR',
+                    (string)$event['id'],
+                    (int)$participant['id'],
+                    (string)$participant['display_name'],
+                    (string)$authUser['id'],
+                    (string)$authUser['name']
+                );
+
+                jsonResponse(200, ['data' => $participant, 'test_mode' => true]);
+                exit;
+            }
+
             MailService::sendParticipantQrEmail(
                 recipientEmail: (string)$participant['email'],
                 recipientName: (string)$participant['display_name'],
                 eventName: (string)$event['name'],
-                eventOfficeWindow: $formatEventOfficeWindow($event),
+                officeLocations: $formatEventOfficeLocationsForEmail($event['office_locations']),
                 eventLocation: (string)$event['location'],
                 bibNumber: (string)($participant['bib_number'] ?? ''),
                 qrToken: (string)$participant['qr_code'],
                 participantCustomFields: is_array($participant['custom_fields'] ?? null) ? $participant['custom_fields'] : [],
-                participantImportantFieldAliases: is_array($participant['important_field_aliases'] ?? null) ? $participant['important_field_aliases'] : []
+                participantImportantFieldAliases: is_array($participant['important_field_aliases'] ?? null) ? $participant['important_field_aliases'] : [],
+                participantId: (int)$participant['id'],
+                eventId: (string)$event['id']
             );
 
             $updateStmt = $pdo->prepare('UPDATE participants SET email_status = :email_status WHERE id = :id');
@@ -7484,8 +8331,79 @@ try {
 
             jsonResponse(200, ['data' => $participant]);
         } catch (Throwable $exception) {
-            jsonResponse(422, ['error' => $exception->getMessage()]);
+            $statusCode = $exception instanceof CentralMailerRequestException ? $exception->apiStatusCode() : 422;
+            jsonResponse($statusCode, ['error' => $exception->getMessage()]);
         }
+        exit;
+    }
+
+    if (preg_match('#^/events/([^/]+)/qr-email-deliveries$#', $path, $matches) === 1 && $method === 'GET') {
+        $authUser = requireAnyRole(['superadmin', 'admin', 'editor'], $resolveAuthenticatedUser);
+        $eventId = (string)$matches[1];
+        $event = $loadEventById($pdo, $eventId);
+
+        if ($event === false) {
+            jsonResponse(404, ['error' => 'Nie znaleziono wydarzenia']);
+            exit;
+        }
+
+        if (!$canManageEventParticipants($authUser, $event)) {
+            jsonResponse(403, ['error' => 'Brak uprawnień']);
+            exit;
+        }
+
+        $stmt = $pdo->prepare('
+            SELECT id, display_name, email, bib_number, email_status, payment_status
+            FROM participants
+            WHERE event_id = :event_id
+            ORDER BY id ASC
+        ');
+        $stmt->execute(['event_id' => $eventId]);
+        $participants = $stmt->fetchAll();
+
+        $mailerAvailable = true;
+        $mailerError = null;
+        $mailerEmails = [];
+
+        if ($isTestEvent($event)) {
+            $mailerAvailable = false;
+            $mailerError = 'test_mode';
+        } else {
+            try {
+                $offset = 0;
+                $pageLimit = 1000;
+                // Twardy limit stron chroni przed patologicznie duzymi kontekstami.
+                for ($page = 0; $page < 20; $page++) {
+                    $response = MailService::getContextEmailStatuses($eventId, $pageLimit, $offset);
+                    $emails = is_array($response['emails'] ?? null) ? $response['emails'] : [];
+                    foreach ($emails as $email) {
+                        $mailerEmails[] = $email;
+                    }
+                    if (($response['hasMore'] ?? false) !== true || $emails === []) {
+                        break;
+                    }
+                    $offset += $pageLimit;
+                }
+            } catch (Throwable $exception) {
+                // Degradacja: biuro zobaczy lokalny stan wysylki zamiast bledu.
+                $mailerAvailable = false;
+                $mailerError = $exception->getMessage();
+                $mailerEmails = [];
+            }
+        }
+
+        $report = QrEmailDeliveryReport::build($participants, $mailerAvailable ? $mailerEmails : []);
+
+        jsonResponse(200, [
+            'data' => [
+                'event_id' => $eventId,
+                'generated_at' => gmdate('Y-m-d\TH:i:s\Z'),
+                'mailer_available' => $mailerAvailable,
+                'mailer_error' => $mailerError,
+                'summary' => $report['summary'],
+                'participants' => $report['participants'],
+            ],
+        ]);
         exit;
     }
 
@@ -7506,6 +8424,11 @@ try {
 
         $input = readJsonBody();
         $resendAll = (bool)($input['resend_all'] ?? false);
+        $paymentScope = (string)($input['payment_scope'] ?? 'all');
+        if (!in_array($paymentScope, ['all', 'paid_only'], true)) {
+            jsonResponse(422, ['error' => 'Nieprawidłowy zakres opłaty']);
+            exit;
+        }
 
         if ($resendAll && $isEventOfficeOpenNow($event)) {
             jsonResponse(422, ['error' => 'W godzinach działania biura nie można ponownie wysłać kodów QR do wszystkich uczestników.']);
@@ -7526,6 +8449,7 @@ try {
                 custom_fields_json,
                 status,
                 email_status,
+                payment_status,
                 checked_in_at,
                 created_at,
                 updated_at
@@ -7539,12 +8463,18 @@ try {
         $sentCount = 0;
         $errorCount = 0;
         $errors = [];
+        $unpaidCount = 0;
+        $unknownPaymentCount = 0;
+        $skippedUnpaidCount = 0;
 
         if (function_exists('set_time_limit')) {
             @set_time_limit(0);
         }
 
         $updateSentEmailStatusStmt = $pdo->prepare('UPDATE participants SET email_status = :email_status WHERE id = :id');
+        $eventOfficeLocationsForEmail = $formatEventOfficeLocationsForEmail($event['office_locations']);
+        $qrEmailMessages = [];
+        $queuedParticipantRows = [];
 
         foreach ($participants as $participantRow) {
             $decodedCustomFields = decodeJsonObject($participantRow['custom_fields_json'] ?? null);
@@ -7553,31 +8483,83 @@ try {
             $participantRow['important_field_aliases'] = $participantFieldMetadata['important_field_aliases'];
             unset($participantRow['custom_fields_json']);
             $participantRow = $ensureParticipantQrCode($pdo, $participantRow);
+            $participantPaymentStatus = (string)($participantRow['payment_status'] ?? 'unknown');
+            if ($participantPaymentStatus === 'unpaid') {
+                $unpaidCount++;
+            } elseif ($participantPaymentStatus === 'unknown') {
+                $unknownPaymentCount++;
+            }
+
+            if ($paymentScope === 'paid_only' && $participantPaymentStatus !== 'paid') {
+                $skippedUnpaidCount++;
+                continue;
+            }
 
             if (!$resendAll && (string)$participantRow['email_status'] === 'sent') {
                 continue;
             }
 
-            try {
-                MailService::sendParticipantQrEmail(
-                    recipientEmail: (string)$participantRow['email'],
-                    recipientName: (string)$participantRow['display_name'],
-                    eventName: (string)$event['name'],
-                    eventOfficeWindow: $formatEventOfficeWindow($event),
-                    eventLocation: (string)$event['location'],
-                    bibNumber: (string)($participantRow['bib_number'] ?? ''),
-                    qrToken: (string)$participantRow['qr_code'],
-                    participantCustomFields: is_array($participantRow['custom_fields'] ?? null) ? $participantRow['custom_fields'] : [],
-                    participantImportantFieldAliases: is_array($participantRow['important_field_aliases'] ?? null) ? $participantRow['important_field_aliases'] : []
-                );
+            $qrEmailMessages[] = [
+                'participantId' => (int)$participantRow['id'],
+                'recipientEmail' => (string)$participantRow['email'],
+                'recipientName' => (string)$participantRow['display_name'],
+                'eventName' => (string)$event['name'],
+                'officeLocations' => $eventOfficeLocationsForEmail,
+                'eventLocation' => (string)$event['location'],
+                'bibNumber' => (string)($participantRow['bib_number'] ?? ''),
+                'qrToken' => (string)$participantRow['qr_code'],
+                'participantCustomFields' => is_array($participantRow['custom_fields'] ?? null) ? $participantRow['custom_fields'] : [],
+                'participantImportantFieldAliases' => is_array($participantRow['important_field_aliases'] ?? null) ? $participantRow['important_field_aliases'] : [],
+            ];
+            $queuedParticipantRows[] = $participantRow;
+        }
 
+        if ($isTestEvent($event)) {
+            foreach ($queuedParticipantRows as $participantRow) {
                 $updateSentEmailStatusStmt->execute([
                     'email_status' => 'sent',
                     'id' => (int)$participantRow['id'],
                 ]);
-                $sentCount++;
-            } catch (Throwable $exception) {
-                $errorCount++;
+            }
+
+            if ($queuedParticipantRows !== []) {
+                $addActivityLog(
+                    $pdo,
+                    $resendAll ? 'Zasymulowano ponowna wysylke kodow QR dla wydarzenia' : 'Zasymulowano wysylke kodow QR dla wydarzenia',
+                    $eventId,
+                    null,
+                    null,
+                    (string)$authUser['id'],
+                    (string)$authUser['name']
+                );
+            }
+
+            jsonResponse(200, [
+                'test_mode' => true,
+                'data' => [
+                    'sent_count' => count($queuedParticipantRows),
+                    'error_count' => 0,
+                    'errors' => [],
+                    'unpaid_count' => $unpaidCount,
+                    'unknown_payment_count' => $unknownPaymentCount,
+                    'skipped_unpaid_count' => $skippedUnpaidCount,
+                ],
+            ]);
+            exit;
+        }
+
+        try {
+            MailService::sendParticipantQrEmailBatch($qrEmailMessages, $eventId);
+            foreach ($queuedParticipantRows as $participantRow) {
+                $updateSentEmailStatusStmt->execute([
+                    'email_status' => 'sent',
+                    'id' => (int)$participantRow['id'],
+                ]);
+            }
+            $sentCount = count($queuedParticipantRows);
+        } catch (Throwable $exception) {
+            $errorCount = count($queuedParticipantRows);
+            foreach ($queuedParticipantRows as $participantRow) {
                 $errors[] = [
                     'participant_id' => (int)$participantRow['id'],
                     'participant_name' => (string)$participantRow['display_name'],
@@ -7589,7 +8571,9 @@ try {
         if ($sentCount > 0) {
             $addActivityLog(
                 $pdo,
-                $resendAll ? 'Wyslano ponownie kody QR dla wydarzenia' : 'Wyslano kody QR dla wydarzenia',
+                $paymentScope === 'paid_only'
+                    ? ($resendAll ? 'Wyslano ponownie kody QR tylko do oplaconych' : 'Wyslano kody QR tylko do oplaconych')
+                    : ($resendAll ? sprintf('Wyslano ponownie kody QR dla wydarzenia, nieoplaconych: %d', $unpaidCount) : sprintf('Wyslano kody QR dla wydarzenia, nieoplaconych: %d', $unpaidCount)),
                 $eventId,
                 null,
                 null,
@@ -7603,6 +8587,9 @@ try {
                 'sent_count' => $sentCount,
                 'error_count' => $errorCount,
                 'errors' => $errors,
+                'unpaid_count' => $unpaidCount,
+                'unknown_payment_count' => $unknownPaymentCount,
+                'skipped_unpaid_count' => $skippedUnpaidCount,
             ],
         ]);
         exit;
@@ -8192,6 +9179,9 @@ try {
                 (string)($participant['display_name'] ?? ''),
                 (string)($participant['email'] ?? '')
             );
+            $resolvedPaymentStatus = in_array((string)($resolvedData['payment_status'] ?? ''), ['unknown', 'paid', 'unpaid'], true)
+                ? (string)$resolvedData['payment_status']
+                : (string)($participant['payment_status'] ?? 'unknown');
             $encodedCustomFields = $encodeParticipantCustomFields(
                 $resolvedCustomFields,
                 $resolvedImportantFieldAliases
@@ -8208,7 +9198,8 @@ try {
                     display_name = :display_name,
                     email = :email,
                     custom_fields_json = :custom_fields_json,
-                    email_status = :email_status
+                    email_status = :email_status,
+                    payment_status = :payment_status
                 WHERE id = :id
             ');
             $updateStmt->execute([
@@ -8218,6 +9209,7 @@ try {
                 'email' => $resolvedEmail,
                 'custom_fields_json' => $encodedCustomFields !== [] ? encodeJsonValue($encodedCustomFields) : null,
                 'email_status' => $emailChanged ? 'not_sent' : (string)$participant['email_status'],
+                'payment_status' => $resolvedPaymentStatus,
                 'id' => (int)$participant['id'],
             ]);
 
@@ -8242,9 +9234,12 @@ try {
                     );
                 }
             }
+            $paymentStatusChanged = (string)($participantStateBeforeDataUpdate['payment_status'] ?? 'unknown') !== (string)($participant['payment_status'] ?? 'unknown');
             $addActivityLog(
                 $pdo,
-                'Zaktualizowano dane uczestnika',
+                $paymentStatusChanged
+                    ? sprintf('Zmieniono status opłaty uczestnika na %s', $formatParticipantPaymentStatus((string)($participant['payment_status'] ?? 'unknown')))
+                    : 'Zaktualizowano dane uczestnika',
                 (string)$participant['event_id'],
                 (int)$participant['id'],
                 (string)$participant['display_name'],
@@ -8330,7 +9325,7 @@ try {
     }
 
     if ($path === '/participants' && $method === 'POST') {
-        $authUser = requireAnyRole(['superadmin', 'admin', 'editor'], $resolveAuthenticatedUser);
+        $authUser = requireAnyRole(['superadmin', 'admin', 'editor', 'scanner_plus'], $resolveAuthenticatedUser);
 
         $input = readJsonBody();
         $firstName = trim((string)($input['first_name'] ?? ''));
@@ -8370,6 +9365,7 @@ try {
             $email,
             $bibNumber === '' ? null : $bibNumber,
             [],
+            'unknown',
             $organization,
             $qrCode === '' ? null : $qrCode
         );

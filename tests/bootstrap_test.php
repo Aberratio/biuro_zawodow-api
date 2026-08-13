@@ -31,6 +31,21 @@ test('normalizes and deduplicates configured CORS origins', function (): void {
     assertFalse(isLocalDevelopmentCorsOrigin('https://example.com'));
 });
 
+test('accepts www and non-www variants for the production frontend CORS origin', function (): void {
+    putenv('APP_FRONTEND_URL');
+    putenv('APP_URL=https://biuro-api.zmierzymyczas.pl');
+
+    $origins = configuredCorsOrigins('https://biuro.zmierzymyczas.pl');
+
+    assertTrue(in_array('https://biuro.zmierzymyczas.pl', $origins, true));
+    assertTrue(in_array('https://www.biuro.zmierzymyczas.pl', $origins, true));
+
+    $origins = configuredCorsOrigins('https://www.biuro.zmierzymyczas.pl');
+
+    assertTrue(in_array('https://biuro.zmierzymyczas.pl', $origins, true));
+    assertTrue(in_array('https://www.biuro.zmierzymyczas.pl', $origins, true));
+});
+
 test('encodes and decodes base64url payloads strictly', function (): void {
     $payload = '{"role":"admin"}';
     $encoded = base64UrlEncode($payload);
@@ -85,7 +100,7 @@ test('builds app URLs and password reset helpers from environment', function ():
 
     assertSame('https://api.example.com', appUrl());
     assertSame('https://panel.example.com', appFrontendUrl());
-    assertSame('https://api.example.com/qr-images/pqr_abc.svg', qrCodeImageUrl('pqr_abc'));
+    assertSame('https://api.example.com/qr-images/pqr_abc.png', qrCodeImageUrl('pqr_abc'));
     assertSame(3600, PASSWORD_RESET_TTL_SECONDS);
     assertSame(604800, ACCOUNT_SETUP_TTL_SECONDS);
     assertSame(hash_hmac('sha256', 'token-1', '0123456789abcdef0123456789abcdef'), passwordResetTokenHash('token-1'));
@@ -104,6 +119,7 @@ test('documents critical API paths in the generated OpenAPI document', function 
         '/superadmin/audit',
         '/superadmin/audit/{id}',
         '/superadmin/server-logs',
+        '/superadmin/database',
         '/superadmin/logging-status',
         '/events/{id}/participant-imports/analyze',
         '/events/{id}/participant-imports/run',
@@ -178,6 +194,50 @@ test('masks sensitive database values without changing ordinary columns', functi
         'bucket_key' => '[MASKED]',
         'email' => 'anna@example.com',
     ]], maskSensitiveDatabaseRows($rows, $columns));
+});
+
+test('treats multi-day office hours with an overnight gap as closed between days', function (): void {
+    $locations = [
+        [
+            'hours' => [
+                ['opens_at' => '2026-09-11T15:00:00', 'closes_at' => '2026-09-11T19:00:00'],
+                ['opens_at' => '2026-09-12T07:00:00', 'closes_at' => '2026-09-12T10:00:00'],
+            ],
+        ],
+    ];
+
+    assertTrue(isAnyEventOfficeLocationHourRangeOpenAt(
+        $locations,
+        new DateTimeImmutable('2026-09-11T16:00:00')
+    ));
+    assertTrue(isAnyEventOfficeLocationHourRangeOpenAt(
+        $locations,
+        new DateTimeImmutable('2026-09-12T08:00:00')
+    ));
+    assertFalse(isAnyEventOfficeLocationHourRangeOpenAt(
+        $locations,
+        new DateTimeImmutable('2026-09-11T23:00:00')
+    ));
+    assertFalse(isAnyEventOfficeLocationHourRangeOpenAt(
+        $locations,
+        new DateTimeImmutable('2026-09-12T11:00:00')
+    ));
+});
+
+test('treats any matching location as open when locations run in parallel', function (): void {
+    $locations = [
+        ['hours' => [['opens_at' => '2026-09-11T09:00:00', 'closes_at' => '2026-09-11T12:00:00']]],
+        ['hours' => [['opens_at' => '2026-09-11T13:00:00', 'closes_at' => '2026-09-11T18:00:00']]],
+    ];
+
+    assertTrue(isAnyEventOfficeLocationHourRangeOpenAt(
+        $locations,
+        new DateTimeImmutable('2026-09-11T14:00:00')
+    ));
+    assertFalse(isAnyEventOfficeLocationHourRangeOpenAt(
+        $locations,
+        new DateTimeImmutable('2026-09-11T12:30:00')
+    ));
 });
 
 test('generates and validates participant QR tokens', function (): void {

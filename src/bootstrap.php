@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 require_once __DIR__ . '/Database.php';
 require_once __DIR__ . '/MailService.php';
+require_once __DIR__ . '/QrEmailDeliveryReport.php';
 require_once __DIR__ . '/QrCodeService.php';
 require_once __DIR__ . '/RequestContext.php';
 require_once __DIR__ . '/SentryBridge.php';
@@ -158,6 +159,33 @@ function normalizeLocalDateTimeString(string $value): ?string
 {
     $dateTime = parseLocalDateTimeString($value);
     return $dateTime?->format('Y-m-d H:i:s');
+}
+
+/**
+ * Determines whether $now falls inside any individual location/day hour range,
+ * rather than the aggregate min(opens_at)/max(closes_at) window across all of them.
+ * A multi-day event with a gap (e.g. Fri 15:00-19:00, Sat 07:00-10:00) must be
+ * treated as closed overnight even though the aggregate window spans that gap.
+ *
+ * @param array<int, array{hours: array<int, array{opens_at: string, closes_at: string}>}> $locations
+ */
+function isAnyEventOfficeLocationHourRangeOpenAt(array $locations, DateTimeImmutable $now): bool
+{
+    foreach ($locations as $location) {
+        foreach ($location['hours'] ?? [] as $hour) {
+            $opensAt = parseLocalDateTimeString((string)($hour['opens_at'] ?? ''));
+            $closesAt = parseLocalDateTimeString((string)($hour['closes_at'] ?? ''));
+            if ($opensAt === null || $closesAt === null) {
+                continue;
+            }
+
+            if ($now >= $opensAt && $now <= $closesAt) {
+                return true;
+            }
+        }
+    }
+
+    return false;
 }
 
 function corsOriginFromUrl(string $url): ?string
@@ -544,11 +572,11 @@ function auditActionCodeFromLabel(string $action): string
         'zmieniono' => 'entity.updated',
         'ustawiono has' => 'user.password.set',
         'wyslano' => 'message.sent',
-        'wysĹ‚ano' => 'message.sent',
+        'wysłano' => 'message.sent',
         'wyeksportowano' => 'export.created',
-        'usuniÄ™to' => 'entity.deleted',
+        'usunięto' => 'entity.deleted',
         'zarchiwizowano' => 'entity.archived',
-        'przywrĂłcono' => 'entity.restored',
+        'przywrócono' => 'entity.restored',
     ];
     foreach ($known as $needle => $code) {
         if (str_contains($normalized, strtolower($needle))) {
@@ -562,7 +590,7 @@ function auditCategoryFromAction(string $actionCode, string $action): string
 {
     $value = strtolower($actionCode . ' ' . normalizeUtf8String($action));
     foreach ([
-        'authentication' => ['auth.', 'logow', 'hasĹ‚'],
+        'authentication' => ['auth.', 'logow', 'hasł'],
         'users' => ['user', 'konto', 'operator', 'admin'],
         'organizations' => ['organization', 'organizac'],
         'events' => ['event', 'wydarze'],
@@ -824,7 +852,7 @@ function appUrl(): string
 
 function qrCodeImageUrl(string $token): string
 {
-    return appUrl() . '/qr-images/' . rawurlencode($token) . '.svg';
+    return appUrl() . '/qr-images/' . rawurlencode($token) . '.png';
 }
 
 function passwordResetTokenHash(string $token): string
@@ -1284,6 +1312,38 @@ function openApiDocument(): array
                     ],
                 ],
             ],
+            '/qr-images/{token}.png' => [
+                'get' => [
+                    'tags' => ['Participants'],
+                    'summary' => 'Render participant QR code as PNG',
+                    'parameters' => [
+                        [
+                            'name' => 'token',
+                            'in' => 'path',
+                            'required' => true,
+                            'schema' => [
+                                'type' => 'string',
+                            ],
+                        ],
+                    ],
+                    'responses' => [
+                        '200' => [
+                            'description' => 'QR code image',
+                            'content' => [
+                                'image/png' => [
+                                    'schema' => [
+                                        'type' => 'string',
+                                        'format' => 'binary',
+                                    ],
+                                ],
+                            ],
+                        ],
+                        '404' => [
+                            '$ref' => '#/components/responses/NotFound',
+                        ],
+                    ],
+                ],
+            ],
             '/bootstrap' => [
                 'get' => [
                     'tags' => ['Bootstrap'],
@@ -1405,6 +1465,17 @@ function openApiDocument(): array
                     ],
                 ],
             ],
+            '/superadmin/database' => [
+                'get' => [
+                    'tags' => ['Superadmin'],
+                    'summary' => 'Load masked database diagnostics',
+                    'security' => [['bearerAuth' => []]],
+                    'responses' => [
+                        '200' => ['description' => 'Database table list and masked paginated rows'],
+                        '403' => ['$ref' => '#/components/responses/Forbidden'],
+                    ],
+                ],
+            ],
             '/superadmin/logging-status' => [
                 'get' => [
                     'tags' => ['Superadmin'],
@@ -1470,6 +1541,41 @@ function openApiDocument(): array
                         '401' => [
                             '$ref' => '#/components/responses/Brak autoryzacji',
                         ],
+                    ],
+                ],
+            ],
+            '/events/test' => [
+                'post' => [
+                    'tags' => ['Events'],
+                    'summary' => 'Create test event sandbox with sample participants',
+                    'security' => [
+                        ['bearerAuth' => []],
+                    ],
+                    'requestBody' => [
+                        'required' => true,
+                        'content' => [
+                            'application/json' => [
+                                'schema' => [
+                                    'type' => 'object',
+                                    'required' => ['organization_id'],
+                                    'properties' => [
+                                        'organization_id' => ['type' => 'string', 'example' => 'org-1'],
+                                    ],
+                                ],
+                            ],
+                        ],
+                    ],
+                    'responses' => [
+                        '201' => [
+                            'description' => 'Test event created',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => ['$ref' => '#/components/schemas/TestEventSandboxResponse'],
+                                ],
+                            ],
+                        ],
+                        '403' => ['$ref' => '#/components/responses/Forbidden'],
+                        '422' => ['description' => 'Validation error'],
                     ],
                 ],
             ],
@@ -1613,6 +1719,35 @@ function openApiDocument(): array
                         '401' => [
                             '$ref' => '#/components/responses/Brak autoryzacji',
                         ],
+                    ],
+                ],
+            ],
+            '/events/{id}/test-reset' => [
+                'post' => [
+                    'tags' => ['Events'],
+                    'summary' => 'Reset sample data and office window for a test event',
+                    'security' => [
+                        ['bearerAuth' => []],
+                    ],
+                    'parameters' => [
+                        [
+                            'name' => 'id',
+                            'in' => 'path',
+                            'required' => true,
+                            'schema' => ['type' => 'string'],
+                        ],
+                    ],
+                    'responses' => [
+                        '200' => [
+                            'description' => 'Test event reset',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => ['$ref' => '#/components/schemas/TestEventSandboxResponse'],
+                                ],
+                            ],
+                        ],
+                        '403' => ['$ref' => '#/components/responses/Forbidden'],
+                        '422' => ['description' => 'Not a test event'],
                     ],
                 ],
             ],
@@ -2195,6 +2330,47 @@ function openApiDocument(): array
                                     ],
                                 ],
                             ],
+                        ],
+                        '401' => [
+                            '$ref' => '#/components/responses/Brak autoryzacji',
+                        ],
+                    ],
+                ],
+            ],
+            '/events/{id}/qr-email-deliveries' => [
+                'get' => [
+                    'tags' => ['Events'],
+                    'summary' => 'QR email delivery statuses for event participants',
+                    'description' => 'Zwraca statusy dostarczenia maili z kodami QR per uczestnik (na zywo z central-mailera), wraz z informacja czy mail poszedl w wysylce masowej. Gdy mailer jest niedostepny, zwraca mailer_available=false i lokalny stan wysylki.',
+                    'security' => [
+                        ['bearerAuth' => []],
+                    ],
+                    'parameters' => [
+                        [
+                            'name' => 'id',
+                            'in' => 'path',
+                            'required' => true,
+                            'schema' => [
+                                'type' => 'string',
+                            ],
+                        ],
+                    ],
+                    'responses' => [
+                        '200' => [
+                            'description' => 'Delivery status report',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => [
+                                        '$ref' => '#/components/schemas/EventQrEmailDeliveriesResponse',
+                                    ],
+                                ],
+                            ],
+                        ],
+                        '403' => [
+                            '$ref' => '#/components/responses/Brak uprawnień',
+                        ],
+                        '404' => [
+                            '$ref' => '#/components/responses/NotFound',
                         ],
                         '401' => [
                             '$ref' => '#/components/responses/Brak autoryzacji',
@@ -3644,9 +3820,29 @@ function openApiDocument(): array
                         ],
                     ],
                 ],
+                'EventOfficeHourRange' => [
+                    'type' => 'object',
+                    'required' => ['opens_at', 'closes_at'],
+                    'properties' => [
+                        'opens_at' => ['type' => 'string', 'format' => 'date-time', 'example' => '2026-04-12T07:00:00'],
+                        'closes_at' => ['type' => 'string', 'format' => 'date-time', 'example' => '2026-04-12T15:00:00'],
+                    ],
+                ],
+                'EventOfficeLocation' => [
+                    'type' => 'object',
+                    'required' => ['name', 'hours'],
+                    'properties' => [
+                        'name' => ['type' => 'string', 'example' => 'Gniezno, Park Miejski'],
+                        'google_maps_url' => ['type' => 'string', 'nullable' => true, 'example' => 'https://maps.google.com/?q=Park+Miejski+Gniezno'],
+                        'hours' => [
+                            'type' => 'array',
+                            'items' => ['$ref' => '#/components/schemas/EventOfficeHourRange'],
+                        ],
+                    ],
+                ],
                 'Event' => [
                     'type' => 'object',
-                    'required' => ['id', 'name', 'location', 'organization_id', 'office_open_at', 'office_close_at'],
+                    'required' => ['id', 'name', 'location', 'organization_id', 'office_open_at', 'office_close_at', 'office_locations', 'is_test'],
                     'properties' => [
                         'id' => ['type' => 'string', 'example' => 'evt-1'],
                         'name' => ['type' => 'string', 'example' => 'Bieg Piastowski 10km'],
@@ -3654,6 +3850,11 @@ function openApiDocument(): array
                         'organization_id' => ['type' => 'string', 'example' => 'org-1'],
                         'office_open_at' => ['type' => 'string', 'format' => 'date-time', 'example' => '2026-04-12T07:00:00'],
                         'office_close_at' => ['type' => 'string', 'format' => 'date-time', 'example' => '2026-04-12T15:00:00'],
+                        'office_locations' => [
+                            'type' => 'array',
+                            'items' => ['$ref' => '#/components/schemas/EventOfficeLocation'],
+                        ],
+                        'is_test' => ['type' => 'boolean', 'example' => false],
                     ],
                 ],
                 'EventResponse' => [
@@ -3667,13 +3868,36 @@ function openApiDocument(): array
                 ],
                 'CreateEventRequest' => [
                     'type' => 'object',
-                    'required' => ['name', 'location', 'organization_id', 'office_open_at', 'office_close_at'],
+                    'required' => ['name', 'location', 'organization_id', 'office_locations'],
                     'properties' => [
                         'name' => ['type' => 'string', 'example' => 'Bieg Jesienny 5km'],
                         'location' => ['type' => 'string', 'example' => 'Krakow, Blonia'],
                         'organization_id' => ['type' => 'string', 'example' => 'org-1'],
-                        'office_open_at' => ['type' => 'string', 'format' => 'date-time', 'example' => '2026-09-20T08:00:00'],
-                        'office_close_at' => ['type' => 'string', 'format' => 'date-time', 'example' => '2026-09-20T16:00:00'],
+                        'office_locations' => [
+                            'type' => 'array',
+                            'items' => ['$ref' => '#/components/schemas/EventOfficeLocation'],
+                        ],
+                    ],
+                ],
+                'TestEventSandboxResponse' => [
+                    'type' => 'object',
+                    'required' => ['data'],
+                    'properties' => [
+                        'data' => [
+                            'type' => 'object',
+                            'required' => ['event', 'participants', 'mappings'],
+                            'properties' => [
+                                'event' => ['$ref' => '#/components/schemas/Event'],
+                                'participants' => [
+                                    'type' => 'array',
+                                    'items' => ['$ref' => '#/components/schemas/Participant'],
+                                ],
+                                'mappings' => [
+                                    'type' => 'array',
+                                    'items' => ['$ref' => '#/components/schemas/ParticipantFieldMapping'],
+                                ],
+                            ],
+                        ],
                     ],
                 ],
                 'UpdateOrganizationEventLimitRequest' => [
@@ -3759,6 +3983,7 @@ function openApiDocument(): array
                         ],
                         'status' => ['type' => 'string', 'enum' => ['not_checked_in', 'checked_in', 'checked_in_not_starting']],
                         'email_status' => ['type' => 'string', 'enum' => ['not_sent', 'sent']],
+                        'payment_status' => ['type' => 'string', 'enum' => ['unknown', 'paid', 'unpaid']],
                         'checked_in_at' => ['type' => 'string', 'format' => 'date-time', 'nullable' => true],
                         'created_at' => ['type' => 'string', 'format' => 'date-time'],
                         'updated_at' => ['type' => 'string', 'format' => 'date-time'],
@@ -3782,7 +4007,7 @@ function openApiDocument(): array
                     'properties' => [
                         'source_column_name' => ['type' => 'string', 'example' => 'Imię'],
                         'alias' => ['type' => 'string', 'example' => 'Imię'],
-                        'field_role' => ['type' => 'string', 'enum' => ['email', 'display_name_part', 'bib_number', 'custom', 'important_custom']],
+                        'field_role' => ['type' => 'string', 'enum' => ['email', 'display_name_part', 'bib_number', 'payment_status', 'custom', 'important_custom']],
                         'display_order' => ['type' => 'integer', 'example' => 1],
                         'is_required' => ['type' => 'boolean'],
                         'is_active' => ['type' => 'boolean'],
@@ -3790,12 +4015,15 @@ function openApiDocument(): array
                 ],
                 'UpdateEventRequest' => [
                     'type' => 'object',
-                    'required' => ['name', 'location', 'office_open_at', 'office_close_at'],
+                    'required' => ['name', 'location', 'office_locations'],
                     'properties' => [
                         'name' => ['type' => 'string', 'example' => 'Bieg Jesienny 5km'],
                         'location' => ['type' => 'string', 'example' => 'Krakow, Blonia'],
-                        'office_open_at' => ['type' => 'string', 'format' => 'date-time', 'example' => '2026-09-20T08:00:00'],
-                        'office_close_at' => ['type' => 'string', 'format' => 'date-time', 'example' => '2026-09-20T16:00:00'],
+                        'office_locations' => [
+                            'type' => 'array',
+                            'items' => ['$ref' => '#/components/schemas/EventOfficeLocation'],
+                        ],
+                        'reopen_office' => ['type' => 'boolean', 'example' => false],
                     ],
                 ],
                 'UpdateOrganizationRequest' => [
@@ -3870,6 +4098,7 @@ function openApiDocument(): array
                         ],
                         'status' => ['type' => 'string', 'enum' => ['not_checked_in', 'checked_in', 'checked_in_not_starting']],
                         'email_status' => ['type' => 'string', 'enum' => ['not_sent', 'sent']],
+                        'payment_status' => ['type' => 'string', 'enum' => ['unknown', 'paid', 'unpaid']],
                         'checked_in_at' => ['type' => 'string', 'format' => 'date-time', 'nullable' => true],
                         'qr_code' => ['type' => 'string'],
                     ],
@@ -3899,6 +4128,7 @@ function openApiDocument(): array
                     'type' => 'object',
                     'properties' => [
                         'resend_all' => ['type' => 'boolean', 'default' => false],
+                        'payment_scope' => ['type' => 'string', 'enum' => ['all', 'paid_only'], 'default' => 'all'],
                     ],
                 ],
                 'EventQrEmailResponse' => [
@@ -3911,6 +4141,9 @@ function openApiDocument(): array
                             'properties' => [
                                 'sent_count' => ['type' => 'integer'],
                                 'error_count' => ['type' => 'integer'],
+                                'unpaid_count' => ['type' => 'integer'],
+                                'unknown_payment_count' => ['type' => 'integer'],
+                                'skipped_unpaid_count' => ['type' => 'integer'],
                                 'errors' => [
                                     'type' => 'array',
                                     'items' => [
@@ -3920,6 +4153,68 @@ function openApiDocument(): array
                                             'participant_id' => ['type' => 'integer', 'format' => 'int64'],
                                             'participant_name' => ['type' => 'string'],
                                             'error' => ['type' => 'string'],
+                                        ],
+                                    ],
+                                ],
+                            ],
+                        ],
+                    ],
+                ],
+                'EventQrEmailDeliveriesResponse' => [
+                    'type' => 'object',
+                    'required' => ['data'],
+                    'properties' => [
+                        'data' => [
+                            'type' => 'object',
+                            'required' => ['event_id', 'generated_at', 'mailer_available', 'mailer_error', 'summary', 'participants'],
+                            'properties' => [
+                                'event_id' => ['type' => 'string'],
+                                'generated_at' => ['type' => 'string', 'format' => 'date-time'],
+                                'mailer_available' => ['type' => 'boolean'],
+                                'mailer_error' => ['type' => 'string', 'nullable' => true],
+                                'summary' => [
+                                    'type' => 'object',
+                                    'required' => ['participants_total', 'sent', 'queued', 'failed', 'bounced', 'unknown', 'no_data'],
+                                    'properties' => [
+                                        'participants_total' => ['type' => 'integer'],
+                                        'sent' => ['type' => 'integer'],
+                                        'queued' => ['type' => 'integer'],
+                                        'failed' => ['type' => 'integer'],
+                                        'bounced' => ['type' => 'integer'],
+                                        'unknown' => ['type' => 'integer'],
+                                        'no_data' => ['type' => 'integer'],
+                                    ],
+                                ],
+                                'participants' => [
+                                    'type' => 'array',
+                                    'items' => [
+                                        'type' => 'object',
+                                        'required' => ['participant_id', 'name', 'email', 'bib_number', 'local_email_status', 'delivery'],
+                                        'properties' => [
+                                            'participant_id' => ['type' => 'integer', 'format' => 'int64'],
+                                            'name' => ['type' => 'string'],
+                                            'email' => ['type' => 'string'],
+                                            'bib_number' => ['type' => 'string'],
+                                            'local_email_status' => ['type' => 'string', 'enum' => ['not_sent', 'sent']],
+                                            'delivery' => [
+                                                'type' => 'object',
+                                                'nullable' => true,
+                                                'required' => ['email_id', 'status', 'effective_status', 'is_batch', 'batch_id', 'sent_at', 'created_at', 'last_error', 'send_count'],
+                                                'properties' => [
+                                                    'email_id' => ['type' => 'string'],
+                                                    'status' => ['type' => 'string'],
+                                                    'effective_status' => [
+                                                        'type' => 'string',
+                                                        'enum' => ['pending', 'processing', 'retry', 'sent', 'failed', 'bounced', 'suppressed', 'unknown'],
+                                                    ],
+                                                    'is_batch' => ['type' => 'boolean'],
+                                                    'batch_id' => ['type' => 'string', 'nullable' => true],
+                                                    'sent_at' => ['type' => 'string', 'nullable' => true],
+                                                    'created_at' => ['type' => 'string', 'nullable' => true],
+                                                    'last_error' => ['type' => 'string', 'nullable' => true],
+                                                    'send_count' => ['type' => 'integer'],
+                                                ],
+                                            ],
                                         ],
                                     ],
                                 ],
@@ -4005,7 +4300,7 @@ function openApiDocument(): array
                     'properties' => [
                         'source_column_name' => ['type' => 'string'],
                         'alias' => ['type' => 'string'],
-                        'field_role' => ['type' => 'string', 'enum' => ['display_name_part', 'bib_number', 'custom', 'important_custom']],
+                        'field_role' => ['type' => 'string', 'enum' => ['display_name_part', 'bib_number', 'payment_status', 'custom', 'important_custom']],
                         'is_active' => ['type' => 'boolean'],
                     ],
                 ],

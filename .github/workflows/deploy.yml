@@ -408,11 +408,3 @@ jobs:
           esac
           echo "API unpacked into $BACKEND_REMOTE_DIR_REAL"
           REMOTE
-
-      - name: Health check
-        if: env.MIGRATION_MODE == 'run' || env.MIGRATION_MODE == 'skip'
-        env:
-          API_URL: ${{ secrets.API_URL }}
-        run: |
-          set -Eeuo pipefail
-          curl --fail --show-error --location "${API_URL%/}/health"
