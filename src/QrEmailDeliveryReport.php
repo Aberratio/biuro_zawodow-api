@@ -76,6 +76,41 @@ final class QrEmailDeliveryReport
         return ['summary' => $summary, 'participants' => $rows];
     }
 
+    /**
+     * Zwraca id uczestnikow, dla ktorych central-mailer ma juz maila w drodze albo dostarczonego.
+     * To jedyna wiarygodna ochrona przed duplikatami: lokalne email_status potrafi klamac, gdy
+     * odpowiedz mailera nie wrocila przed timeoutem, mimo ze paczka zostala zakolejkowana.
+     *
+     * Korelujemy wylacznie po metadata.participantId — dopasowanie po adresie e-mail dawaloby
+     * falszywe trafienia przy ponownym imporcie listy (ten sam adres, nowy rekord i nowy kod QR),
+     * a tu falszywe trafienie oznacza uczestnika, ktory nigdy nie dostanie maila.
+     *
+     * Statusy terminalnie nieudane (failed/suppressed/bounced) nie blokuja — tam ponowna proba
+     * jest pozadana. Status "unknown" blokuje: nie wiadomo, czy mail wyszedl, wiec dosylka
+     * moglaby zdublowac.
+     *
+     * @param list<array<string, mixed>> $mailerEmails
+     * @return array<int, true> mapa participantId => true, gotowa do isset()
+     */
+    public static function participantIdsAlreadyInMailer(array $mailerEmails): array
+    {
+        $blocking = [];
+        foreach ($mailerEmails as $email) {
+            $metadata = is_array($email['metadata'] ?? null) ? $email['metadata'] : [];
+            $participantId = (int)($metadata['participantId'] ?? 0);
+            if ($participantId <= 0) {
+                continue;
+            }
+            $effectiveStatus = (string)($email['effectiveStatus'] ?? $email['status'] ?? '');
+            if (!in_array($effectiveStatus, ['pending', 'processing', 'retry', 'sent', 'unknown'], true)) {
+                continue;
+            }
+            $blocking[$participantId] = true;
+        }
+
+        return $blocking;
+    }
+
     /** @param list<array<string, mixed>> $candidates */
     private static function delivery(array $candidates): ?array
     {

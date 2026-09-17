@@ -85,50 +85,112 @@ final class MailService
         );
     }
 
-    public static function sendParticipantQrEmailBatch(array $messages, ?string $eventId = null): void
+    /**
+     * Przekazuje kody QR do central-mailera paczkami po CENTRAL_MAILER_BATCH_SIZE odbiorcow.
+     *
+     * Wysylka nie jest juz "wszystko albo nic": kazdy chunk leci osobno, a wynik mowi, ktorzy
+     * uczestnicy faktycznie trafili do kolejki. Dzieki temu timeout albo odrzucenie jednego
+     * chunku nie kasuje wysylki dla pozostalych — wolajacy oznacza jako wyslanych tylko
+     * potwierdzonych, a ponowne klikniecie dosyla wylacznie reszte.
+     *
+     * @param list<array<string, mixed>> $messages
+     * @return array{sentParticipantIds: list<int>, failures: list<array{chunkIndex: int, participantIds: list<int>, error: string}>}
+     */
+    public static function sendParticipantQrEmailBatch(array $messages, ?string $eventId = null): array
     {
-        $recipients = [];
-        foreach ($messages as $message) {
-            $payload = self::participantQrPayload(
-                recipientEmail: (string)($message['recipientEmail'] ?? ''),
-                recipientName: (string)($message['recipientName'] ?? ''),
-                eventName: (string)($message['eventName'] ?? ''),
-                officeLocations: is_array($message['officeLocations'] ?? null) ? $message['officeLocations'] : [],
-                eventLocation: (string)($message['eventLocation'] ?? ''),
-                bibNumber: (string)($message['bibNumber'] ?? ''),
-                qrToken: (string)($message['qrToken'] ?? ''),
-                participantCustomFields: is_array($message['participantCustomFields'] ?? null) ? $message['participantCustomFields'] : [],
-                participantImportantFieldAliases: is_array($message['participantImportantFieldAliases'] ?? null) ? $message['participantImportantFieldAliases'] : [],
-                participantId: isset($message['participantId']) ? (int)$message['participantId'] : null,
-                eventId: $eventId
-            );
-            unset($payload['priority']);
-            $recipients[] = $payload;
+        $result = ['sentParticipantIds' => [], 'failures' => []];
+        if ($messages === []) {
+            return $result;
         }
 
-        if ($recipients === []) {
-            return;
-        }
+        $batchSize = max(1, (int)(getenv('CENTRAL_MAILER_BATCH_SIZE') ?: 50));
 
-        $batchSize = max(1, (int)(getenv('CENTRAL_MAILER_BATCH_SIZE') ?: 500));
-        foreach (array_chunk($recipients, $batchSize) as $index => $recipientChunk) {
+        foreach (array_chunk($messages, $batchSize) as $index => $messageChunk) {
+            $participantIds = [];
+            $recipients = [];
+            // Kody QR renderujemy dopiero tutaj, per chunk: 1600 PNG-ow naraz to kilkadziesiat
+            // MB w pamieci PHP, a do wyslania paczki potrzebny jest tylko biezacy kawalek.
+            foreach ($messageChunk as $message) {
+                $participantId = isset($message['participantId']) ? (int)$message['participantId'] : null;
+                if ($participantId !== null && $participantId > 0) {
+                    $participantIds[] = $participantId;
+                }
+                $payload = self::participantQrPayload(
+                    recipientEmail: (string)($message['recipientEmail'] ?? ''),
+                    recipientName: (string)($message['recipientName'] ?? ''),
+                    eventName: (string)($message['eventName'] ?? ''),
+                    officeLocations: is_array($message['officeLocations'] ?? null) ? $message['officeLocations'] : [],
+                    eventLocation: (string)($message['eventLocation'] ?? ''),
+                    bibNumber: (string)($message['bibNumber'] ?? ''),
+                    qrToken: (string)($message['qrToken'] ?? ''),
+                    participantCustomFields: is_array($message['participantCustomFields'] ?? null) ? $message['participantCustomFields'] : [],
+                    participantImportantFieldAliases: is_array($message['participantImportantFieldAliases'] ?? null) ? $message['participantImportantFieldAliases'] : [],
+                    participantId: $participantId,
+                    eventId: $eventId
+                );
+                unset($payload['priority']);
+                $recipients[] = $payload;
+            }
+
+            if ($recipients === []) {
+                continue;
+            }
+
             $payload = [
                 'subject' => 'Kody QR uczestnikow',
                 'html' => '<p>Kod QR uczestnika jest gotowy.</p>',
                 'text' => 'Kod QR uczestnika jest gotowy.',
                 'priority' => self::PRIORITY_NORMAL,
                 'metadata' => ['type' => 'participant_qr_batch', 'chunkIndex' => $index],
-                'recipients' => $recipientChunk,
+                'recipients' => $recipients,
             ];
             if ($eventId !== null && $eventId !== '') {
                 $payload['contextId'] = $eventId;
             }
-            self::sendQueuedEmail(
-                endpoint: '/emails/batch',
-                payload: $payload,
-                idempotencyKey: self::idempotencyKey('participant-qr-batch', json_encode($recipientChunk, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR) . '|' . $index . '|' . bin2hex(random_bytes(8)))
-            );
+
+            try {
+                self::sendQueuedEmail(
+                    endpoint: '/emails/batch',
+                    payload: $payload,
+                    idempotencyKey: self::participantQrBatchIdempotencyKey($eventId, $messageChunk)
+                );
+                foreach ($participantIds as $participantId) {
+                    $result['sentParticipantIds'][] = $participantId;
+                }
+            } catch (Throwable $exception) {
+                self::logException($exception, 'central_mailer.participant_qr_batch_chunk_failed');
+                $result['failures'][] = [
+                    'chunkIndex' => $index,
+                    'participantIds' => $participantIds,
+                    'error' => $exception->getMessage(),
+                ];
+            }
         }
+
+        return $result;
+    }
+
+    /**
+     * Klucz idempotencji musi byc deterministyczny. Gdy odpowiedz central-mailera nie zdazy
+     * wrocic przed timeoutem, paczka i tak moze byc juz zapisana w kolejce — ponowna proba ma
+     * byc wtedy replayem, a nie druga wysylka tych samych maili.
+     *
+     * Odcisk liczymy z zawartosci chunku (adres + token QR), nie z jego pozycji, wiec przy
+     * dosylce reszty uczestnikow inny podzial na paczki nie udaje nagle "tej samej" paczki.
+     *
+     * @param list<array<string, mixed>> $messageChunk
+     */
+    private static function participantQrBatchIdempotencyKey(?string $eventId, array $messageChunk): string
+    {
+        $fingerprint = [];
+        foreach ($messageChunk as $message) {
+            $fingerprint[] = ((string)($message['recipientEmail'] ?? '')) . '#' . ((string)($message['qrToken'] ?? ''));
+        }
+
+        return self::idempotencyKey(
+            'participant-qr-batch',
+            ((string)$eventId) . '|' . implode(',', $fingerprint)
+        );
     }
 
     private static function sendActionEmail(
@@ -248,6 +310,31 @@ final class MailService
         $query = http_build_query(['limit' => max(1, $limit), 'offset' => max(0, $offset)]);
 
         return self::request('GET', '/emails/context/' . rawurlencode($contextId) . '?' . $query);
+    }
+
+    /**
+     * Pobiera wszystkie maile zarejestrowane w central-mailerze dla danego kontekstu (wydarzenia),
+     * stronicujac az do wyczerpania. Twardy limit stron chroni przed patologicznie duzym kontekstem.
+     *
+     * @return list<array<string, mixed>>
+     */
+    public static function fetchContextEmails(string $contextId, int $pageLimit = 1000, int $maxPages = 20): array
+    {
+        $emails = [];
+        $offset = 0;
+        for ($page = 0; $page < $maxPages; $page++) {
+            $response = self::getContextEmailStatuses($contextId, $pageLimit, $offset);
+            $pageEmails = is_array($response['emails'] ?? null) ? $response['emails'] : [];
+            foreach ($pageEmails as $email) {
+                $emails[] = $email;
+            }
+            if (($response['hasMore'] ?? false) !== true || $pageEmails === []) {
+                break;
+            }
+            $offset += $pageLimit;
+        }
+
+        return $emails;
     }
 
     private static function request(string $method, string $endpoint, ?array $payload = null, ?string $idempotencyKey = null): array

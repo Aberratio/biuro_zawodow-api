@@ -8370,20 +8370,7 @@ try {
             $mailerError = 'test_mode';
         } else {
             try {
-                $offset = 0;
-                $pageLimit = 1000;
-                // Twardy limit stron chroni przed patologicznie duzymi kontekstami.
-                for ($page = 0; $page < 20; $page++) {
-                    $response = MailService::getContextEmailStatuses($eventId, $pageLimit, $offset);
-                    $emails = is_array($response['emails'] ?? null) ? $response['emails'] : [];
-                    foreach ($emails as $email) {
-                        $mailerEmails[] = $email;
-                    }
-                    if (($response['hasMore'] ?? false) !== true || $emails === []) {
-                        break;
-                    }
-                    $offset += $pageLimit;
-                }
+                $mailerEmails = MailService::fetchContextEmails($eventId);
             } catch (Throwable $exception) {
                 // Degradacja: biuro zobaczy lokalny stan wysylki zamiast bledu.
                 $mailerAvailable = false;
@@ -8476,6 +8463,39 @@ try {
         $qrEmailMessages = [];
         $queuedParticipantRows = [];
 
+        // Ochrona przed duplikatami. Lokalne email_status potrafi klamac: gdy odpowiedz mailera
+        // nie zdazy wrocic przed timeoutem, paczka jest juz zakolejkowana, a uczestnicy nadal maja
+        // email_status inny niz 'sent'. Zrodlem prawdy jest wiec central-mailer, nie nasza baza.
+        $alreadyInMailer = [];
+        $reconciledCount = 0;
+        if (!$isTestEvent($event) && !$resendAll) {
+            try {
+                $alreadyInMailer = QrEmailDeliveryReport::participantIdsAlreadyInMailer(
+                    MailService::fetchContextEmails($eventId)
+                );
+            } catch (Throwable $exception) {
+                // Bez potwierdzenia z mailera nie wysylamy nic: przy 1600 uczestnikach slepa
+                // wysylka oznaczalaby 1600 duplikatow u ludzi, ktorzy maila juz dostali.
+                jsonResponse(503, [
+                    'error' => 'Nie udalo sie sprawdzic w central-mailerze, ktore kody QR juz wyslano. '
+                        . 'Wysylka zostala wstrzymana, zeby nie zdublowac maili. Szczegoly: '
+                        . $exception->getMessage(),
+                    'code' => 'mailer_status_unavailable',
+                ]);
+                exit;
+            }
+
+            // Skoro mailer potwierdza wysylke, doprowadzamy lokalny stan do prawdy — inaczej
+            // biuro widzi "niewyslane" przy kazdym kolejnym wejsciu na liste.
+            foreach ($participants as $participantRow) {
+                $participantId = (int)$participantRow['id'];
+                if (isset($alreadyInMailer[$participantId]) && (string)$participantRow['email_status'] !== 'sent') {
+                    $updateSentEmailStatusStmt->execute(['email_status' => 'sent', 'id' => $participantId]);
+                    $reconciledCount++;
+                }
+            }
+        }
+
         foreach ($participants as $participantRow) {
             $decodedCustomFields = decodeJsonObject($participantRow['custom_fields_json'] ?? null);
             $participantFieldMetadata = $extractParticipantFieldMetadata($decodedCustomFields);
@@ -8495,7 +8515,8 @@ try {
                 continue;
             }
 
-            if (!$resendAll && (string)$participantRow['email_status'] === 'sent') {
+            if (!$resendAll && ((string)$participantRow['email_status'] === 'sent'
+                || isset($alreadyInMailer[(int)$participantRow['id']]))) {
                 continue;
             }
 
@@ -8548,22 +8569,32 @@ try {
             exit;
         }
 
-        try {
-            MailService::sendParticipantQrEmailBatch($qrEmailMessages, $eventId);
-            foreach ($queuedParticipantRows as $participantRow) {
-                $updateSentEmailStatusStmt->execute([
-                    'email_status' => 'sent',
-                    'id' => (int)$participantRow['id'],
-                ]);
-            }
-            $sentCount = count($queuedParticipantRows);
-        } catch (Throwable $exception) {
-            $errorCount = count($queuedParticipantRows);
-            foreach ($queuedParticipantRows as $participantRow) {
+        // Wysylka idzie paczkami i kazda odpowiada za siebie: uczestnika oznaczamy jako
+        // wyslanego tylko wtedy, gdy central-mailer potwierdzil przyjecie jego paczki.
+        // Wczesniej jeden bledny chunk kasowal wynik calej wysylki i nikt nie byl oznaczony,
+        // mimo ze maile poszly — a ponowne klikniecie dublowalo je u uczestnikow.
+        $participantNamesById = [];
+        foreach ($queuedParticipantRows as $participantRow) {
+            $participantNamesById[(int)$participantRow['id']] = (string)$participantRow['display_name'];
+        }
+
+        $batchResult = MailService::sendParticipantQrEmailBatch($qrEmailMessages, $eventId);
+
+        foreach ($batchResult['sentParticipantIds'] as $participantId) {
+            $updateSentEmailStatusStmt->execute([
+                'email_status' => 'sent',
+                'id' => (int)$participantId,
+            ]);
+        }
+        $sentCount = count($batchResult['sentParticipantIds']);
+
+        foreach ($batchResult['failures'] as $failure) {
+            foreach ($failure['participantIds'] as $participantId) {
+                $errorCount++;
                 $errors[] = [
-                    'participant_id' => (int)$participantRow['id'],
-                    'participant_name' => (string)$participantRow['display_name'],
-                    'error' => $exception->getMessage(),
+                    'participant_id' => (int)$participantId,
+                    'participant_name' => $participantNamesById[(int)$participantId] ?? '',
+                    'error' => (string)$failure['error'],
                 ];
             }
         }
@@ -8590,6 +8621,8 @@ try {
                 'unpaid_count' => $unpaidCount,
                 'unknown_payment_count' => $unknownPaymentCount,
                 'skipped_unpaid_count' => $skippedUnpaidCount,
+                // Ilu uczestnikow mialo maila juz w central-mailerze mimo lokalnego "niewyslane".
+                'reconciled_count' => $reconciledCount,
             ],
         ]);
         exit;
