@@ -4570,6 +4570,52 @@ try {
             );
         }
 
+        $archivedIssueRows = $pdo->query("
+            SELECT
+                oia.issue_id, oia.severity, oia.category, oia.title, oia.description, oia.issue_count,
+                oia.organization_id, o.name AS organization_name,
+                oia.event_id, e.name AS event_name,
+                oia.archived_by_user_id, oia.archived_by_name_snapshot, oia.archived_reason,
+                DATE_FORMAT(oia.archived_at, '%Y-%m-%dT%H:%i:%s') AS archived_at
+            FROM operational_issue_archives oia
+            LEFT JOIN organizations o ON o.id = oia.organization_id
+            LEFT JOIN events e ON e.id = oia.event_id
+            ORDER BY oia.archived_at DESC
+        ")->fetchAll();
+
+        $archivedIssueIds = array_flip(array_map(
+            static fn(array $row): string => (string)$row['issue_id'],
+            $archivedIssueRows
+        ));
+
+        $archivedIssues = array_map(static function (array $row): array {
+            return [
+                'id' => (string)$row['issue_id'],
+                'severity' => (string)$row['severity'],
+                'category' => (string)$row['category'],
+                'title' => (string)$row['title'],
+                'description' => (string)$row['description'],
+                'count' => (int)$row['issue_count'],
+                'organization_id' => $row['organization_id'] !== null ? (string)$row['organization_id'] : null,
+                'organization_name' => $row['organization_name'] !== null ? (string)$row['organization_name'] : null,
+                'event_id' => $row['event_id'] !== null ? (string)$row['event_id'] : null,
+                'event_name' => $row['event_name'] !== null ? (string)$row['event_name'] : null,
+                'archived_by_user_id' => (string)$row['archived_by_user_id'],
+                'archived_by_name' => (string)$row['archived_by_name_snapshot'],
+                'archived_reason' => (string)$row['archived_reason'],
+                'archived_at' => (string)$row['archived_at'],
+            ];
+        }, $archivedIssueRows);
+
+        $excludeArchivedIssues = static function (array $issues) use ($archivedIssueIds): array {
+            return array_values(array_filter(
+                $issues,
+                static fn(array $issue): bool => !isset($archivedIssueIds[(string)$issue['id']])
+            ));
+        };
+        $alerts = $excludeArchivedIssues($alerts);
+        $qualityIssues = $excludeArchivedIssues($qualityIssues);
+
         $severityOrder = ['critical' => 0, 'warning' => 1, 'info' => 2];
         $sortIssues = static function (array &$issues) use ($severityOrder): void {
             usort($issues, static function (array $left, array $right) use ($severityOrder): int {
@@ -4601,6 +4647,111 @@ try {
             'alerts' => $alerts,
             'sync_events' => $syncEvents,
             'quality_issues' => $qualityIssues,
+            'archived_issues' => $archivedIssues,
+        ]);
+        exit;
+    }
+
+    if ($path === '/superadmin/operations/archived-issues' && $method === 'POST') {
+        $authUser = requireAnyRole(['superadmin'], $resolveAuthenticatedUser);
+        $input = readJsonBody();
+
+        $issueId = trim((string)($input['issue_id'] ?? ''));
+        $severity = trim((string)($input['severity'] ?? ''));
+        $category = trim((string)($input['category'] ?? ''));
+        $title = trim((string)($input['title'] ?? ''));
+        $description = trim((string)($input['description'] ?? ''));
+        $issueCount = (int)($input['count'] ?? 0);
+        $organizationId = trim((string)($input['organization_id'] ?? '')) ?: null;
+        $eventId = trim((string)($input['event_id'] ?? '')) ?: null;
+        $reason = trim((string)($input['reason'] ?? ''));
+
+        if ($issueId === '' || $severity === '' || $category === '' || $title === '') {
+            jsonResponse(422, ['error' => 'Brak danych ostrzezenia do zarchiwizowania']);
+            exit;
+        }
+
+        if ($reason === '') {
+            jsonResponse(422, ['error' => 'Podaj powod archiwizacji']);
+            exit;
+        }
+
+        if (!in_array($severity, ['critical', 'warning', 'info'], true)) {
+            jsonResponse(422, ['error' => 'Nieprawidlowy poziom istotnosci']);
+            exit;
+        }
+
+        $stmt = $pdo->prepare('
+            INSERT INTO operational_issue_archives (
+                issue_id, severity, category, title, description, issue_count,
+                organization_id, event_id,
+                archived_by_user_id, archived_by_name_snapshot, archived_reason, archived_at
+            ) VALUES (
+                :issue_id, :severity, :category, :title, :description, :issue_count,
+                :organization_id, :event_id,
+                :archived_by_user_id, :archived_by_name_snapshot, :archived_reason, UTC_TIMESTAMP()
+            )
+            ON DUPLICATE KEY UPDATE
+                severity = VALUES(severity),
+                category = VALUES(category),
+                title = VALUES(title),
+                description = VALUES(description),
+                issue_count = VALUES(issue_count),
+                organization_id = VALUES(organization_id),
+                event_id = VALUES(event_id),
+                archived_by_user_id = VALUES(archived_by_user_id),
+                archived_by_name_snapshot = VALUES(archived_by_name_snapshot),
+                archived_reason = VALUES(archived_reason),
+                archived_at = VALUES(archived_at)
+        ');
+        $stmt->execute([
+            'issue_id' => $issueId,
+            'severity' => $severity,
+            'category' => $category,
+            'title' => $title,
+            'description' => $description,
+            'issue_count' => $issueCount,
+            'organization_id' => $organizationId,
+            'event_id' => $eventId,
+            'archived_by_user_id' => $authUser['id'],
+            'archived_by_name_snapshot' => $authUser['name'],
+            'archived_reason' => $reason,
+        ]);
+
+        addAuditLog($pdo, [
+            'category' => 'system',
+            'action_code' => 'operational_issue.archived',
+            'action' => sprintf('Zarchiwizowano ostrzezenie operacyjne: %s', $title),
+            'severity' => $severity,
+            'actor_user_id' => $authUser['id'],
+            'actor_name' => $authUser['name'],
+            'actor_role' => $authUser['role'],
+            'target_type' => 'operational_issue',
+            'target_id' => $issueId,
+            'organization_id' => $organizationId,
+            'event_id' => $eventId,
+            'metadata' => [
+                'reason' => $reason,
+                'category' => $category,
+                'count' => $issueCount,
+            ],
+        ]);
+
+        jsonResponse(200, [
+            'data' => [
+                'id' => $issueId,
+                'severity' => $severity,
+                'category' => $category,
+                'title' => $title,
+                'description' => $description,
+                'count' => $issueCount,
+                'organization_id' => $organizationId,
+                'event_id' => $eventId,
+                'archived_by_user_id' => (string)$authUser['id'],
+                'archived_by_name' => (string)$authUser['name'],
+                'archived_reason' => $reason,
+                'archived_at' => gmdate(DATE_ATOM),
+            ],
         ]);
         exit;
     }

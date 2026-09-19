@@ -1398,6 +1398,43 @@ function openApiDocument(): array
                     ],
                 ],
             ],
+            '/superadmin/operations/archived-issues' => [
+                'post' => [
+                    'tags' => ['Superadmin'],
+                    'summary' => 'Archive an operational alert or data quality issue with a reason',
+                    'security' => [
+                        ['bearerAuth' => []],
+                    ],
+                    'responses' => [
+                        '200' => [
+                            'description' => 'Issue archived',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => [
+                                        'type' => 'object',
+                                    ],
+                                ],
+                            ],
+                        ],
+                        '422' => [
+                            'description' => 'Missing issue data or archive reason',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => [
+                                        '$ref' => '#/components/schemas/ErrorResponse',
+                                    ],
+                                ],
+                            ],
+                        ],
+                        '401' => [
+                            '$ref' => '#/components/responses/Brak autoryzacji',
+                        ],
+                        '403' => [
+                            '$ref' => '#/components/responses/Brak uprawnień',
+                        ],
+                    ],
+                ],
+            ],
             '/superadmin/audit' => [
                 'get' => [
                     'tags' => ['Superadmin'],
