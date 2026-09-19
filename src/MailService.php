@@ -93,6 +93,10 @@ final class MailService
      * chunku nie kasuje wysylki dla pozostalych — wolajacy oznacza jako wyslanych tylko
      * potwierdzonych, a ponowne klikniecie dosyla wylacznie reszte.
      *
+     * Przyjeta paczka nie znaczy jeszcze, ze przyjeto kazdego odbiorce: zly albo zablokowany
+     * adres central-mailer zapisuje od razu jako `failed`. Taki uczestnik trafia do `failures`,
+     * a nie do `sentParticipantIds`, wiec zostaje "niewyslany" i dosyla sie po poprawce adresu.
+     *
      * @param list<array<string, mixed>> $messages
      * @return array{sentParticipantIds: list<int>, failures: list<array{chunkIndex: int, participantIds: list<int>, error: string}>}
      */
@@ -107,6 +111,8 @@ final class MailService
 
         foreach (array_chunk($messages, $batchSize) as $index => $messageChunk) {
             $participantIds = [];
+            // Rownolegle do $recipients (takze null), bo emails[i] z odpowiedzi odpowiada recipients[i].
+            $recipientParticipantIds = [];
             $recipients = [];
             // Kody QR renderujemy dopiero tutaj, per chunk: 1600 PNG-ow naraz to kilkadziesiat
             // MB w pamieci PHP, a do wyslania paczki potrzebny jest tylko biezacy kawalek.
@@ -114,7 +120,10 @@ final class MailService
                 $participantId = isset($message['participantId']) ? (int)$message['participantId'] : null;
                 if ($participantId !== null && $participantId > 0) {
                     $participantIds[] = $participantId;
+                } else {
+                    $participantId = null;
                 }
+                $recipientParticipantIds[] = $participantId;
                 $payload = self::participantQrPayload(
                     recipientEmail: (string)($message['recipientEmail'] ?? ''),
                     recipientName: (string)($message['recipientName'] ?? ''),
@@ -149,12 +158,27 @@ final class MailService
             }
 
             try {
-                self::sendQueuedEmail(
+                $response = self::sendQueuedEmail(
                     endpoint: '/emails/batch',
                     payload: $payload,
                     idempotencyKey: self::participantQrBatchIdempotencyKey($eventId, $messageChunk)
                 );
-                foreach ($participantIds as $participantId) {
+                $emails = is_array($response['emails'] ?? null) ? array_values($response['emails']) : [];
+                // Bez statusu per odbiorca (niepelna odpowiedz) zostajemy przy przyjeciu calej paczki.
+                $hasRecipientStatuses = count($emails) === count($recipients);
+                foreach ($recipientParticipantIds as $recipientIndex => $participantId) {
+                    if ($participantId === null) {
+                        continue;
+                    }
+                    $email = $hasRecipientStatuses && is_array($emails[$recipientIndex]) ? $emails[$recipientIndex] : [];
+                    if (($email['status'] ?? null) === 'failed') {
+                        $result['failures'][] = [
+                            'chunkIndex' => $index,
+                            'participantIds' => [$participantId],
+                            'error' => self::rejectedRecipientMessage($email['lastError'] ?? null),
+                        ];
+                        continue;
+                    }
                     $result['sentParticipantIds'][] = $participantId;
                 }
             } catch (Throwable $exception) {
@@ -168,6 +192,17 @@ final class MailService
         }
 
         return $result;
+    }
+
+    private static function rejectedRecipientMessage(mixed $lastError): string
+    {
+        $reason = match ($lastError) {
+            'Recipient email is invalid' => 'nieprawidlowy adres e-mail',
+            'Recipient address is suppressed' => 'adres zablokowany w central-mailerze',
+            default => is_string($lastError) && trim($lastError) !== '' ? trim($lastError) : '',
+        };
+
+        return 'Central-mailer odrzucil adres odbiorcy' . ($reason !== '' ? ': ' . $reason : '') . '.';
     }
 
     /**

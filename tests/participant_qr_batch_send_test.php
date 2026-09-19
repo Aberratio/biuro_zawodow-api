@@ -236,6 +236,26 @@ test('keeps sending remaining chunks when one chunk fails', function (): void {
     });
 });
 
+test('does not mark recipients the mailer rejected as sent', function (): void {
+    // Literowka w adresie (gorkag@wp.ol) przechodzila jako "wyslany" i zbiorcze "wyslij"
+    // pomijalo ja juz na zawsze, choc mail nigdy nie wyszedl.
+    withCentralMailerStub('', 4, function (CentralMailerStub $stub): void {
+        $messages = qrBatchMessages(6);
+        $messages[1] = qrBatchMessage(2, 'literowka@rejected.test');
+        $messages[4] = qrBatchMessage(5, 'inna@rejected.test');
+
+        $result = MailService::sendParticipantQrEmailBatch($messages, 'evt-1');
+
+        assertSame([1, 3, 4, 6], $result['sentParticipantIds']);
+        assertSame([[2], [5]], array_column($result['failures'], 'participantIds'));
+        assertSame([0, 1], array_column($result['failures'], 'chunkIndex'));
+        assertSame(
+            'Central-mailer odrzucil adres odbiorcy: nieprawidlowy adres e-mail.',
+            $result['failures'][0]['error']
+        );
+    });
+});
+
 test('reports every chunk as failed when the mailer is completely down', function (): void {
     withCentralMailerStub('0,1', 5, function (CentralMailerStub $stub): void {
         $result = MailService::sendParticipantQrEmailBatch(qrBatchMessages(10), 'evt-1');

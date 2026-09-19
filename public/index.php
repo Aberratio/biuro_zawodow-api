@@ -8570,7 +8570,7 @@ try {
         }
 
         // Wysylka idzie paczkami i kazda odpowiada za siebie: uczestnika oznaczamy jako
-        // wyslanego tylko wtedy, gdy central-mailer potwierdzil przyjecie jego paczki.
+        // wyslanego tylko wtedy, gdy central-mailer przyjal jego paczke i nie odrzucil jego adresu.
         // Wczesniej jeden bledny chunk kasowal wynik calej wysylki i nikt nie byl oznaczony,
         // mimo ze maile poszly — a ponowne klikniecie dublowalo je u uczestnikow.
         $participantNamesById = [];

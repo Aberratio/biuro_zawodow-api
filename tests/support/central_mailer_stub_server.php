@@ -55,7 +55,19 @@ if ($chunkIndex !== null && in_array((string)$chunkIndex, $failChunks, true)) {
     return true;
 }
 
+// Jak prawdziwy mailer: status per odbiorca w kolejnosci `recipients`; adres w domenie
+// rejected.test udaje literowke, ktora mailer zapisuje od razu jako `failed`.
+$emails = [];
+foreach ($recipients as $i => $recipient) {
+    $rejected = str_ends_with((string)($recipient['to'] ?? ''), '@rejected.test');
+    $emails[] = [
+        'id' => sprintf('email-%s-%d', $chunkIndex ?? '0', $i),
+        'status' => $rejected ? 'failed' : 'pending',
+        'lastError' => $rejected ? 'Recipient email is invalid' : null,
+    ];
+}
+
 http_response_code(202);
-echo json_encode(['id' => 'batch-' . ($chunkIndex ?? '0'), 'emails' => []]);
+echo json_encode(['id' => 'batch-' . ($chunkIndex ?? '0'), 'emails' => $emails]);
 
 return true;
