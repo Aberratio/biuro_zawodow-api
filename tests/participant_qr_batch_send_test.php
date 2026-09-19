@@ -66,7 +66,10 @@ final class CentralMailerStub
                 'STUB_FAIL_FILE' => $this->failPath,
                 'PATH' => (string)getenv('PATH'),
                 'SystemRoot' => (string)getenv('SystemRoot'),
-            ]
+            ],
+            // Na Windows bez tego proc_open startuje cmd.exe, a proc_terminate zabija tylko jego:
+            // osierocony `php -S` trzyma potem stdout i `composer test` wisi w nieskonczonosc.
+            ['bypass_shell' => true]
         );
 
         if (!is_resource($this->process)) {
