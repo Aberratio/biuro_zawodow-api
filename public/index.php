@@ -1910,8 +1910,9 @@ try {
     };
 
     $ensureParticipantQrCode = static function (PDO $pdo, array $participant) use ($generateUniqueParticipantQrCode): array {
-        $qrCode = trim((string)($participant['qr_code'] ?? ''));
-        if (QrCodeService::isSecureToken($qrCode)) {
+        // Platform-issued start codes share this app's format and are kept as delivered.
+        // Only the start code is repaired here; the competitor code is issued by the platform and never rewritten.
+        if (!ParticipantCodePolicy::mustRegenerateStartCode($participant['qr_code'] ?? null)) {
             return $participant;
         }
 
@@ -1940,6 +1941,7 @@ try {
                 organization,
                 bib_number,
                 qr_code,
+                identity_code,
                 custom_fields_json,
                 status,
                 email_status,
@@ -1979,6 +1981,7 @@ try {
                 organization,
                 bib_number,
                 qr_code,
+                identity_code,
                 custom_fields_json,
                 status,
                 email_status,
@@ -2006,6 +2009,48 @@ try {
         return $ensureParticipantQrCode($pdo, $participant);
     };
 
+    $loadParticipantsByIdentityCode = static function (PDO $pdo, string $identityCode) use (&$ensureParticipantQrCode, $extractParticipantFieldMetadata): array {
+        $stmt = $pdo->prepare('
+            SELECT
+                id,
+                event_id,
+                participant_audit_key,
+                baseline_import_record_id,
+                first_name,
+                last_name,
+                display_name,
+                email,
+                organization,
+                bib_number,
+                qr_code,
+                identity_code,
+                custom_fields_json,
+                status,
+                email_status,
+                payment_status,
+                checked_in_at,
+                created_at,
+                updated_at
+            FROM participants
+            WHERE identity_code = :identity_code
+            ORDER BY id ASC
+            LIMIT 100
+        ');
+        $stmt->execute(['identity_code' => $identityCode]);
+
+        $participants = [];
+        foreach ($stmt->fetchAll() as $participant) {
+            $decodedCustomFields = decodeJsonObject($participant['custom_fields_json'] ?? null);
+            $participantFieldMetadata = $extractParticipantFieldMetadata($decodedCustomFields);
+            $participant['custom_fields'] = $participantFieldMetadata['custom_fields'];
+            $participant['important_field_aliases'] = $participantFieldMetadata['important_field_aliases'];
+            unset($participant['custom_fields_json']);
+            $participants[] = $ensureParticipantQrCode($pdo, $participant);
+        }
+
+        return $participants;
+    };
+
     $loadParticipantsByEventId = static function (PDO $pdo, string $eventId) use (&$ensureParticipantQrCode, $extractParticipantFieldMetadata): array {
         $stmt = $pdo->prepare('
             SELECT
@@ -2020,6 +2065,7 @@ try {
                 organization,
                 bib_number,
                 qr_code,
+                identity_code,
                 custom_fields_json,
                 status,
                 email_status,
@@ -2070,6 +2116,7 @@ try {
                 organization,
                 bib_number,
                 qr_code,
+                identity_code,
                 custom_fields_json,
                 status,
                 email_status,
@@ -2112,22 +2159,29 @@ try {
         ')->fetchAll();
     };
 
-    $serializeParticipantScanResponse = static function (array $participant, array $event, bool $canAccess): array {
+    $serializeScanParticipant = static function (array $participant): array {
         return [
-            'participant' => [
-                'id' => (int)$participant['id'],
-                'event_id' => (string)$participant['event_id'],
-                'display_name' => (string)$participant['display_name'],
-                'email' => (string)$participant['email'],
-                'bib_number' => (string)($participant['bib_number'] ?? ''),
-                'custom_fields' => $participant['custom_fields'] ?? [],
-                'important_field_aliases' => $participant['important_field_aliases'] ?? [],
-                'status' => (string)$participant['status'],
-                'email_status' => (string)$participant['email_status'],
-                'payment_status' => (string)($participant['payment_status'] ?? 'unknown'),
-                'checked_in_at' => $participant['checked_in_at'],
-                'qr_code' => (string)$participant['qr_code'],
-            ],
+            'id' => (int)$participant['id'],
+            'event_id' => (string)$participant['event_id'],
+            'display_name' => (string)$participant['display_name'],
+            'email' => (string)$participant['email'],
+            'bib_number' => (string)($participant['bib_number'] ?? ''),
+            'custom_fields' => $participant['custom_fields'] ?? [],
+            'important_field_aliases' => $participant['important_field_aliases'] ?? [],
+            'status' => (string)$participant['status'],
+            'email_status' => (string)$participant['email_status'],
+            'payment_status' => (string)($participant['payment_status'] ?? 'unknown'),
+            'checked_in_at' => $participant['checked_in_at'],
+            'qr_code' => (string)$participant['qr_code'],
+            'identity_code' => isset($participant['identity_code']) && $participant['identity_code'] !== null
+                ? (string)$participant['identity_code']
+                : null,
+        ];
+    };
+
+    $serializeParticipantScanResponse = static function (array $participant, array $event, bool $canAccess) use ($serializeScanParticipant): array {
+        return [
+            'participant' => $serializeScanParticipant($participant),
             'event' => [
                 'id' => (string)$event['id'],
                 'name' => (string)$event['name'],
@@ -2513,6 +2567,7 @@ try {
                 organization,
                 bib_number,
                 qr_code,
+                identity_code,
                 custom_fields_json,
                 status,
                 email_status,
@@ -2728,15 +2783,15 @@ try {
         string $organization = '',
         ?string $qrCode = null,
         ?string $participantAuditKey = null,
-        ?int $baselineImportRecordId = null
+        ?int $baselineImportRecordId = null,
+        ?string $identityCode = null
     ) use ($loadParticipantById, $generateUniqueParticipantQrCode, $encodeParticipantCustomFields, $isValidParticipantPaymentStatus): array {
         $nameParts = splitParticipantDisplayName($displayName);
         $resolvedBibNumber = $bibNumber !== null && trim($bibNumber) !== ''
             ? trim($bibNumber)
             : null;
-        $resolvedQrCode = $qrCode !== null && QrCodeService::isSecureToken(trim($qrCode))
-            ? trim($qrCode)
-            : $generateUniqueParticipantQrCode($pdo);
+        $resolvedQrCode = ParticipantCodePolicy::acceptedStartCode($qrCode) ?? $generateUniqueParticipantQrCode($pdo);
+        $resolvedIdentityCode = ParticipantCodePolicy::acceptedIdentityCode($identityCode);
         $resolvedImportantFieldAliases = [];
         if (isset($customFields['important_field_aliases']) && is_array($customFields['important_field_aliases'])) {
             $resolvedImportantFieldAliases = $customFields['important_field_aliases'];
@@ -2760,6 +2815,7 @@ try {
                 organization,
                 bib_number,
                 qr_code,
+                identity_code,
                 custom_fields_json,
                 status,
                 email_status,
@@ -2775,6 +2831,7 @@ try {
                 :organization,
                 :bib_number,
                 :qr_code,
+                :identity_code,
                 :custom_fields_json,
                 :status,
                 :email_status,
@@ -2792,6 +2849,7 @@ try {
             'organization' => $organization !== '' ? $organization : null,
             'bib_number' => $resolvedBibNumber,
             'qr_code' => $resolvedQrCode,
+            'identity_code' => $resolvedIdentityCode,
             'custom_fields_json' => $encodedCustomFields !== [] ? encodeJsonValue($encodedCustomFields) : null,
             'status' => 'not_checked_in',
             'email_status' => 'not_sent',
@@ -8584,6 +8642,7 @@ try {
                 organization,
                 bib_number,
                 qr_code,
+                identity_code,
                 custom_fields_json,
                 status,
                 email_status,
@@ -8927,6 +8986,82 @@ try {
             exit;
         }
 
+        $requestedEventId = trim((string)($input['event_id'] ?? ''));
+        $codeKind = ParticipantCodePolicy::classifyScannedCode($qrCode);
+
+        if ($codeKind === ParticipantCodePolicy::SCAN_INVALID_IDENTITY) {
+            jsonResponse(404, ['error' => 'Nie znaleziono uczestnika']);
+            exit;
+        }
+
+        if ($codeKind === ParticipantCodePolicy::SCAN_IDENTITY) {
+            $candidates = $loadParticipantsByIdentityCode($pdo, $qrCode);
+            $eventsById = [];
+            $accessibleEventIds = [];
+            $openOfficeEventIds = [];
+            foreach ($candidates as $candidate) {
+                $candidateEventId = trim((string)($candidate['event_id'] ?? ''));
+                if ($candidateEventId === '' || array_key_exists($candidateEventId, $eventsById)) {
+                    continue;
+                }
+
+                $candidateEvent = $loadEventById($pdo, $candidateEventId);
+                $eventsById[$candidateEventId] = $candidateEvent;
+                if ($candidateEvent !== false && $canAccessEvent($authUser, $candidateEvent)) {
+                    $accessibleEventIds[] = $candidateEventId;
+                    if ($isEventOfficeOpenNow($candidateEvent)) {
+                        $openOfficeEventIds[] = $candidateEventId;
+                    }
+                }
+            }
+
+            $resolution = ParticipantCodePolicy::resolveIdentityScan(
+                $candidates,
+                $accessibleEventIds,
+                $openOfficeEventIds,
+                $requestedEventId !== '' ? $requestedEventId : null
+            );
+
+            if ($resolution['status'] === ParticipantCodePolicy::NOT_FOUND) {
+                jsonResponse(404, ['error' => 'Nie znaleziono zapisu tego zawodnika na bieżące wydarzenie.']);
+                exit;
+            }
+
+            if ($resolution['status'] === ParticipantCodePolicy::AMBIGUOUS_EVENT) {
+                jsonResponse(409, [
+                    'error' => 'Ten kod tożsamości pasuje do zapisów w kilku wydarzeniach. Wybierz wydarzenie i zeskanuj kod ponownie.',
+                    'data' => [
+                        'events' => array_map(
+                            static fn (string $candidateEventId): array => [
+                                'id' => $candidateEventId,
+                                'name' => (string)($eventsById[$candidateEventId]['name'] ?? ''),
+                            ],
+                            $resolution['event_ids']
+                        ),
+                    ],
+                ]);
+                exit;
+            }
+
+            $identityParticipant = $resolution['participants'][0];
+            $identityEvent = $eventsById[$resolution['event_id']];
+            $addActivityLog(
+                $pdo,
+                'Skan QR',
+                (string)$identityEvent['id'],
+                (int)$identityParticipant['id'],
+                (string)$identityParticipant['display_name'],
+                (string)$authUser['id'],
+                (string)$authUser['name']
+            );
+
+            jsonResponse(200, ['data' => $serializeParticipantScanResponse($identityParticipant, $identityEvent, true) + [
+                'match' => 'identity',
+                'candidates' => array_map($serializeScanParticipant, $resolution['participants']),
+            ]]);
+            exit;
+        }
+
         $participant = $loadParticipantByQrCode($pdo, $qrCode);
         if ($participant === false) {
             jsonResponse(404, ['error' => 'Nie znaleziono uczestnika']);
@@ -8948,7 +9083,7 @@ try {
         if (!$canAccessEvent($authUser, $event)) {
             jsonResponse(403, [
                 'error' => 'Ten kod QR należy do uczestnika z innego wydarzenia niż aktualnie wybrane.',
-                'data' => $serializeParticipantScanResponse($participant, $event, false),
+                'data' => $serializeParticipantScanResponse($participant, $event, false) + ['match' => 'start'],
             ]);
             exit;
         }
@@ -8963,7 +9098,7 @@ try {
             (string)$authUser['name']
         );
 
-        jsonResponse(200, ['data' => $serializeParticipantScanResponse($participant, $event, true)]);
+        jsonResponse(200, ['data' => $serializeParticipantScanResponse($participant, $event, true) + ['match' => 'start']]);
         exit;
     }
 

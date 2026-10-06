@@ -13,7 +13,7 @@ final class ApplicationLogger
         'critical' => 500,
     ];
 
-    private const SENSITIVE_KEY_PATTERN = '/password|passphrase|secret|token|authorization|cookie|qr_code|dsn|smtp|db_|body|payload|csv/i';
+    private const SENSITIVE_KEY_PATTERN = '/password|passphrase|secret|token|authorization|cookie|qr_code|identity_code|dsn|smtp|db_|body|payload|csv/i';
 
     public static function log(string $level, string $eventCode, string $message, array $context = [], string $source = 'application'): ?string
     {

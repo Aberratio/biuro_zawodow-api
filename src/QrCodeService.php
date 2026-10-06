@@ -10,9 +10,12 @@ use Endroid\QrCode\Writer\SvgWriter;
 
 final class QrCodeService
 {
+    public const START_PREFIX = 'pqr_';
+    public const IDENTITY_PREFIX = 'zqr_';
+
     public static function generateToken(): string
     {
-        return 'pqr_' . bin2hex(random_bytes(24));
+        return self::START_PREFIX . bin2hex(random_bytes(24));
     }
 
     public static function isSecureToken(?string $token): bool
@@ -22,6 +25,15 @@ final class QrCodeService
         }
 
         return preg_match('/^pqr_[a-f0-9]{48}$/', $token) === 1;
+    }
+
+    public static function isIdentityToken(?string $token): bool
+    {
+        if (!is_string($token)) {
+            return false;
+        }
+
+        return preg_match('/^zqr_[a-f0-9]{48}$/', $token) === 1;
     }
 
     public static function renderSvg(string $payload, int $size = 320, int $margin = 12): string

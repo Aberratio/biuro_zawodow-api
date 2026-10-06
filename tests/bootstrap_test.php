@@ -199,6 +199,7 @@ test('masks sensitive database values without changing ordinary columns', functi
         ['name' => 'password'],
         ['name' => 'token_hash'],
         ['name' => 'qr_code'],
+        ['name' => 'identity_code'],
         ['name' => 'bucket_key'],
         ['name' => 'email'],
     ];
@@ -207,17 +208,20 @@ test('masks sensitive database values without changing ordinary columns', functi
         'password' => 'secret',
         'token_hash' => 'hash',
         'qr_code' => 'pqr_secret',
+        'identity_code' => 'zqr_secret',
         'bucket_key' => 'auth_login:anna@example.com',
         'email' => 'anna@example.com',
     ]];
 
     assertTrue(isSensitiveDatabaseColumn('PASSWORD'));
+    assertTrue(isSensitiveDatabaseColumn('identity_code'));
     assertFalse(isSensitiveDatabaseColumn('participant_audit_key'));
     assertSame([[
         'id' => 'user-1',
         'password' => '[MASKED]',
         'token_hash' => '[MASKED]',
         'qr_code' => '[MASKED]',
+        'identity_code' => '[MASKED]',
         'bucket_key' => '[MASKED]',
         'email' => 'anna@example.com',
     ]], maskSensitiveDatabaseRows($rows, $columns));
@@ -273,4 +277,13 @@ test('generates and validates participant QR tokens', function (): void {
     assertTrue(QrCodeService::isSecureToken($token));
     assertFalse(QrCodeService::isSecureToken('pqr_short'));
     assertFalse(QrCodeService::isSecureToken(null));
+    assertTrue(QrCodeService::isIdentityToken('zqr_' . bin2hex(random_bytes(24))));
+    assertFalse(QrCodeService::isIdentityToken(QrCodeService::generateToken()));
+});
+
+test('redacts identity codes in application log context', function (): void {
+    assertSame(
+        ['identity_code' => '[REDACTED]', 'event_id' => 'evt-1'],
+        ApplicationLogger::redact(['identity_code' => 'zqr_' . str_repeat('a', 48), 'event_id' => 'evt-1'])
+    );
 });

@@ -241,6 +241,10 @@ $adoptionChecks = [
         return $columnExists($pdo, 'event_participant_field_mappings', 'field_type')
             && $columnExists($pdo, 'event_participant_field_mappings', 'validation_rules_json');
     },
+    '027_add_participant_identity_code.php' => static function (PDO $pdo) use ($columnExists, $indexExists): bool {
+        return $columnExists($pdo, 'participants', 'identity_code')
+            && $indexExists($pdo, 'participants', 'idx_participants_identity_code_event');
+    },
 ];
 
 $pending = [];

@@ -6,6 +6,7 @@ require_once __DIR__ . '/Database.php';
 require_once __DIR__ . '/MailService.php';
 require_once __DIR__ . '/QrEmailDeliveryReport.php';
 require_once __DIR__ . '/QrCodeService.php';
+require_once __DIR__ . '/ParticipantCodePolicy.php';
 require_once __DIR__ . '/RequestContext.php';
 require_once __DIR__ . '/SentryBridge.php';
 require_once __DIR__ . '/ApplicationLogger.php';
@@ -1013,6 +1014,7 @@ function isSensitiveDatabaseColumn(string $columnName): bool
         'password',
         'token_hash',
         'qr_code',
+        'identity_code',
         'bucket_key',
     ], true);
 }
@@ -3188,6 +3190,16 @@ function openApiDocument(): array
                         '404' => [
                             '$ref' => '#/components/responses/NotFound',
                         ],
+                        '409' => [
+                            'description' => 'Identity code matches registrations in several events; data.events lists them',
+                            'content' => [
+                                'application/json' => [
+                                    'schema' => [
+                                        '$ref' => '#/components/schemas/ErrorResponse',
+                                    ],
+                                ],
+                            ],
+                        ],
                         '422' => [
                             'description' => 'Validation error',
                             'content' => [
@@ -4010,6 +4022,7 @@ function openApiDocument(): array
                         'organization' => ['type' => 'string', 'nullable' => true],
                         'bib_number' => ['type' => 'string', 'nullable' => true],
                         'qr_code' => ['type' => 'string', 'nullable' => true],
+                        'identity_code' => ['type' => 'string', 'nullable' => true, 'description' => 'Platform competitor identity code (zqr_ + 48 hex); null for locally created participants'],
                         'custom_fields' => [
                             'type' => 'object',
                             'additionalProperties' => ['type' => 'string'],
@@ -4113,7 +4126,8 @@ function openApiDocument(): array
                     'type' => 'object',
                     'required' => ['qr_code'],
                     'properties' => [
-                        'qr_code' => ['type' => 'string', 'example' => 'QR-evt-1-101'],
+                        'qr_code' => ['type' => 'string', 'example' => 'QR-evt-1-101', 'description' => 'Participant start code (pqr_ or legacy) or competitor identity code (zqr_)'],
+                        'event_id' => ['type' => 'string', 'description' => 'Optional current event; narrows an identity (zqr_) scan to that event'],
                     ],
                 ],
                 'ParticipantScanParticipant' => [
@@ -4138,6 +4152,7 @@ function openApiDocument(): array
                         'payment_status' => ['type' => 'string', 'enum' => ['unknown', 'paid', 'unpaid']],
                         'checked_in_at' => ['type' => 'string', 'format' => 'date-time', 'nullable' => true],
                         'qr_code' => ['type' => 'string'],
+                        'identity_code' => ['type' => 'string', 'nullable' => true],
                     ],
                 ],
                 'ParticipantScanResponse' => [
@@ -4148,6 +4163,12 @@ function openApiDocument(): array
                             'type' => 'object',
                             'required' => ['participant', 'event', 'access'],
                             'properties' => [
+                                'match' => ['type' => 'string', 'enum' => ['start', 'identity']],
+                                'candidates' => [
+                                    'type' => 'array',
+                                    'description' => 'Identity scans only: every registration of the competitor in the resolved event',
+                                    'items' => ['$ref' => '#/components/schemas/ParticipantScanParticipant'],
+                                ],
                                 'participant' => ['$ref' => '#/components/schemas/ParticipantScanParticipant'],
                                 'event' => ['$ref' => '#/components/schemas/Event'],
                                 'access' => [
