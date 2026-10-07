@@ -86,3 +86,20 @@ test('no repeated named placeholders in the identity lookup', function () use ($
     $insertSql = substr($insertBody, $insertSqlStart, 1500);
     assertSame(1, preg_match_all('/:identity_code\b/', $insertSql));
 });
+
+test('scan responses hide the identity code from callers without event access', function () use ($identityWiringRead): void {
+    $source = $identityWiringRead('public/index.php');
+    assertStringContains('$serializeScanParticipant = static function (array $participant, bool $includeIdentityCode = true): array', $source);
+    assertStringContains("'identity_code' => \$includeIdentityCode && isset(", $source);
+    assertStringContains("'participant' => \$serializeScanParticipant(\$participant, \$canAccess),", $source);
+    assertStringContains('$serializeParticipantScanResponse($participant, $event, false)', $source);
+});
+
+test('scan rejects a non string event_id before using it', function () use ($identityWiringRead): void {
+    $source = $identityWiringRead('public/index.php');
+    $start = strpos($source, "if (\$path === '/participants/scan' && \$method === 'POST')");
+    assertTrue($start !== false);
+    $body = substr($source, $start, 1500);
+    assertStringContains("isset(\$input['event_id']) && !is_string(\$input['event_id'])", $body);
+    assertStringContains('Pole event_id musi być tekstem', $body);
+});

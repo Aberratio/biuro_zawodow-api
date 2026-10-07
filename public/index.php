@@ -2159,7 +2159,7 @@ try {
         ')->fetchAll();
     };
 
-    $serializeScanParticipant = static function (array $participant): array {
+    $serializeScanParticipant = static function (array $participant, bool $includeIdentityCode = true): array {
         return [
             'id' => (int)$participant['id'],
             'event_id' => (string)$participant['event_id'],
@@ -2173,7 +2173,8 @@ try {
             'payment_status' => (string)($participant['payment_status'] ?? 'unknown'),
             'checked_in_at' => $participant['checked_in_at'],
             'qr_code' => (string)$participant['qr_code'],
-            'identity_code' => isset($participant['identity_code']) && $participant['identity_code'] !== null
+            // The competitor code is a long-lived secret: never expose it to a caller without access to the event.
+            'identity_code' => $includeIdentityCode && isset($participant['identity_code']) && $participant['identity_code'] !== null
                 ? (string)$participant['identity_code']
                 : null,
         ];
@@ -2181,7 +2182,7 @@ try {
 
     $serializeParticipantScanResponse = static function (array $participant, array $event, bool $canAccess) use ($serializeScanParticipant): array {
         return [
-            'participant' => $serializeScanParticipant($participant),
+            'participant' => $serializeScanParticipant($participant, $canAccess),
             'event' => [
                 'id' => (string)$event['id'],
                 'name' => (string)$event['name'],
@@ -8983,6 +8984,11 @@ try {
 
         if ($qrCode === '') {
             jsonResponse(422, ['error' => 'Pole qr_code jest wymagane']);
+            exit;
+        }
+
+        if (isset($input['event_id']) && !is_string($input['event_id'])) {
+            jsonResponse(422, ['error' => 'Pole event_id musi być tekstem']);
             exit;
         }
 
