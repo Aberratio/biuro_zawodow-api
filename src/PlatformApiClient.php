@@ -61,6 +61,69 @@ final class PlatformApiClient
         return ['status' => $status, 'participant_count' => $count, 'http_status' => $http > 0 ? $http : null];
     }
 
+    /**
+     * Downloads the whole participant list. Network errors, server errors and rate limiting are retried
+     * (1 s, then 3 s pause); authorisation and not-found answers never are. The result never contains
+     * headers, the token or exception text.
+     *
+     * @param null|callable(int): void $sleep
+     * @return array{status: string, http_status: ?int, body: ?string, attempts: int}
+     */
+    public function fetchParticipants(string $platformEventId, string $organizationToken, int $maxAttempts = 1, ?callable $sleep = null): array
+    {
+        $headers = [
+            'Accept' => 'application/json',
+            'X-API-Key' => $this->config->appKey(),
+            'X-BZ-Organization-Token' => $organizationToken,
+        ];
+        $sleep ??= static function (int $seconds): void {
+            sleep($seconds);
+        };
+        $maxAttempts = max(1, $maxAttempts);
+        $pauses = [1, 3];
+        $result = ['status' => 'network_error', 'http_status' => null, 'body' => null, 'attempts' => 0];
+
+        for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
+            $result = $this->fetchOnce($platformEventId, $headers);
+            $result['attempts'] = $attempt;
+
+            if (!in_array($result['status'], ['network_error', 'platform_error', 'platform_rate_limited'], true) || $attempt === $maxAttempts) {
+                break;
+            }
+
+            $sleep($pauses[min($attempt - 1, count($pauses) - 1)]);
+        }
+
+        return $result;
+    }
+
+    /** @return array{status: string, http_status: ?int, body: ?string, attempts: int} */
+    private function fetchOnce(string $platformEventId, array $headers): array
+    {
+        try {
+            $response = ($this->transport)('GET', $this->participantsUrl($platformEventId), $headers, $this->config->pullTimeoutSeconds());
+        } catch (Throwable) {
+            return ['status' => 'network_error', 'http_status' => null, 'body' => null, 'attempts' => 0];
+        }
+
+        $http = (int)($response['status'] ?? 0);
+        $status = match (true) {
+            $http === 200 => 'ok',
+            $http === 401 => 'app_key_rejected',
+            $http === 403 => 'token_rejected',
+            $http === 404 => 'platform_event_not_found',
+            $http === 429 => 'platform_rate_limited',
+            default => 'platform_error',
+        };
+
+        return [
+            'status' => $status,
+            'http_status' => $http > 0 ? $http : null,
+            'body' => $http === 200 ? (string)($response['body'] ?? '') : null,
+            'attempts' => 0,
+        ];
+    }
+
     /** @return array{status: int, body: string} */
     public static function defaultTransport(string $method, string $url, array $headers, int $timeout): array
     {

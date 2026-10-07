@@ -16,6 +16,7 @@ final class PlatformIntegrationConfig
         private readonly string $apiBaseUrl,
         private readonly string $appKey,
         private readonly int $timeoutSeconds,
+        private readonly int $pullTimeoutSeconds,
         private readonly ?string $currentKey,
         private readonly ?string $previousKey
     ) {
@@ -74,7 +75,10 @@ final class PlatformIntegrationConfig
         $timeout = $read('BZ_PLATFORM_TIMEOUT_SECONDS');
         $timeoutSeconds = $timeout !== '' && ctype_digit($timeout) ? max(1, min(30, (int)$timeout)) : 10;
 
-        return new self($reasons, $apiUrl, $appKey, $timeoutSeconds, $currentKey, $previousKey);
+        $pullTimeout = $read('BZ_PLATFORM_PULL_TIMEOUT_SECONDS');
+        $pullTimeoutSeconds = $pullTimeout !== '' && ctype_digit($pullTimeout) ? max(5, min(120, (int)$pullTimeout)) : 60;
+
+        return new self($reasons, $apiUrl, $appKey, $timeoutSeconds, $pullTimeoutSeconds, $currentKey, $previousKey);
     }
 
     public static function fromProcess(): self
@@ -110,6 +114,12 @@ final class PlatformIntegrationConfig
     public function timeoutSeconds(): int
     {
         return $this->timeoutSeconds;
+    }
+
+    /** Timeout of a full participant list download (much longer than the connection test). */
+    public function pullTimeoutSeconds(): int
+    {
+        return $this->pullTimeoutSeconds;
     }
 
     public function cipher(): PlatformTokenCipher

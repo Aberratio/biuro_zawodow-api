@@ -245,8 +245,8 @@ final class PlatformParticipantSync
             'registration_id' => (string)$record['platform_registration_id'],
             'changes' => $changes,
             'changed_fields' => $changedFields,
-            'before' => self::state($row),
-            'after' => self::state($after),
+            'before' => self::changeState($row),
+            'after' => self::changeState($after),
         ];
     }
 
@@ -293,7 +293,7 @@ final class PlatformParticipantSync
     }
 
     /** Same shape as the change-log states of the participant API; codes are never part of it. */
-    private static function state(array $row): array
+    public static function changeState(array $row): array
     {
         $custom = is_array($row['custom_fields'] ?? null) ? $row['custom_fields'] : [];
         ksort($custom);
