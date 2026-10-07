@@ -429,3 +429,10 @@ test('migration 028 is portable and idempotent by construction', function (): vo
     assertSame(0, preg_match('/ADD\s+(COLUMN|CONSTRAINT|INDEX|KEY)[^;]*IF NOT EXISTS/i', $sql));
     assertFalse(str_contains($sql, 'VALUES('));
 });
+
+test('CORS allows PUT because the platform connection is saved with PUT', function (): void {
+    $source = (string)file_get_contents(__DIR__ . '/../src/bootstrap.php');
+    assertSame(1, preg_match('/Access-Control-Allow-Methods: [A-Z, ]*\bPUT\b/', $source));
+    $index = (string)file_get_contents(__DIR__ . '/../public/index.php');
+    assertTrue(str_contains($index, "\$method === 'PUT'"), 'PUT route expected');
+});
