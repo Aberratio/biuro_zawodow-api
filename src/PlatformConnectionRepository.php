@@ -11,7 +11,7 @@ final class PlatformConnectionRepository
 
     public function find(string $eventId): ?array
     {
-        $stmt = $this->pdo->prepare('SELECT * FROM event_platform_connections WHERE event_id = :event_id LIMIT 1');
+        $stmt = $this->pdo->prepare('SELECT *, UNIX_TIMESTAMP(updated_at) AS updated_at_unix FROM event_platform_connections WHERE event_id = :event_id LIMIT 1');
         $stmt->execute(['event_id' => $eventId]);
         $row = $stmt->fetch();
 

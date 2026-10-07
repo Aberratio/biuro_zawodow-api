@@ -23,7 +23,9 @@ final class PlatformConnectionPresenter
                 'token_updated_at' => self::iso($row['token_updated_at'] ?? null),
                 'last_test_at' => self::iso($row['last_test_at'] ?? null),
                 'last_test_status' => isset($row['last_test_status']) ? (string)$row['last_test_status'] : null,
-                'updated_at' => self::iso($row['updated_at'] ?? null),
+                'updated_at' => isset($row['updated_at_unix'])
+                    ? gmdate('Y-m-d\TH:i:s\Z', (int)$row['updated_at_unix'])
+                    : self::iso($row['updated_at'] ?? null),
             ];
         }
 
