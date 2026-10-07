@@ -156,6 +156,7 @@ test('documents critical API paths in the generated OpenAPI document', function 
         '/participants/{id}/undo-check-in',
         '/events/{id}/platform-connection',
         '/events/{id}/platform-connection/test',
+        '/events/{id}/platform-connection/pull',
     ] as $path) {
         assertTrue(in_array($path, $paths, true), "OpenAPI path missing: {$path}");
     }

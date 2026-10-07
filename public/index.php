@@ -517,6 +517,7 @@ try {
                 'participant_edit' => 'Edycja uczestnika',
                 'participant_delete' => 'Usunięcie uczestnika',
                 'bib_conflict_resolution' => 'Rozwiązanie konfliktu numeru startowego',
+                'platform_sync' => 'Synchronizacja z platformą',
             ],
             'current_state' => [
                 'active' => 'Aktywny',
@@ -533,6 +534,10 @@ try {
                 'status' => 'status',
                 'email_status' => 'status e-maila',
                 'checked_in_at' => 'czas odprawy',
+                'qr_code' => 'kod startowy',
+                'identity_code' => 'kod zawodnika',
+                'payment_status' => 'status opłaty',
+                'platform_removed_at' => 'usunięcie na platformie',
             ],
         ];
 
@@ -6702,6 +6707,89 @@ try {
         exit;
     }
 
+    if (preg_match('#^/events/([^/]+)/platform-connection/pull$#', $path, $matches) === 1 && $method === 'POST') {
+        $authUser = requireAnyRole(['superadmin', 'admin', 'editor'], $resolveAuthenticatedUser);
+        $eventId = (string)$matches[1];
+        $event = $loadEventById($pdo, $eventId);
+
+        if ($event === false) {
+            jsonResponse(404, ['error' => 'Nie znaleziono wydarzenia']);
+            exit;
+        }
+
+        if (!$canManageEventParticipants($authUser, $event)) {
+            jsonResponse(403, ['error' => 'Brak uprawnień']);
+            exit;
+        }
+
+        $platformConfig = PlatformIntegrationConfig::fromProcess();
+        if (!$platformConfig->isAvailable()) {
+            $platformUnavailableResponse($platformConfig);
+            exit;
+        }
+
+        $platformRepository = new PlatformConnectionRepository($pdo);
+        $platformRow = $platformRepository->find($eventId);
+        if ($platformRow === null) {
+            jsonResponse(404, [
+                'error' => 'Najpierw zapisz połączenie z platformą.',
+                'code' => 'platform_connection_missing',
+            ]);
+            exit;
+        }
+
+        $platformPullService = new PlatformParticipantPullService(
+            new PdoPlatformParticipantStore($pdo),
+            $platformConfig,
+            new PlatformApiClient($platformConfig)
+        );
+        $platformPullActor = ['id' => (string)$authUser['id'], 'name' => (string)$authUser['name']];
+
+        if ((int)$platformRow['is_enabled'] !== 1) {
+            $platformPullService->pull($eventId, 'manual', $platformPullActor, 1);
+            jsonResponse(409, [
+                'error' => 'Integracja z platformą jest wyłączona dla tego wydarzenia. Włącz ją, aby pobrać uczestników.',
+                'code' => 'platform_connection_disabled',
+            ]);
+            exit;
+        }
+
+        $platformWait = PlatformConnectionTestThrottle::secondsUntilAllowed(
+            isset($platformRow['last_pull_started_at']) ? (string)$platformRow['last_pull_started_at'] : null,
+            new DateTimeImmutable('now', new DateTimeZone('UTC')),
+            15
+        );
+        if ($platformWait > 0) {
+            jsonResponse(429, [
+                'error' => 'Odczekaj chwilę przed kolejnym pobraniem uczestników.',
+                'code' => 'platform_pull_throttled',
+                'retry_after' => $platformWait,
+            ]);
+            exit;
+        }
+
+        ignore_user_abort(true);
+        set_time_limit(max(180, 2 * $platformConfig->pullTimeoutSeconds() + 60));
+        $platformPullResult = $platformPullService->pull($eventId, 'manual', $platformPullActor, 2);
+
+        if ($platformPullResult['status'] === 'in_progress') {
+            jsonResponse(409, [
+                'error' => 'Pobieranie uczestników z platformy już trwa. Spróbuj za chwilę.',
+                'code' => 'platform_pull_in_progress',
+            ]);
+            exit;
+        }
+
+        $platformRow = $platformRepository->find($eventId);
+        jsonResponse(200, [
+            'data' => [
+                'result' => $platformPullResult,
+                'connection' => PlatformConnectionPresenter::present($platformRow, $platformConfig, $platformTokenReadable($platformConfig, $platformRow))['connection'],
+            ],
+        ]);
+        exit;
+    }
+
     if (preg_match('#^/events/([^/]+)/platform-connection$#', $path, $matches) === 1 && $method === 'DELETE') {
         $authUser = requireAnyRole(['superadmin', 'admin', 'editor'], $resolveAuthenticatedUser);
         $eventId = (string)$matches[1];
@@ -7700,6 +7788,15 @@ try {
 
         if (!$canManageEventParticipants($authUser, $event)) {
             jsonResponse(403, ['error' => 'Brak uprawnień']);
+            exit;
+        }
+
+        $platformSyncRow = (new PlatformConnectionRepository($pdo))->find($eventId);
+        if ($platformSyncRow !== null && (int)$platformSyncRow['is_enabled'] === 1) {
+            jsonResponse(409, [
+                'error' => 'To wydarzenie pobiera uczestników z platformy Zmierzymy Czas. Wyłącz integrację, zanim zastąpisz listę plikiem.',
+                'code' => 'platform_sync_active',
+            ]);
             exit;
         }
 

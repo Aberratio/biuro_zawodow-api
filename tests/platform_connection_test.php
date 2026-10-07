@@ -246,18 +246,33 @@ test('presenter exposes only whitelisted connection keys', function (): void {
         'created_at' => '2026-10-05 10:00:00',
         'updated_at' => '2026-10-05 10:05:00',
         'plaintext' => 'PLAINTEXT-MARKER',
+        'last_pull_started_at' => '2026-10-05 10:06:00',
+        'last_pull_finished_at' => '2026-10-05 10:06:04',
+        'last_pull_status' => 'partial',
+        'last_pull_trigger' => 'cron',
+        'last_pull_summary_json' => '{"fetched":5,"created":2,"updated":1,"unchanged":2,"skipped":1,"skipped_by_reason":{"qr_collision":1},"removed":0,"restored":0,"possible_duplicates":0,"warnings":{"missing_email":0},"duration_ms":4120,"names":"SUMMARY-MARKER","nested":{"x":"SUMMARY-MARKER"}}',
+        'field_layout_json' => '{"first_name":"LAYOUT-MARKER"}',
     ];
     $view = PlatformConnectionPresenter::present($row, platformConfig(), true);
 
     assertSame(['availability', 'connection'], array_keys($view));
     assertSame([
         'platform_event_id', 'is_enabled', 'token_set', 'token_hint', 'token_readable',
-        'token_updated_at', 'last_test_at', 'last_test_status', 'updated_at',
+        'token_updated_at', 'last_test_at', 'last_test_status',
+        'last_pull_at', 'last_pull_status', 'last_pull_summary', 'updated_at',
     ], array_keys($view['connection']));
     assertTrue($view['connection']['is_enabled'] === true);
     assertTrue($view['connection']['token_readable'] === true);
     assertSame('2026-10-05T10:00:00Z', $view['connection']['token_updated_at']);
+    assertSame('2026-10-05T10:06:04Z', $view['connection']['last_pull_at']);
+    assertSame('partial', $view['connection']['last_pull_status']);
+    assertSame(5, $view['connection']['last_pull_summary']['fetched']);
+    assertSame(['qr_collision' => 1], $view['connection']['last_pull_summary']['skipped_by_reason']);
+    assertSame(4120, $view['connection']['last_pull_summary']['duration_ms']);
     $json = json_encode($view);
+    assertFalse(str_contains($json, 'SUMMARY-MARKER'));
+    assertFalse(str_contains($json, 'LAYOUT-MARKER'));
+    assertFalse(str_contains($json, 'cron'));
     assertFalse(str_contains($json, 'CIPHERTEXT-MARKER'));
     assertFalse(str_contains($json, 'PLAINTEXT-MARKER'));
     assertFalse(str_contains($json, 'ciphertext'));
@@ -392,7 +407,7 @@ test('masks platform token ciphertext in the database viewer', function (): void
 test('platform connection handlers check role, event and organization before anything else', function (): void {
     $source = platformHandlersSource();
     $handlers = preg_split("/(?=if \(preg_match\('#\^\/events\/\(\[\^\/\]\+\)\/platform-connection)/", $source, -1, PREG_SPLIT_NO_EMPTY);
-    assertSame(4, count($handlers), 'Oczekiwano 4 handlerow, jest ' . count($handlers));
+    assertSame(5, count($handlers), 'Oczekiwano 5 handlerow, jest ' . count($handlers));
 
     foreach ($handlers as $handler) {
         $role = strpos($handler, "requireAnyRole(['superadmin', 'admin', 'editor']");

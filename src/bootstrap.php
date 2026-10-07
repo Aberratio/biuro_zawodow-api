@@ -1838,6 +1838,23 @@ function openApiDocument(): array
                     ],
                 ],
             ],
+            '/events/{id}/platform-connection/pull' => [
+                'post' => [
+                    'tags' => ['Events'],
+                    'summary' => 'Pull the participant list of an event from the platform now',
+                    'security' => [['bearerAuth' => []]],
+                    'parameters' => [['name' => 'id', 'in' => 'path', 'required' => true, 'schema' => ['type' => 'string']]],
+                    'responses' => [
+                        '200' => ['description' => 'Pull result (a failed attempt is also a 200 result)', 'content' => ['application/json' => ['schema' => ['$ref' => '#/components/schemas/PlatformPullResponse']]]],
+                        '401' => ['description' => 'Brak autoryzacji'],
+                        '403' => ['$ref' => '#/components/responses/Forbidden'],
+                        '404' => ['description' => 'Nie znaleziono wydarzenia lub polaczenia'],
+                        '409' => ['description' => 'platform_pull_in_progress or platform_connection_disabled'],
+                        '429' => ['description' => 'platform_pull_throttled (retry_after)'],
+                        '503' => ['description' => 'platform_integration_unavailable'],
+                    ],
+                ],
+            ],
             '/events/{id}/test-reset' => [
                 'post' => [
                     'tags' => ['Events'],
@@ -3911,6 +3928,9 @@ function openApiDocument(): array
                             'token_updated_at' => ['type' => 'string', 'nullable' => true],
                             'last_test_at' => ['type' => 'string', 'nullable' => true],
                             'last_test_status' => ['type' => 'string', 'nullable' => true],
+                            'last_pull_at' => ['type' => 'string', 'nullable' => true],
+                            'last_pull_status' => ['type' => 'string', 'nullable' => true],
+                            'last_pull_summary' => ['type' => 'object', 'nullable' => true],
                             'updated_at' => ['type' => 'string', 'nullable' => true],
                         ]],
                     ],
@@ -3923,6 +3943,22 @@ function openApiDocument(): array
                     'type' => 'object',
                     'properties' => ['data' => ['type' => 'object', 'properties' => [
                         'result' => ['type' => 'object', 'properties' => ['status' => ['type' => 'string'], 'participant_count' => ['type' => 'integer', 'nullable' => true]]],
+                        'connection' => ['type' => 'object', 'nullable' => true],
+                    ]]],
+                ],
+                'PlatformPullResponse' => [
+                    'type' => 'object',
+                    'properties' => ['data' => ['type' => 'object', 'properties' => [
+                        'result' => ['type' => 'object', 'properties' => [
+                            'status' => ['type' => 'string', 'enum' => [
+                                'ok', 'partial', 'connection_disabled', 'token_unreadable', 'event_inactive', 'app_key_rejected',
+                                'token_rejected', 'platform_event_not_found', 'platform_rate_limited', 'network_error',
+                                'invalid_response', 'platform_error', 'response_too_large', 'apply_failed',
+                            ]],
+                            'summary' => ['type' => 'object', 'nullable' => true],
+                            'skipped_records' => ['type' => 'array', 'items' => ['type' => 'object', 'properties' => ['registration_id' => ['type' => 'string'], 'reason' => ['type' => 'string']]]],
+                            'possible_duplicate_registration_ids' => ['type' => 'array', 'items' => ['type' => 'string']],
+                        ]],
                         'connection' => ['type' => 'object', 'nullable' => true],
                     ]]],
                 ],
