@@ -53,6 +53,7 @@ Key variables from `.example.env`:
 | `LOG_LEVEL`, `LOG_RETENTION_DAYS`, `AUDIT_RETENTION_DAYS`, `SLOW_REQUEST_MS` | Logging and audit tuning |
 | `SENTRY_DSN` | Optional; empty/unavailable Sentry never blocks requests |
 | `DB_*` | Database connection |
+| `BZ_PLATFORM_API_URL`, `BZ_PLATFORM_APP_KEY`, `BZ_PLATFORM_TOKEN_KEY` (+ optional `BZ_PLATFORM_TOKEN_KEY_PREVIOUS`, `BZ_PLATFORM_TIMEOUT_SECONDS`) | Per-event platform connection. All three required values must be valid or the feature stays inactive (the API still boots). Key rotation: `php scripts/reencrypt-platform-tokens.php [--apply]` |
 | `CENTRAL_MAILER_URL`, `CENTRAL_MAILER_API_KEY`, `CENTRAL_MAILER_BATCH_SIZE` | Central-mailer integration for QR emails; batch size should not exceed the mailer's `EMAIL_BATCH_MAX_RECIPIENTS` |
 
 ## Seeded local accounts
