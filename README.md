@@ -54,6 +54,7 @@ Key variables from `.example.env`:
 | `SENTRY_DSN` | Optional; empty/unavailable Sentry never blocks requests |
 | `DB_*` | Database connection |
 | `BZ_PLATFORM_API_URL`, `BZ_PLATFORM_APP_KEY`, `BZ_PLATFORM_TOKEN_KEY` (+ optional `BZ_PLATFORM_TOKEN_KEY_PREVIOUS`, `BZ_PLATFORM_TIMEOUT_SECONDS`) | Per-event platform connection. All three required values must be valid or the feature stays inactive (the API still boots). Key rotation: `php scripts/reencrypt-platform-tokens.php [--apply]` |
+| `BZ_PLATFORM_PULL_TIMEOUT_SECONDS` | Optional timeout of a full participant list download from the platform, 5-120 seconds (default 60). The pull runs from the event details button and from `php scripts/pull-platform-participants.php` (`--event=ID`, `--force`, `--help`); cron entry, e.g. every 5 minutes: `*/5 * * * * php /path/to/api/scripts/pull-platform-participants.php >> /path/to/logs/platform-pull.log 2>&1` (the script only pulls connections that are due: 6 h, 1 h in the last week, 5 min on the event day) |
 | `CENTRAL_MAILER_URL`, `CENTRAL_MAILER_API_KEY`, `CENTRAL_MAILER_BATCH_SIZE` | Central-mailer integration for QR emails; batch size should not exceed the mailer's `EMAIL_BATCH_MAX_RECIPIENTS` |
 
 ## Seeded local accounts
