@@ -7,6 +7,9 @@ require_once __DIR__ . '/MailService.php';
 require_once __DIR__ . '/QrEmailDeliveryReport.php';
 require_once __DIR__ . '/QrCodeService.php';
 require_once __DIR__ . '/ParticipantCodePolicy.php';
+require_once __DIR__ . '/PlatformTokenCipher.php';
+require_once __DIR__ . '/PlatformIntegrationConfig.php';
+require_once __DIR__ . '/PlatformConnectionRepository.php';
 require_once __DIR__ . '/RequestContext.php';
 require_once __DIR__ . '/SentryBridge.php';
 require_once __DIR__ . '/ApplicationLogger.php';
@@ -1016,6 +1019,7 @@ function isSensitiveDatabaseColumn(string $columnName): bool
         'qr_code',
         'identity_code',
         'bucket_key',
+        'organization_token_ciphertext',
     ], true);
 }
 
