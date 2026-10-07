@@ -1769,6 +1769,64 @@ function openApiDocument(): array
                     ],
                 ],
             ],
+            '/events/{id}/platform-connection' => [
+                'get' => [
+                    'tags' => ['Events'],
+                    'summary' => 'Get the platform connection of an event (never returns the token)',
+                    'security' => [['bearerAuth' => []]],
+                    'parameters' => [['name' => 'id', 'in' => 'path', 'required' => true, 'schema' => ['type' => 'string']]],
+                    'responses' => [
+                        '200' => ['description' => 'Connection view', 'content' => ['application/json' => ['schema' => ['$ref' => '#/components/schemas/PlatformConnectionResponse']]]],
+                        '401' => ['description' => 'Brak autoryzacji'],
+                        '403' => ['$ref' => '#/components/responses/Forbidden'],
+                        '404' => ['description' => 'Nie znaleziono wydarzenia lub polaczenia'],
+                    ],
+                ],
+                'put' => [
+                    'tags' => ['Events'],
+                    'summary' => 'Save the platform connection of an event',
+                    'security' => [['bearerAuth' => []]],
+                    'parameters' => [['name' => 'id', 'in' => 'path', 'required' => true, 'schema' => ['type' => 'string']]],
+                    'responses' => [
+                        '200' => ['description' => 'Connection view', 'content' => ['application/json' => ['schema' => ['$ref' => '#/components/schemas/PlatformConnectionResponse']]]],
+                        '401' => ['description' => 'Brak autoryzacji'],
+                        '403' => ['$ref' => '#/components/responses/Forbidden'],
+                        '404' => ['description' => 'Nie znaleziono wydarzenia'],
+                        '409' => ['description' => 'platform_event_already_connected'],
+                        '422' => ['description' => 'validation_error'],
+                        '503' => ['description' => 'platform_integration_unavailable'],
+                    ],
+                    'requestBody' => ['required' => true, 'content' => ['application/json' => ['schema' => ['$ref' => '#/components/schemas/PlatformConnectionInput']]]],
+                ],
+                'delete' => [
+                    'tags' => ['Events'],
+                    'summary' => 'Disconnect an event from the platform',
+                    'security' => [['bearerAuth' => []]],
+                    'parameters' => [['name' => 'id', 'in' => 'path', 'required' => true, 'schema' => ['type' => 'string']]],
+                    'responses' => [
+                        '200' => ['description' => 'Disconnected', 'content' => ['application/json' => ['schema' => ['$ref' => '#/components/schemas/PlatformConnectionResponse']]]],
+                        '401' => ['description' => 'Brak autoryzacji'],
+                        '403' => ['$ref' => '#/components/responses/Forbidden'],
+                        '404' => ['description' => 'Nie znaleziono wydarzenia lub polaczenia'],
+                    ],
+                ],
+            ],
+            '/events/{id}/platform-connection/test' => [
+                'post' => [
+                    'tags' => ['Events'],
+                    'summary' => 'Test the platform connection of an event',
+                    'security' => [['bearerAuth' => []]],
+                    'parameters' => [['name' => 'id', 'in' => 'path', 'required' => true, 'schema' => ['type' => 'string']]],
+                    'responses' => [
+                        '200' => ['description' => 'Test result', 'content' => ['application/json' => ['schema' => ['$ref' => '#/components/schemas/PlatformConnectionTestResponse']]]],
+                        '401' => ['description' => 'Brak autoryzacji'],
+                        '403' => ['$ref' => '#/components/responses/Forbidden'],
+                        '404' => ['description' => 'Nie znaleziono wydarzenia lub polaczenia'],
+                        '429' => ['description' => 'platform_connection_test_throttled (retry_after)'],
+                        '503' => ['description' => 'platform_integration_unavailable'],
+                    ],
+                ],
+            ],
             '/events/{id}/test-reset' => [
                 'post' => [
                     'tags' => ['Events'],
@@ -3819,6 +3877,43 @@ function openApiDocument(): array
                         'error' => ['type' => 'string', 'example' => 'Database error'],
                         'details' => ['type' => 'string', 'nullable' => true],
                     ],
+                ],
+                'PlatformConnectionInput' => [
+                    'type' => 'object',
+                    'required' => ['platform_event_id'],
+                    'properties' => [
+                        'platform_event_id' => ['type' => 'string', 'maxLength' => 64],
+                        'organization_token' => ['type' => 'string', 'minLength' => 32, 'maxLength' => 255, 'writeOnly' => true, 'description' => 'Required on first save; omit to keep the stored token. Never returned.'],
+                        'is_enabled' => ['type' => 'boolean'],
+                    ],
+                ],
+                'PlatformConnectionView' => [
+                    'type' => 'object',
+                    'properties' => [
+                        'availability' => ['type' => 'object', 'properties' => ['available' => ['type' => 'boolean'], 'reasons' => ['type' => 'array', 'items' => ['type' => 'string']]]],
+                        'connection' => ['type' => 'object', 'nullable' => true, 'properties' => [
+                            'platform_event_id' => ['type' => 'string'],
+                            'is_enabled' => ['type' => 'boolean'],
+                            'token_set' => ['type' => 'boolean'],
+                            'token_hint' => ['type' => 'string'],
+                            'token_readable' => ['type' => 'boolean', 'nullable' => true],
+                            'token_updated_at' => ['type' => 'string', 'nullable' => true],
+                            'last_test_at' => ['type' => 'string', 'nullable' => true],
+                            'last_test_status' => ['type' => 'string', 'nullable' => true],
+                            'updated_at' => ['type' => 'string', 'nullable' => true],
+                        ]],
+                    ],
+                ],
+                'PlatformConnectionResponse' => [
+                    'type' => 'object',
+                    'properties' => ['data' => ['$ref' => '#/components/schemas/PlatformConnectionView']],
+                ],
+                'PlatformConnectionTestResponse' => [
+                    'type' => 'object',
+                    'properties' => ['data' => ['type' => 'object', 'properties' => [
+                        'result' => ['type' => 'object', 'properties' => ['status' => ['type' => 'string'], 'participant_count' => ['type' => 'integer', 'nullable' => true]]],
+                        'connection' => ['type' => 'object', 'nullable' => true],
+                    ]]],
                 ],
                 'ErrorResponse' => [
                     'type' => 'object',

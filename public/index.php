@@ -6479,6 +6479,268 @@ try {
         exit;
     }
 
+    $platformTokenReadable = static function (PlatformIntegrationConfig $config, ?array $row): ?bool {
+        if ($row === null || !$config->isAvailable()) {
+            return null;
+        }
+
+        $plain = $config->cipher()->decrypt((string)$row['organization_token_ciphertext'], (string)$row['event_id']);
+        $readable = $plain !== null;
+        unset($plain);
+
+        return $readable;
+    };
+    $platformUnavailableResponse = static function (PlatformIntegrationConfig $config): void {
+        jsonResponse(503, [
+            'error' => 'Integracja z platformą jest nieaktywna na tym serwerze.',
+            'code' => 'platform_integration_unavailable',
+            'reasons' => $config->unavailableReasons(),
+        ]);
+    };
+
+    if (preg_match('#^/events/([^/]+)/platform-connection$#', $path, $matches) === 1 && $method === 'GET') {
+        $authUser = requireAnyRole(['superadmin', 'admin', 'editor'], $resolveAuthenticatedUser);
+        $eventId = (string)$matches[1];
+        $event = $loadEventById($pdo, $eventId);
+
+        if ($event === false) {
+            jsonResponse(404, ['error' => 'Nie znaleziono wydarzenia']);
+            exit;
+        }
+
+        if (!$canManageEventParticipants($authUser, $event)) {
+            jsonResponse(403, ['error' => 'Brak uprawnień']);
+            exit;
+        }
+
+        $platformConfig = PlatformIntegrationConfig::fromProcess();
+        $platformRow = (new PlatformConnectionRepository($pdo))->find($eventId);
+
+        jsonResponse(200, [
+            'data' => PlatformConnectionPresenter::present($platformRow, $platformConfig, $platformTokenReadable($platformConfig, $platformRow)),
+        ]);
+        exit;
+    }
+
+    if (preg_match('#^/events/([^/]+)/platform-connection$#', $path, $matches) === 1 && $method === 'PUT') {
+        $authUser = requireAnyRole(['superadmin', 'admin', 'editor'], $resolveAuthenticatedUser);
+        $eventId = (string)$matches[1];
+        $event = $loadEventById($pdo, $eventId);
+
+        if ($event === false) {
+            jsonResponse(404, ['error' => 'Nie znaleziono wydarzenia']);
+            exit;
+        }
+
+        if (!$canManageEventParticipants($authUser, $event)) {
+            jsonResponse(403, ['error' => 'Brak uprawnień']);
+            exit;
+        }
+
+        $platformConfig = PlatformIntegrationConfig::fromProcess();
+        if (!$platformConfig->isAvailable()) {
+            $platformUnavailableResponse($platformConfig);
+            exit;
+        }
+
+        $platformRepository = new PlatformConnectionRepository($pdo);
+        $platformExisting = $platformRepository->find($eventId);
+        $platformParsed = PlatformConnectionInput::parse(readJsonBody(), $platformExisting !== null);
+        if (!$platformParsed['ok']) {
+            jsonResponse(422, [
+                'error' => 'Popraw zaznaczone pola.',
+                'code' => 'validation_error',
+                'fields' => $platformParsed['fields'],
+            ]);
+            exit;
+        }
+
+        $platformConflict = static function (): void {
+            jsonResponse(409, [
+                'error' => 'To wydarzenie platformy jest już połączone z innym wydarzeniem w Biurze Zawodów.',
+                'code' => 'platform_event_already_connected',
+            ]);
+        };
+        if ($platformRepository->findEventIdByPlatformEventId($platformParsed['platform_event_id'], $eventId) !== null) {
+            $platformConflict();
+            exit;
+        }
+
+        $platformCiphertext = null;
+        $platformHint = null;
+        if ($platformParsed['organization_token'] !== null) {
+            $platformCiphertext = $platformConfig->cipher()->encrypt($platformParsed['organization_token'], $eventId);
+            $platformHint = substr($platformParsed['organization_token'], -4);
+        }
+
+        try {
+            $platformRepository->save(
+                $eventId,
+                $platformParsed['platform_event_id'],
+                $platformParsed['is_enabled'],
+                $platformCiphertext,
+                $platformHint,
+                (string)$authUser['id']
+            );
+        } catch (PDOException $exception) {
+            if ((string)$exception->getCode() === '23000') {
+                $platformConflict();
+                exit;
+            }
+
+            throw $exception;
+        }
+
+        $platformCredentialChanged = $platformCiphertext !== null;
+        $addActivityLog(
+            $pdo,
+            sprintf(
+                'Zapisano połączenie z platformą Zmierzymy Czas (ID wydarzenia platformy: %s, integracja %s%s)',
+                $platformParsed['platform_event_id'],
+                $platformParsed['is_enabled'] ? 'włączona' : 'wyłączona',
+                $platformCredentialChanged ? ', zmieniono token organizacji' : ''
+            ),
+            $eventId,
+            null,
+            null,
+            (string)$authUser['id'],
+            (string)$authUser['name']
+        );
+        ApplicationLogger::log('info', 'platform_connection.saved', 'Platform connection saved', [
+            'event_id' => $eventId,
+            'platform_event_id' => $platformParsed['platform_event_id'],
+            'is_enabled' => $platformParsed['is_enabled'],
+            'credential_changed' => $platformCredentialChanged,
+        ]);
+
+        $platformRow = $platformRepository->find($eventId);
+        jsonResponse(200, [
+            'data' => PlatformConnectionPresenter::present($platformRow, $platformConfig, $platformTokenReadable($platformConfig, $platformRow)),
+        ]);
+        exit;
+    }
+
+    if (preg_match('#^/events/([^/]+)/platform-connection/test$#', $path, $matches) === 1 && $method === 'POST') {
+        $authUser = requireAnyRole(['superadmin', 'admin', 'editor'], $resolveAuthenticatedUser);
+        $eventId = (string)$matches[1];
+        $event = $loadEventById($pdo, $eventId);
+
+        if ($event === false) {
+            jsonResponse(404, ['error' => 'Nie znaleziono wydarzenia']);
+            exit;
+        }
+
+        if (!$canManageEventParticipants($authUser, $event)) {
+            jsonResponse(403, ['error' => 'Brak uprawnień']);
+            exit;
+        }
+
+        $platformConfig = PlatformIntegrationConfig::fromProcess();
+        if (!$platformConfig->isAvailable()) {
+            $platformUnavailableResponse($platformConfig);
+            exit;
+        }
+
+        $platformRepository = new PlatformConnectionRepository($pdo);
+        $platformRow = $platformRepository->find($eventId);
+        if ($platformRow === null) {
+            jsonResponse(404, [
+                'error' => 'Najpierw zapisz połączenie z platformą.',
+                'code' => 'platform_connection_missing',
+            ]);
+            exit;
+        }
+
+        $platformNow = new DateTimeImmutable('now', new DateTimeZone('UTC'));
+        $platformWait = PlatformConnectionTestThrottle::secondsUntilAllowed(
+            isset($platformRow['last_test_at']) ? (string)$platformRow['last_test_at'] : null,
+            $platformNow
+        );
+        if ($platformWait > 0) {
+            jsonResponse(429, [
+                'error' => 'Odczekaj chwilę przed kolejnym testem połączenia.',
+                'code' => 'platform_connection_test_throttled',
+                'retry_after' => $platformWait,
+            ]);
+            exit;
+        }
+
+        $platformPlain = $platformConfig->cipher()->decrypt((string)$platformRow['organization_token_ciphertext'], $eventId);
+        if ($platformPlain === null) {
+            $platformResult = ['status' => 'token_unreadable', 'participant_count' => null, 'http_status' => null];
+        } else {
+            $platformResult = (new PlatformApiClient($platformConfig))->probeParticipants((string)$platformRow['platform_event_id'], $platformPlain);
+            unset($platformPlain);
+        }
+
+        $platformRepository->recordTest($eventId, $platformResult['status'], $platformNow->format('Y-m-d H:i:s'));
+        $addActivityLog(
+            $pdo,
+            'Test połączenia z platformą: ' . $platformResult['status'],
+            $eventId,
+            null,
+            null,
+            (string)$authUser['id'],
+            (string)$authUser['name']
+        );
+        ApplicationLogger::log('info', 'platform_connection.tested', 'Platform connection tested', [
+            'event_id' => $eventId,
+            'platform_event_id' => (string)$platformRow['platform_event_id'],
+            'status' => $platformResult['status'],
+        ]);
+
+        $platformRow = $platformRepository->find($eventId);
+        jsonResponse(200, [
+            'data' => [
+                'result' => [
+                    'status' => $platformResult['status'],
+                    'participant_count' => $platformResult['participant_count'],
+                ],
+                'connection' => PlatformConnectionPresenter::present($platformRow, $platformConfig, $platformTokenReadable($platformConfig, $platformRow))['connection'],
+            ],
+        ]);
+        exit;
+    }
+
+    if (preg_match('#^/events/([^/]+)/platform-connection$#', $path, $matches) === 1 && $method === 'DELETE') {
+        $authUser = requireAnyRole(['superadmin', 'admin', 'editor'], $resolveAuthenticatedUser);
+        $eventId = (string)$matches[1];
+        $event = $loadEventById($pdo, $eventId);
+
+        if ($event === false) {
+            jsonResponse(404, ['error' => 'Nie znaleziono wydarzenia']);
+            exit;
+        }
+
+        if (!$canManageEventParticipants($authUser, $event)) {
+            jsonResponse(403, ['error' => 'Brak uprawnień']);
+            exit;
+        }
+
+        $platformConfig = PlatformIntegrationConfig::fromProcess();
+        if (!(new PlatformConnectionRepository($pdo))->delete($eventId)) {
+            jsonResponse(404, [
+                'error' => 'To wydarzenie nie ma zapisanego połączenia z platformą.',
+                'code' => 'platform_connection_missing',
+            ]);
+            exit;
+        }
+
+        $addActivityLog(
+            $pdo,
+            'Usunięto połączenie z platformą Zmierzymy Czas',
+            $eventId,
+            null,
+            null,
+            (string)$authUser['id'],
+            (string)$authUser['name']
+        );
+        ApplicationLogger::log('info', 'platform_connection.deleted', 'Platform connection deleted', ['event_id' => $eventId]);
+
+        jsonResponse(200, ['data' => PlatformConnectionPresenter::present(null, $platformConfig, null)]);
+        exit;
+    }
+
     if (preg_match('#^/events/([^/]+)$#', $path, $matches) === 1 && $method === 'DELETE') {
         $authUser = requireAnyRole(['superadmin', 'admin', 'editor'], $resolveAuthenticatedUser);
         $eventId = (string)$matches[1];
