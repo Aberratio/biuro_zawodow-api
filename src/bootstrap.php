@@ -1024,6 +1024,7 @@ function isSensitiveDatabaseColumn(string $columnName): bool
         'identity_code',
         'bucket_key',
         'organization_token_ciphertext',
+        'platform_snapshot_json',
     ], true);
 }
 

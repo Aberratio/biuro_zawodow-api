@@ -245,6 +245,12 @@ $adoptionChecks = [
         return $columnExists($pdo, 'participants', 'identity_code')
             && $indexExists($pdo, 'participants', 'idx_participants_identity_code_event');
     },
+    '029_add_platform_participant_sync.php' => static function (PDO $pdo) use ($columnExists, $indexExists): bool {
+        return $columnExists($pdo, 'participants', 'platform_registration_id')
+            && $columnExists($pdo, 'participants', 'platform_removed_at')
+            && $indexExists($pdo, 'participants', 'uq_participants_event_platform_registration')
+            && $columnExists($pdo, 'event_platform_connections', 'last_pull_summary_json');
+    },
 ];
 
 $pending = [];
