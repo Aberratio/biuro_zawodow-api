@@ -638,6 +638,7 @@ test('index wires the webhook, the queue hooks and the withdrawn flag', function
         }
         assertStringContains($needle, $handler);
     }
+    assertStringContains('token_missing', $handler, 'a missing token is answered like a wrong one (403)');
     $parse = strpos($handler, 'PlatformWebhookRequest::parse');
     $decide = strpos($handler, 'PlatformWebhookAuthenticator::decide');
     $service = strpos($handler, 'PlatformCriticalChangeService');

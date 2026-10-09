@@ -3878,6 +3878,13 @@ try {
         ], $webhookBody);
         unset($webhookBody);
         if (!$webhookParsed['ok']) {
+            if ($webhookParsed['error'] === 'missing_token') {
+                // Same answer as a wrong token: nothing is revealed about events or request validity.
+                ApplicationLogger::log('warning', 'platform_webhook.rejected', 'Platform webhook rejected', ['reason' => 'token_missing']);
+                jsonResponse(403, ['code' => 'forbidden', 'error' => 'Brak dostępu.']);
+                exit;
+            }
+
             jsonResponse(400, ['code' => 'invalid_request', 'error' => 'Nieprawidłowe żądanie webhooka.']);
             exit;
         }
