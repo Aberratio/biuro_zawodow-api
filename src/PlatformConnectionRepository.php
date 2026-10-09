@@ -31,6 +31,16 @@ final class PlatformConnectionRepository
         return $value === false ? null : (string)$value;
     }
 
+    /** The connection for a platform (ZC) event id, which is unique across all BZ events. */
+    public function findByPlatformEventId(string $platformEventId): ?array
+    {
+        $stmt = $this->pdo->prepare('SELECT * FROM event_platform_connections WHERE platform_event_id = :platform_event_id LIMIT 1');
+        $stmt->execute(['platform_event_id' => $platformEventId]);
+        $row = $stmt->fetch();
+
+        return $row === false ? null : $row;
+    }
+
     /**
      * Inserts or updates the connection. A null $ciphertext keeps the stored token (and its hint).
      * A new token or a new platform event id clears the last test result.

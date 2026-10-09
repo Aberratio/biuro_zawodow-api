@@ -157,6 +157,7 @@ test('documents critical API paths in the generated OpenAPI document', function 
         '/events/{id}/platform-connection',
         '/events/{id}/platform-connection/test',
         '/events/{id}/platform-connection/pull',
+        '/webhooks/critical-changes',
     ] as $path) {
         assertTrue(in_array($path, $paths, true), "OpenAPI path missing: {$path}");
     }

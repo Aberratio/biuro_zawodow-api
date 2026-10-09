@@ -24,6 +24,11 @@ require_once __DIR__ . '/PlatformPullSchedule.php';
 require_once __DIR__ . '/PlatformParticipantStore.php';
 require_once __DIR__ . '/PdoPlatformParticipantStore.php';
 require_once __DIR__ . '/PlatformParticipantPullService.php';
+require_once __DIR__ . '/PlatformWebhookRequest.php';
+require_once __DIR__ . '/PlatformWebhookAuthenticator.php';
+require_once __DIR__ . '/PlatformWebhookStore.php';
+require_once __DIR__ . '/PdoPlatformWebhookStore.php';
+require_once __DIR__ . '/PlatformCriticalChangeService.php';
 require_once __DIR__ . '/RequestContext.php';
 require_once __DIR__ . '/SentryBridge.php';
 require_once __DIR__ . '/ApplicationLogger.php';
@@ -1852,6 +1857,33 @@ function openApiDocument(): array
                         '409' => ['description' => 'platform_pull_in_progress or platform_connection_disabled'],
                         '429' => ['description' => 'platform_pull_throttled (retry_after)'],
                         '503' => ['description' => 'platform_integration_unavailable'],
+                    ],
+                ],
+            ],
+            '/webhooks/critical-changes' => [
+                'post' => [
+                    'tags' => ['Events'],
+                    'summary' => 'Receive a critical change (cancellation, refund) from the platform',
+                    'description' => 'Server-to-server. Authenticated by the organization token in X-BZ-Organization-Token; Idempotency-Key makes a resend harmless.',
+                    'security' => [],
+                    'parameters' => [
+                        ['name' => 'X-BZ-Organization-Token', 'in' => 'header', 'required' => true, 'schema' => ['type' => 'string']],
+                        ['name' => 'Idempotency-Key', 'in' => 'header', 'required' => true, 'schema' => ['type' => 'string']],
+                    ],
+                    'requestBody' => ['required' => true, 'content' => ['application/json' => ['schema' => ['type' => 'object', 'required' => ['eventId', 'registrationId', 'changeType'], 'properties' => [
+                        'eventId' => ['type' => 'string'],
+                        'registrationId' => ['type' => 'string'],
+                        'changeType' => ['type' => 'string', 'enum' => ['cancellation', 'refund_approved', 'refund_refunded']],
+                        'occurredAt' => ['type' => 'string', 'format' => 'date-time', 'nullable' => true],
+                        'qrCode' => ['type' => 'string', 'nullable' => true],
+                    ]]]]],
+                    'responses' => [
+                        '200' => ['description' => 'Accepted (also for a resend or an unknown change type)', 'content' => ['application/json' => ['schema' => ['$ref' => '#/components/schemas/PlatformWebhookResponse']]]],
+                        '400' => ['description' => 'invalid_request'],
+                        '403' => ['description' => 'forbidden (unknown event, disabled connection, unreadable or wrong token: one answer)'],
+                        '413' => ['description' => 'Body larger than 64 KB'],
+                        '500' => ['description' => 'Not applied; the platform retries'],
+                        '503' => ['description' => 'integration_unavailable, or busy with a Retry-After header while a pull runs'],
                     ],
                 ],
             ],
@@ -3944,6 +3976,14 @@ function openApiDocument(): array
                     'properties' => ['data' => ['type' => 'object', 'properties' => [
                         'result' => ['type' => 'object', 'properties' => ['status' => ['type' => 'string'], 'participant_count' => ['type' => 'integer', 'nullable' => true]]],
                         'connection' => ['type' => 'object', 'nullable' => true],
+                    ]]],
+                ],
+                'PlatformWebhookResponse' => [
+                    'type' => 'object',
+                    'properties' => ['success' => ['type' => 'boolean'], 'data' => ['type' => 'object', 'properties' => [
+                        'status' => ['type' => 'string', 'enum' => [
+                            'applied', 'already_removed', 'superseded_by_pull', 'recorded', 'participant_not_found', 'ignored_unknown_type', 'duplicate',
+                        ]],
                     ]]],
                 ],
                 'PlatformPullResponse' => [

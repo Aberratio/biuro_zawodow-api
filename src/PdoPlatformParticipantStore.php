@@ -378,6 +378,7 @@ final class PdoPlatformParticipantStore implements PlatformParticipantStore
         $userId = $entry['user_id'] ?? null;
         $userName = $entry['user_name'] ?? null;
         $changeType = (string)$entry['change_type'];
+        $changeSource = in_array($entry['change_source'] ?? null, ['platform_sync', 'platform_webhook'], true) ? (string)$entry['change_source'] : 'platform_sync';
         $changedFields = array_values($entry['changed_fields'] ?? []);
         $before = $entry['before_state'] ?? [];
         $after = $entry['after_state'] ?? [];
@@ -393,7 +394,7 @@ final class PdoPlatformParticipantStore implements PlatformParticipantStore
             'event_id' => $eventId,
             'participant_id' => $participantId,
             'metadata' => [
-                'change_source' => 'platform_sync',
+                'change_source' => $changeSource,
                 'changed_fields' => $changedFields,
                 'participant_audit_key' => $auditKey,
             ],
@@ -417,7 +418,7 @@ final class PdoPlatformParticipantStore implements PlatformParticipantStore
             'participant_audit_key' => $auditKey,
             'participant_id' => $participantId,
             'change_type' => $changeType,
-            'change_source' => 'platform_sync',
+            'change_source' => $changeSource,
             'changed_fields_json' => $changedFields !== [] ? encodeJsonValue($changedFields) : null,
             'before_state_json' => $before !== [] ? encodeJsonValue($before) : null,
             'after_state_json' => $after !== [] ? encodeJsonValue($after) : null,

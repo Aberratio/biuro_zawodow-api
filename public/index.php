@@ -518,6 +518,7 @@ try {
                 'participant_delete' => 'Usunięcie uczestnika',
                 'bib_conflict_resolution' => 'Rozwiązanie konfliktu numeru startowego',
                 'platform_sync' => 'Synchronizacja z platformą',
+                'platform_webhook' => 'Zmiana zgłoszona przez platformę',
             ],
             'current_state' => [
                 'active' => 'Aktywny',
@@ -3792,6 +3793,66 @@ try {
         header('Content-Type: image/png');
         header('Cache-Control: public, max-age=300');
         echo QrCodeService::renderPng((string)$participant['qr_code'], 320, 10);
+        exit;
+    }
+
+    if ($path === '/webhooks/critical-changes' && $method === 'POST') {
+        // Server-to-server: the platform authenticates with the organization token (no user session, no CORS).
+        $webhookConfig = PlatformIntegrationConfig::fromProcess();
+        if (!$webhookConfig->isAvailable()) {
+            jsonResponse(503, ['code' => 'integration_unavailable', 'error' => 'Integracja z platformą jest nieaktywna na tym serwerze.']);
+            exit;
+        }
+
+        $webhookBody = (string)file_get_contents('php://input', false, null, 0, PlatformWebhookRequest::MAX_BODY_BYTES + 1);
+        if (strlen($webhookBody) > PlatformWebhookRequest::MAX_BODY_BYTES) {
+            jsonResponse(413, ['code' => 'payload_too_large', 'error' => 'Żądanie jest zbyt duże.']);
+            exit;
+        }
+
+        $webhookParsed = PlatformWebhookRequest::parse([
+            'x-bz-organization-token' => requestHeaderValue('X-BZ-Organization-Token'),
+            'idempotency-key' => requestHeaderValue('Idempotency-Key'),
+        ], $webhookBody);
+        unset($webhookBody);
+        if (!$webhookParsed['ok']) {
+            jsonResponse(400, ['code' => 'invalid_request', 'error' => 'Nieprawidłowe żądanie webhooka.']);
+            exit;
+        }
+
+        $webhookRequest = $webhookParsed['request'];
+        $webhookConnection = (new PlatformConnectionRepository($pdo))->findByPlatformEventId((string)$webhookRequest['event_id']);
+        $webhookToken = $webhookConnection !== null && (int)$webhookConnection['is_enabled'] === 1
+            ? $webhookConfig->cipher()->decrypt((string)$webhookConnection['organization_token_ciphertext'], (string)$webhookConnection['event_id'])
+            : null;
+        $webhookDecision = PlatformWebhookAuthenticator::decide($webhookConnection, $webhookToken, (string)$webhookRequest['token']);
+        unset($webhookToken, $webhookRequest['token'], $webhookParsed);
+
+        if ($webhookDecision !== 'ok') {
+            ApplicationLogger::log('warning', 'platform_webhook.rejected', 'Platform webhook rejected', [
+                'reason' => $webhookDecision,
+                'platform_event_id' => (string)$webhookRequest['event_id'],
+            ]);
+            jsonResponse(403, ['code' => 'forbidden', 'error' => 'Brak dostępu.']);
+            exit;
+        }
+
+        $webhookResult = (new PlatformCriticalChangeService(new PdoPlatformWebhookStore($pdo)))->handle(
+            (string)$webhookConnection['event_id'],
+            $webhookRequest,
+            gmdate('Y-m-d H:i:s')
+        );
+        if ($webhookResult['http'] === 503) {
+            header('Retry-After: ' . (int)$webhookResult['retry_after']);
+            jsonResponse(503, ['code' => 'busy', 'error' => 'Trwa synchronizacja z platformą. Spróbuj ponownie później.']);
+            exit;
+        }
+        if ($webhookResult['http'] !== 200) {
+            jsonResponse(500, ['code' => 'webhook_failed', 'error' => 'Nie udało się zapisać zgłoszenia.']);
+            exit;
+        }
+
+        jsonResponse(200, ['success' => true, 'data' => ['status' => $webhookResult['status']]]);
         exit;
     }
 
