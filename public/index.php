@@ -6618,6 +6618,20 @@ try {
 
         return $readable;
     };
+    // Queue counters for the office (null before migration 030); the presenter only reads them from the row.
+    $withPlatformPushCounts = static function (PDO $pdo, ?array $row): ?array {
+        if ($row === null) {
+            return null;
+        }
+
+        $counts = (new PdoPlatformPushQueueStore($pdo))->countsForEvent((string)$row['event_id']);
+        if ($counts !== null) {
+            $row['push_pending'] = $counts['pending'];
+            $row['push_failed'] = $counts['failed'];
+        }
+
+        return $row;
+    };
     $platformUnavailableResponse = static function (PlatformIntegrationConfig $config): void {
         jsonResponse(503, [
             'error' => 'Integracja z platformą jest nieaktywna na tym serwerze.',
@@ -6645,7 +6659,7 @@ try {
         $platformRow = (new PlatformConnectionRepository($pdo))->find($eventId);
 
         jsonResponse(200, [
-            'data' => PlatformConnectionPresenter::present($platformRow, $platformConfig, $platformTokenReadable($platformConfig, $platformRow)),
+            'data' => PlatformConnectionPresenter::present($withPlatformPushCounts($pdo, $platformRow), $platformConfig, $platformTokenReadable($platformConfig, $platformRow)),
         ]);
         exit;
     }
@@ -6743,7 +6757,7 @@ try {
 
         $platformRow = $platformRepository->find($eventId);
         jsonResponse(200, [
-            'data' => PlatformConnectionPresenter::present($platformRow, $platformConfig, $platformTokenReadable($platformConfig, $platformRow)),
+            'data' => PlatformConnectionPresenter::present($withPlatformPushCounts($pdo, $platformRow), $platformConfig, $platformTokenReadable($platformConfig, $platformRow)),
         ]);
         exit;
     }
@@ -6824,7 +6838,7 @@ try {
                     'status' => $platformResult['status'],
                     'participant_count' => $platformResult['participant_count'],
                 ],
-                'connection' => PlatformConnectionPresenter::present($platformRow, $platformConfig, $platformTokenReadable($platformConfig, $platformRow))['connection'],
+                'connection' => PlatformConnectionPresenter::present($withPlatformPushCounts($pdo, $platformRow), $platformConfig, $platformTokenReadable($platformConfig, $platformRow))['connection'],
             ],
         ]);
         exit;
@@ -6907,7 +6921,7 @@ try {
         jsonResponse(200, [
             'data' => [
                 'result' => $platformPullResult,
-                'connection' => PlatformConnectionPresenter::present($platformRow, $platformConfig, $platformTokenReadable($platformConfig, $platformRow))['connection'],
+                'connection' => PlatformConnectionPresenter::present($withPlatformPushCounts($pdo, $platformRow), $platformConfig, $platformTokenReadable($platformConfig, $platformRow))['connection'],
             ],
         ]);
         exit;

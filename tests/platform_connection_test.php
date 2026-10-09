@@ -259,8 +259,15 @@ test('presenter exposes only whitelisted connection keys', function (): void {
     assertSame([
         'platform_event_id', 'is_enabled', 'token_set', 'token_hint', 'token_readable',
         'token_updated_at', 'last_test_at', 'last_test_status',
-        'last_pull_at', 'last_pull_status', 'last_pull_summary', 'updated_at',
+        'last_pull_at', 'last_pull_status', 'last_pull_summary', 'last_webhook_at', 'push_pending', 'push_failed', 'updated_at',
     ], array_keys($view['connection']));
+    assertNullValue($view['connection']['last_webhook_at']);
+    assertNullValue($view['connection']['push_pending']);
+    assertNullValue($view['connection']['push_failed']);
+    $withCounts = PlatformConnectionPresenter::present($row + ['last_webhook_at' => '2026-10-05 10:07:00', 'push_pending' => 3, 'push_failed' => '1'], platformConfig(), true);
+    assertSame('2026-10-05T10:07:00Z', $withCounts['connection']['last_webhook_at']);
+    assertSame(3, $withCounts['connection']['push_pending']);
+    assertSame(1, $withCounts['connection']['push_failed']);
     assertTrue($view['connection']['is_enabled'] === true);
     assertTrue($view['connection']['token_readable'] === true);
     assertSame('2026-10-05T10:00:00Z', $view['connection']['token_updated_at']);

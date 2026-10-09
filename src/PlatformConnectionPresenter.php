@@ -26,6 +26,9 @@ final class PlatformConnectionPresenter
                 'last_pull_at' => self::iso($row['last_pull_finished_at'] ?? null) ?? self::iso($row['last_pull_started_at'] ?? null),
                 'last_pull_status' => isset($row['last_pull_status']) ? (string)$row['last_pull_status'] : null,
                 'last_pull_summary' => self::summary($row['last_pull_summary_json'] ?? null),
+                'last_webhook_at' => self::iso($row['last_webhook_at'] ?? null),
+                'push_pending' => isset($row['push_pending']) && is_numeric($row['push_pending']) ? (int)$row['push_pending'] : null,
+                'push_failed' => isset($row['push_failed']) && is_numeric($row['push_failed']) ? (int)$row['push_failed'] : null,
                 'updated_at' => isset($row['updated_at_unix'])
                     ? gmdate('Y-m-d\TH:i:s\Z', (int)$row['updated_at_unix'])
                     : self::iso($row['updated_at'] ?? null),
