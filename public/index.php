@@ -1948,6 +1948,8 @@ try {
                 bib_number,
                 qr_code,
                 identity_code,
+                platform_registration_id,
+                platform_removed_at,
                 custom_fields_json,
                 status,
                 email_status,
@@ -1988,6 +1990,8 @@ try {
                 bib_number,
                 qr_code,
                 identity_code,
+                platform_registration_id,
+                platform_removed_at,
                 custom_fields_json,
                 status,
                 email_status,
@@ -2030,6 +2034,8 @@ try {
                 bib_number,
                 qr_code,
                 identity_code,
+                platform_registration_id,
+                platform_removed_at,
                 custom_fields_json,
                 status,
                 email_status,
@@ -2072,6 +2078,8 @@ try {
                 bib_number,
                 qr_code,
                 identity_code,
+                platform_registration_id,
+                platform_removed_at,
                 custom_fields_json,
                 status,
                 email_status,
@@ -2123,6 +2131,8 @@ try {
                 bib_number,
                 qr_code,
                 identity_code,
+                platform_registration_id,
+                platform_removed_at,
                 custom_fields_json,
                 status,
                 email_status,
@@ -2179,6 +2189,10 @@ try {
             'payment_status' => (string)($participant['payment_status'] ?? 'unknown'),
             'checked_in_at' => $participant['checked_in_at'],
             'qr_code' => (string)$participant['qr_code'],
+            // Withdrawn on the platform: warned about, never blocked. Hidden together with the identity code (403-with-data replies).
+            'platform_removed_at' => $includeIdentityCode && isset($participant['platform_removed_at']) && $participant['platform_removed_at'] !== null
+                ? (string)$participant['platform_removed_at']
+                : null,
             // The competitor code is a long-lived secret: never expose it to a caller without access to the event.
             'identity_code' => $includeIdentityCode && isset($participant['identity_code']) && $participant['identity_code'] !== null
                 ? (string)$participant['identity_code']
@@ -2222,11 +2236,46 @@ try {
         return [$event, null];
     };
 
+    // Queues what the office changed for the platform; the request itself never calls the platform.
+    // A failure (for example before migration 030 is applied) is logged and never fails the office action.
+    $enqueuePlatformPush = static function (PDO $pdo, array $participant, array $fields): void {
+        if (trim((string)($participant['platform_registration_id'] ?? '')) === '' || $fields === []) {
+            return;
+        }
+
+        try {
+            (new PdoPlatformPushQueueStore($pdo))->enqueue((string)$participant['event_id'], (int)$participant['id'], $fields, gmdate('Y-m-d H:i:s'));
+        } catch (Throwable $exception) {
+            ApplicationLogger::log('warning', 'platform_push.enqueue_failed', 'Platform push could not be queued', [
+                'participant_id' => (int)$participant['id'],
+                'event_id' => (string)$participant['event_id'],
+                'field_keys' => array_keys($fields),
+                'exception_class' => $exception::class,
+            ]);
+        }
+    };
+
+    $enqueuePlatformCorrections = static function (PDO $pdo, array $participant, array $changedFields) use ($enqueuePlatformPush): void {
+        if (trim((string)($participant['platform_registration_id'] ?? '')) === '' || $changedFields === []) {
+            return;
+        }
+
+        try {
+            $keys = PlatformPushFieldMap::platformKeys($changedFields, (new PdoPlatformPushQueueStore($pdo))->aliasByKey((string)$participant['event_id']));
+        } catch (Throwable) {
+            $keys = PlatformPushFieldMap::platformKeys($changedFields, []);
+        }
+
+        $nowUtc = gmdate('Y-m-d H:i:s');
+        $enqueuePlatformPush($pdo, $participant, array_fill_keys($keys, ['at' => $nowUtc]));
+    };
+
     $updateParticipantStatus = static function (
         PDO $pdo,
         array $participant,
-        string $status
-    ) use ($loadParticipantById, $isValidParticipantStatus, $participantStatusCountsAsCheckedIn): array {
+        string $status,
+        ?array $actor = null
+    ) use ($loadParticipantById, $isValidParticipantStatus, $participantStatusCountsAsCheckedIn, $enqueuePlatformPush): array {
         if (!$isValidParticipantStatus($status)) {
             throw new InvalidArgumentException('Nieobsługiwany status uczestnika');
         }
@@ -2240,6 +2289,19 @@ try {
         $stmt->bindValue(':checked_in_at', $checkedInAt, $checkedInAt === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
         $stmt->bindValue(':id', (int)$participant['id'], PDO::PARAM_INT);
         $stmt->execute();
+
+        // Check-in and undo travel to the platform together (checked_in_at and checked_in_by in one request).
+        // JSON_MERGE_PATCH drops keys set to null, so "cleared" is an empty string here.
+        if (($participant['checked_in_at'] ?? null) !== $checkedInAt) {
+            $changedAtUtc = gmdate('Y-m-d H:i:s');
+            $enqueuePlatformPush($pdo, $participant, [
+                'checked_in_at' => ['at' => $changedAtUtc],
+                'checked_in_by' => [
+                    'at' => $changedAtUtc,
+                    'value' => $checkedInAt === null ? '' : mb_substr(trim((string)($actor['name'] ?? '')), 0, 100),
+                ],
+            ]);
+        }
 
         return $loadParticipantById($pdo, (int)$participant['id']) ?: $participant;
     };
@@ -9339,7 +9401,7 @@ try {
 
             try {
                 if ($requestedStatus !== (string)$participant['status']) {
-                    $participant = $updateParticipantStatus($pdo, $participant, $requestedStatus);
+                    $participant = $updateParticipantStatus($pdo, $participant, $requestedStatus, $authUser);
                     $addActivityLog(
                         $pdo,
                         sprintf('Zsynchronizowano status uczestnika z wezla lokalnego na %s', $requestedStatus),
@@ -9632,7 +9694,7 @@ try {
                 try {
                     $participantStateBeforeBibUpdate = $normalizeParticipantChangeState($participant);
                     if ($nextStatus !== $statusBeforeUpdate) {
-                        $participant = $updateParticipantStatus($pdo, $participant, $nextStatus);
+                        $participant = $updateParticipantStatus($pdo, $participant, $nextStatus, $authUser);
                         $addActivityLog(
                             $pdo,
                             sprintf('Zmieniono status uczestnika na %s', $nextStatus),
@@ -9787,6 +9849,9 @@ try {
                     $updateBibNumberStmt->execute();
 
                     $participant = $loadParticipantById($pdo, (int)$participant['id']) ?: $participant;
+                    if ($normalizeParticipantBibNumber($participant['bib_number'] ?? null) !== $currentBibNumber) {
+                        $enqueuePlatformCorrections($pdo, $participant, ['bib_number']);
+                    }
                     if ($hasParticipantChangeBaseline && is_array($participantStateBeforeBibUpdate)) {
                         $participantStateAfterBibUpdate = $normalizeParticipantChangeState($participant);
                         $changedFields = $diffParticipantChangeStates($participantStateBeforeBibUpdate, $participantStateAfterBibUpdate);
@@ -9959,6 +10024,9 @@ try {
             ]);
 
             $participant = $loadParticipantById($pdo, (int)$participant['id']) ?: $participant;
+            if (trim((string)($participant['platform_registration_id'] ?? '')) !== '') {
+                $enqueuePlatformCorrections($pdo, $participant, $diffParticipantChangeStates($participantStateBeforeDataUpdate, $normalizeParticipantChangeState($participant)));
+            }
             if ($hasParticipantChangeBaseline) {
                 $participantStateAfterDataUpdate = $normalizeParticipantChangeState($participant);
                 $changedFields = $diffParticipantChangeStates($participantStateBeforeDataUpdate, $participantStateAfterDataUpdate);
@@ -10012,7 +10080,7 @@ try {
             exit;
         }
 
-        $participant = $updateParticipantStatus($pdo, $participant, 'checked_in');
+        $participant = $updateParticipantStatus($pdo, $participant, 'checked_in', $authUser);
         $addActivityLog(
             $pdo,
             'Check-in',
@@ -10042,7 +10110,7 @@ try {
             exit;
         }
 
-        $participant = $updateParticipantStatus($pdo, $participant, 'not_checked_in');
+        $participant = $updateParticipantStatus($pdo, $participant, 'not_checked_in', $authUser);
         $addActivityLog(
             $pdo,
             'Cofnieto odprawe',
