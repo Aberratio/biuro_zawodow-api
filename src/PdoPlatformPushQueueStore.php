@@ -270,23 +270,6 @@ final class PdoPlatformPushQueueStore implements PlatformPushQueueStore
         }
     }
 
-    /** @return array<string, string> event id => latest pull request (UTC); empty before migration 030 */
-    public function loadPullRequests(): array
-    {
-        try {
-            $stmt = $this->pdo->query('SELECT event_id, pull_requested_at FROM event_platform_connections WHERE pull_requested_at IS NOT NULL');
-        } catch (PDOException) {
-            return [];
-        }
-
-        $requests = [];
-        foreach ($stmt === false ? [] : $stmt->fetchAll() as $row) {
-            $requests[(string)$row['event_id']] = (string)$row['pull_requested_at'];
-        }
-
-        return $requests;
-    }
-
     public function addActivity(string $eventId, ?int $participantId, ?string $participantName, string $action, array $metadata): void
     {
         $text = mb_strlen($action) > 190 ? mb_substr($action, 0, 189) . '…' : $action;

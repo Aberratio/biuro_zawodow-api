@@ -10,10 +10,10 @@ require_once __DIR__ . '/PlatformIntegrationConfig.php';
  */
 final class PlatformApiClient
 {
-    /** @var callable(string, string, array<string, string>, int): array{status: int, body: string} */
+    /** @var callable the fifth argument (request body) is only passed by patchParticipant */
     private $transport;
 
-    /** @param null|callable(string $method, string $url, array<string,string> $headers, int $timeout): array{status:int, body:string} $transport */
+    /** @param null|callable(string $method, string $url, array<string,string> $headers, int $timeout, ?string $body): array{status:int, body:string} $transport */
     public function __construct(private readonly PlatformIntegrationConfig $config, ?callable $transport = null)
     {
         $this->transport = $transport ?? [self::class, 'defaultTransport'];
@@ -22,6 +22,69 @@ final class PlatformApiClient
     public function participantsUrl(string $platformEventId): string
     {
         return $this->config->apiBaseUrl() . '/events/' . rawurlencode($platformEventId) . '/bz/participants';
+    }
+
+    public function participantUrl(string $platformEventId, string $registrationId): string
+    {
+        return $this->participantsUrl($platformEventId) . '/' . rawurlencode($registrationId);
+    }
+
+    /**
+     * Sends one change set for one participant (one attempt: the push queue is the retry).
+     * Only field keys and reason codes of the answer survive, never values, headers, the token or exception text.
+     *
+     * @param array<string, mixed> $body {fields: {key: {value, changedAt}}, reason?}
+     * @return array{status: string, http_status: ?int, data: ?array{applied: list<string>, rejected: array<string, string>}}
+     */
+    public function patchParticipant(string $platformEventId, string $registrationId, string $organizationToken, array $body): array
+    {
+        $headers = [
+            'Accept' => 'application/json',
+            'Content-Type' => 'application/json',
+            'X-API-Key' => $this->config->appKey(),
+            'X-BZ-Organization-Token' => $organizationToken,
+        ];
+
+        try {
+            $response = ($this->transport)(
+                'PATCH',
+                $this->participantUrl($platformEventId, $registrationId),
+                $headers,
+                $this->config->timeoutSeconds(),
+                (string)json_encode($body, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)
+            );
+        } catch (Throwable) {
+            return ['status' => 'network_error', 'http_status' => null, 'data' => null];
+        }
+
+        $http = (int)($response['status'] ?? 0);
+        $status = match (true) {
+            $http === 200 => 'invalid_response',
+            $http === 401 => 'app_key_rejected',
+            $http === 403 => 'token_rejected',
+            $http === 404 => 'platform_registration_not_found',
+            $http === 422 => 'platform_validation_rejected',
+            $http === 429 => 'platform_rate_limited',
+            default => 'platform_error',
+        };
+
+        $data = null;
+        if ($http === 200) {
+            $decoded = json_decode((string)($response['body'] ?? ''), true);
+            if (is_array($decoded) && isset($decoded['data']) && is_array($decoded['data'])) {
+                $status = 'ok';
+                $applied = isset($decoded['data']['applied']) && is_array($decoded['data']['applied']) ? array_keys($decoded['data']['applied']) : [];
+                $rejected = [];
+                foreach (is_array($decoded['data']['rejected'] ?? null) ? $decoded['data']['rejected'] : [] as $key => $detail) {
+                    if (is_string($key) && is_array($detail) && isset($detail['reason']) && is_string($detail['reason']) && preg_match('/^[a-z_]{1,40}$/', $detail['reason']) === 1) {
+                        $rejected[$key] = $detail['reason'];
+                    }
+                }
+                $data = ['applied' => array_values(array_map('strval', $applied)), 'rejected' => $rejected];
+            }
+        }
+
+        return ['status' => $status, 'http_status' => $http > 0 ? $http : null, 'data' => $data];
     }
 
     /** @return array{status: string, participant_count: ?int, http_status: ?int} */
@@ -125,23 +188,26 @@ final class PlatformApiClient
     }
 
     /** @return array{status: int, body: string} */
-    public static function defaultTransport(string $method, string $url, array $headers, int $timeout): array
+    public static function defaultTransport(string $method, string $url, array $headers, int $timeout, ?string $body = null): array
     {
         $lines = [];
         foreach ($headers as $name => $value) {
             $lines[] = $name . ': ' . $value;
         }
 
-        $context = stream_context_create([
-            'http' => [
-                'method' => $method,
-                'header' => implode("\r\n", $lines),
-                'timeout' => $timeout,
-                'ignore_errors' => true,
-                'follow_location' => 0,
-                'max_redirects' => 0,
-            ],
-        ]);
+        $options = [
+            'method' => $method,
+            'header' => implode("\r\n", $lines),
+            'timeout' => $timeout,
+            'ignore_errors' => true,
+            'follow_location' => 0,
+            'max_redirects' => 0,
+        ];
+        if ($body !== null) {
+            $options['content'] = $body;
+        }
+
+        $context = stream_context_create(['http' => $options]);
 
         set_error_handler(static function (int $severity, string $message): bool {
             throw new RuntimeException('platform_transport_error');

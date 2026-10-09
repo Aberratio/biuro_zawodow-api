@@ -1230,6 +1230,14 @@ test('schedule pulls more often as the event approaches', function (): void {
     assertTrue(PlatformPullSchedule::isDue('2026-10-07 11:55:10', 300, $now), 'cron jitter tolerance');
     assertFalse(PlatformPullSchedule::isDue('2026-10-07 10:00:00', 21600, $now));
     assertTrue(PlatformPullSchedule::isDue('2026-10-07 05:59:00', 21600, $now));
+
+    // requested pulls (webhook refunds): due as soon as the request is newer than the last pull
+    assertTrue(PlatformPullSchedule::isDue('2026-10-07 11:58:00', 300, $now, '2026-10-07 11:59:00'));
+    assertFalse(PlatformPullSchedule::isDue('2026-10-07 11:59:30', 300, $now, '2026-10-07 11:59:00'), 'a pull after the request satisfies it');
+    assertTrue(PlatformPullSchedule::isDue(null, 300, $now, '2026-10-07 11:59:00'));
+    assertFalse(PlatformPullSchedule::isDue('2026-10-07 11:58:00', null, $now, '2026-10-07 11:59:00'), 'ended schedules stay ended');
+    assertFalse(PlatformPullSchedule::isDue('2026-10-07 11:58:00', 300, $now, null));
+    assertTrue(PlatformPullSchedule::isDue('2026-10-07 11:50:00', 300, $now, null));
 });
 
 test('status texts are Polish for every code and activity entries fit the column', function (): void {

@@ -60,6 +60,7 @@ try {
     $service = new PlatformParticipantPullService($store, $config, new PlatformApiClient($config));
     $nowUtc = new DateTimeImmutable('now', new DateTimeZone('UTC'));
     $nowLocal = new DateTimeImmutable('now');
+    $pullRequests = $eventOption === null && !$force ? $store->loadPullRequests() : [];
 
     $targets = [];
     if ($eventOption !== null) {
@@ -72,7 +73,7 @@ try {
                     fwrite(STDOUT, sprintf("%s not_due schedule_ended\n", $row['id']));
                     continue;
                 }
-                if (!PlatformPullSchedule::isDue($row['last_pull_started_at'] !== null ? (string)$row['last_pull_started_at'] : null, $interval, $nowUtc)) {
+                if (!PlatformPullSchedule::isDue($row['last_pull_started_at'] !== null ? (string)$row['last_pull_started_at'] : null, $interval, $nowUtc, $pullRequests[(string)$row['id']] ?? null)) {
                     fwrite(STDOUT, sprintf(
                         "%s not_due next_in=%ds\n",
                         $row['id'],

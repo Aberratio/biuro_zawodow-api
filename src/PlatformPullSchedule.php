@@ -45,10 +45,15 @@ final class PlatformPullSchedule
         return $days <= 7 ? self::NEAR_SECONDS : self::FAR_SECONDS;
     }
 
-    public static function isDue(?string $lastPullStartedUtc, ?int $intervalSeconds, DateTimeImmutable $nowUtc): bool
+    /** @param ?string $pullRequestedUtc set by a webhook that wants a fresh list (for example after a refund) */
+    public static function isDue(?string $lastPullStartedUtc, ?int $intervalSeconds, DateTimeImmutable $nowUtc, ?string $pullRequestedUtc = null): bool
     {
         if ($intervalSeconds === null) {
             return false;
+        }
+        if ($pullRequestedUtc !== null && $pullRequestedUtc !== ''
+            && ($lastPullStartedUtc === null || $lastPullStartedUtc === '' || $pullRequestedUtc > $lastPullStartedUtc)) {
+            return true;
         }
         if ($lastPullStartedUtc === null || $lastPullStartedUtc === '') {
             return true;

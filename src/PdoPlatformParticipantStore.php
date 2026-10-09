@@ -72,6 +72,23 @@ final class PdoPlatformParticipantStore implements PlatformParticipantStore
         return $stmt === false ? [] : $stmt->fetchAll();
     }
 
+    /** @return array<string, string> event id => latest pull request (UTC); empty before migration 030 */
+    public function loadPullRequests(): array
+    {
+        try {
+            $stmt = $this->pdo->query('SELECT event_id, pull_requested_at FROM event_platform_connections WHERE pull_requested_at IS NOT NULL');
+        } catch (PDOException) {
+            return [];
+        }
+
+        $requests = [];
+        foreach ($stmt === false ? [] : $stmt->fetchAll() as $row) {
+            $requests[(string)$row['event_id']] = (string)$row['pull_requested_at'];
+        }
+
+        return $requests;
+    }
+
     public function tryLock(string $eventId): bool
     {
         $stmt = $this->pdo->prepare('SELECT GET_LOCK(:lock_name, 0)');
