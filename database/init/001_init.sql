@@ -228,7 +228,7 @@ CREATE TABLE event_participant_change_logs (
     baseline_record_id BIGINT UNSIGNED NULL,
     participant_id BIGINT UNSIGNED NULL,
     change_type ENUM('added', 'updated', 'deleted') NOT NULL,
-    change_source ENUM('csv_import', 'manual', 'participant_edit', 'participant_delete', 'bib_conflict_resolution', 'platform_sync') NOT NULL,
+    change_source ENUM('csv_import', 'manual', 'participant_edit', 'participant_delete', 'bib_conflict_resolution', 'platform_sync', 'platform_webhook') NOT NULL,
     changed_fields_json LONGTEXT NULL,
     before_state_json LONGTEXT NULL,
     after_state_json LONGTEXT NULL,

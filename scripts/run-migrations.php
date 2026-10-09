@@ -251,6 +251,12 @@ $adoptionChecks = [
             && $indexExists($pdo, 'participants', 'uq_participants_event_platform_registration')
             && $columnExists($pdo, 'event_platform_connections', 'last_pull_summary_json');
     },
+    '030_add_platform_webhooks_and_push_queue.php' => static function (PDO $pdo) use ($columnExists, $tableExists): bool {
+        return $tableExists($pdo, 'platform_webhook_receipts')
+            && $tableExists($pdo, 'platform_push_queue')
+            && $columnExists($pdo, 'event_platform_connections', 'pull_requested_at')
+            && $columnExists($pdo, 'event_platform_connections', 'last_webhook_at');
+    },
 ];
 
 $pending = [];
