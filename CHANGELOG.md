@@ -16,10 +16,10 @@ Upgrade notes:
 
 ### Added
 
-- A superadmin switch for who may use the platform integration: `off`,
-  `superadmin` (the default) or `on`, read and changed through
+- A superadmin switch for who may set up and run the platform integration:
+  `off`, `superadmin` (the default) or `on`, read and changed through
   `GET`/`PUT /superadmin/platform-integration`. Every change is written to the
-  audit log.
+  audit log. Connections that already exist keep syncing in every mode.
 
 ### Changed
 

@@ -4,8 +4,9 @@ declare(strict_types=1);
 
 /**
  * Who may use the platform integration, set by a superadmin (app_settings.platform_integration).
- * `off`: nobody; `superadmin`: superadmins only, others see a notice; `on`: every role the endpoints allow.
- * A missing row or table means `superadmin`, so a fresh deploy never exposes the feature.
+ * It governs changes to connections (save, test, pull, disconnect): `off`: nobody; `superadmin`: superadmins only,
+ * others see a notice; `on`: every role the endpoints allow. Webhooks, cron pulls and the push queue keep serving
+ * connections that already exist. A missing row or table means `superadmin`, so a fresh deploy never exposes the feature.
  */
 final class PlatformIntegrationAccess
 {
@@ -35,8 +36,11 @@ final class PlatformIntegrationAccess
             $stmt = $pdo->prepare('SELECT setting_value FROM app_settings WHERE setting_key = :setting_key LIMIT 1');
             $stmt->execute(['setting_key' => self::SETTING_KEY]);
             $value = $stmt->fetchColumn();
-        } catch (PDOException) {
-            // Table not migrated yet: keep the safe default.
+        } catch (PDOException $exception) {
+            // Table not migrated yet (42S02): keep the safe default. Any other database error is real.
+            if ($exception->getCode() !== '42S02') {
+                throw $exception;
+            }
             $value = false;
         }
 
