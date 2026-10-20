@@ -4,9 +4,9 @@ declare(strict_types=1);
 
 /**
  * Reads the release marker that the deploy workflow writes next to the code
- * (`.release` in the API root). `VERSION` is set only when production is
- * deployed from a release tag; a local checkout has no marker at all, so
- * both values may be null.
+ * (`.release` in the API root). `VERSION` is set only when a vYYYY.MM.PATCH
+ * release tag is deployed, to any environment; a local checkout has no marker
+ * at all, so both values may be null.
  */
 final class ReleaseInfo
 {

@@ -76,9 +76,11 @@ jobs:
             --exclude='artifact' \
             --exclude='serv.zip' \
             --exclude='server.zip'
-          # VERSION is set only for a release tag (RELEASING.md); /health reports it.
+          # VERSION is set only for a vYYYY.MM.PATCH release tag (RELEASING.md); /health reports it.
           RELEASE_VERSION=""
-          if [ "$GITHUB_REF_TYPE" = "tag" ]; then RELEASE_VERSION="${GITHUB_REF_NAME#v}"; fi
+          if [[ "$GITHUB_REF_TYPE" == "tag" && "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            RELEASE_VERSION="${GITHUB_REF_NAME#v}"
+          fi
           printf 'GIT_SHA=%s\nVERSION=%s\n' "$GITHUB_SHA" "$RELEASE_VERSION" > artifact/api/.release
           cd artifact/api
           zip -r ../api.zip .
