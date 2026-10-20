@@ -1,0 +1,46 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Extract release notes from CHANGELOG.md
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          awk -v heading="## [${VERSION}]" '
+            index($0, heading) == 1 { found = 1; next }
+            found && (/^## \[/ || /^\[[^]]+\]: /) { exit }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+          if ! grep -q '[^[:space:]]' release-notes.md; then
+            echo "::error file=CHANGELOG.md::No '## [${VERSION}]' section found. Cut it in a release PR before pushing the tag (see RELEASING.md)."
+            exit 1
+          fi
+          cat release-notes.md
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --verify-tag \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file release-notes.md
