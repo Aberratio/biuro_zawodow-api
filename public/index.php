@@ -4251,9 +4251,12 @@ try {
 
     if ($path === '/health' && $method === 'GET') {
         $pdo->query('SELECT 1');
+        $release = ReleaseInfo::fromFile(dirname(__DIR__) . '/.release');
         jsonResponse(200, [
             'status' => 'ok',
             'service' => 'biuro-zawodow-api',
+            'version' => $release['version'],
+            'commit' => $release['commit'],
             'timestamp' => gmdate(DATE_ATOM),
         ]);
         exit;

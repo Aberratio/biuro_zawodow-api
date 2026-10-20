@@ -39,6 +39,7 @@ require_once __DIR__ . '/PlatformPushService.php';
 require_once __DIR__ . '/RequestContext.php';
 require_once __DIR__ . '/SentryBridge.php';
 require_once __DIR__ . '/ApplicationLogger.php';
+require_once __DIR__ . '/ReleaseInfo.php';
 
 $composerAutoloadPath = __DIR__ . '/../vendor/autoload.php';
 if (is_file($composerAutoloadPath)) {
@@ -3883,6 +3884,18 @@ function openApiDocument(): array
                     'properties' => [
                         'status' => ['type' => 'string', 'example' => 'ok'],
                         'service' => ['type' => 'string', 'example' => 'biuro-zawodow-api'],
+                        'version' => [
+                            'type' => 'string',
+                            'nullable' => true,
+                            'description' => 'Deployed release; null when not deployed from a release tag.',
+                            'example' => '2026.10.0',
+                        ],
+                        'commit' => [
+                            'type' => 'string',
+                            'nullable' => true,
+                            'description' => 'Short SHA of the deployed commit; null outside deploys.',
+                            'example' => '6d9302e',
+                        ],
                         'timestamp' => ['type' => 'string', 'format' => 'date-time'],
                     ],
                 ],
