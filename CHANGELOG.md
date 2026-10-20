@@ -22,6 +22,7 @@ and deployed.
   the command line. Withdrawals made on the platform and the push status are
   shown to the race office.
 - Participant identity codes, resolved when a code is scanned.
+- `/health` reports the deployed `version` and `commit`.
 
 ### Changed
 
