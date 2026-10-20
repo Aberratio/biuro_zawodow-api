@@ -9,6 +9,26 @@ and deployed.
 
 ## [Unreleased]
 
+## [2026.10.0] - 2026-10-20
+
+Adds the integration with the ZmierzymyCzas platform. It stays inactive until
+the `BZ_PLATFORM_*` variables are set, so this release can ship before the
+platform goes live.
+
+Upgrade notes:
+
+- Runs migrations `027` to `030` (identity codes, platform connections,
+  participant sync, webhook receipts and push queue). Deploy with
+  `migration_mode` set to `run`.
+- To turn the integration on later, set `BZ_PLATFORM_API_URL`,
+  `BZ_PLATFORM_APP_KEY` and `BZ_PLATFORM_TOKEN_KEY` (see `.example.env`),
+  keep a copy of the token key outside the server, and add the
+  `pull-platform-participants.php` and `push-platform-changes.php` cron
+  jobs.
+- The screens for these features ship in the next biuro_zawodow-client
+  release. The API stays compatible with the client in production, so it
+  goes first.
+
 ### Added
 
 - Per-event connection to the ZmierzymyCzas platform, stored encrypted.
@@ -60,5 +80,6 @@ earlier production deploys were not versioned.
   limiting on login and password reset, server-side filtering of sensitive
   data.
 
-[Unreleased]: https://github.com/Aberratio/biuro_zawodow-api/compare/v2026.09.0...HEAD
+[Unreleased]: https://github.com/Aberratio/biuro_zawodow-api/compare/v2026.10.0...HEAD
+[2026.10.0]: https://github.com/Aberratio/biuro_zawodow-api/compare/v2026.09.0...v2026.10.0
 [2026.09.0]: https://github.com/Aberratio/biuro_zawodow-api/releases/tag/v2026.09.0
