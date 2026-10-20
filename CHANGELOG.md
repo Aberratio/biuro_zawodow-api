@@ -9,6 +9,26 @@ and deployed.
 
 ## [Unreleased]
 
+Upgrade notes:
+
+- Runs migration `031` (application settings). Deploy with `migration_mode`
+  set to `run`.
+
+### Added
+
+- A superadmin switch for who may set up and run the platform integration:
+  `off`, `superadmin` (the default) or `on`, read and changed through
+  `GET`/`PUT /superadmin/platform-integration`. Every change is written to the
+  audit log. Connections that already exist keep syncing in every mode.
+
+### Changed
+
+- Saving, testing, importing and deleting a platform connection
+  answer `403` with code `platform_integration_not_enabled` unless the switch
+  allows the caller. `GET /events/{id}/platform-connection` now returns an
+  `access` object (`mode`, `can_use`) so the client can show a notice instead.
+  Until it is set to `on`, only superadmins can use the integration.
+
 ## [2026.10.0] - 2026-10-20
 
 Adds the integration with the ZmierzymyCzas platform. It stays inactive until

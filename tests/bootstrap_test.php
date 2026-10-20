@@ -148,6 +148,7 @@ test('documents critical API paths in the generated OpenAPI document', function 
         '/superadmin/server-logs',
         '/superadmin/database',
         '/superadmin/logging-status',
+        '/superadmin/platform-integration',
         '/events/{id}/participant-imports/analyze',
         '/events/{id}/participant-imports/run',
         '/events/{id}/participant-field-mappings',
