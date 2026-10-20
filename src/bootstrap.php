@@ -9,6 +9,7 @@ require_once __DIR__ . '/QrCodeService.php';
 require_once __DIR__ . '/ParticipantCodePolicy.php';
 require_once __DIR__ . '/PlatformTokenCipher.php';
 require_once __DIR__ . '/PlatformIntegrationConfig.php';
+require_once __DIR__ . '/PlatformIntegrationAccess.php';
 require_once __DIR__ . '/PlatformConnectionInput.php';
 require_once __DIR__ . '/PlatformConnectionPresenter.php';
 require_once __DIR__ . '/PlatformApiClient.php';
@@ -1555,6 +1556,32 @@ function openApiDocument(): array
                     'responses' => [
                         '200' => ['description' => 'Logging status'],
                         '403' => ['$ref' => '#/components/responses/Forbidden'],
+                    ],
+                ],
+            ],
+            '/superadmin/platform-integration' => [
+                'get' => [
+                    'tags' => ['Superadmin'],
+                    'summary' => 'Load who may use the platform integration',
+                    'security' => [['bearerAuth' => []]],
+                    'responses' => [
+                        '200' => ['description' => 'Current mode: off, superadmin or on'],
+                        '403' => ['$ref' => '#/components/responses/Forbidden'],
+                    ],
+                ],
+                'put' => [
+                    'tags' => ['Superadmin'],
+                    'summary' => 'Change who may use the platform integration (audited)',
+                    'security' => [['bearerAuth' => []]],
+                    'requestBody' => ['required' => true, 'content' => ['application/json' => ['schema' => [
+                        'type' => 'object',
+                        'required' => ['mode'],
+                        'properties' => ['mode' => ['type' => 'string', 'enum' => ['off', 'superadmin', 'on']]],
+                    ]]]],
+                    'responses' => [
+                        '200' => ['description' => 'Mode saved'],
+                        '403' => ['$ref' => '#/components/responses/Forbidden'],
+                        '422' => ['description' => 'validation_error'],
                     ],
                 ],
             ],
@@ -3971,6 +3998,7 @@ function openApiDocument(): array
                     'type' => 'object',
                     'properties' => [
                         'availability' => ['type' => 'object', 'properties' => ['available' => ['type' => 'boolean'], 'reasons' => ['type' => 'array', 'items' => ['type' => 'string']]]],
+                        'access' => ['$ref' => '#/components/schemas/PlatformIntegrationAccess'],
                         'connection' => ['type' => 'object', 'nullable' => true, 'properties' => [
                             'platform_event_id' => ['type' => 'string'],
                             'is_enabled' => ['type' => 'boolean'],
@@ -3988,6 +4016,14 @@ function openApiDocument(): array
                             'push_failed' => ['type' => 'integer', 'nullable' => true],
                             'updated_at' => ['type' => 'string', 'nullable' => true],
                         ]],
+                    ],
+                ],
+                'PlatformIntegrationAccess' => [
+                    'type' => 'object',
+                    'description' => 'Only in GET; set by a superadmin through /superadmin/platform-integration',
+                    'properties' => [
+                        'mode' => ['type' => 'string', 'enum' => ['off', 'superadmin', 'on']],
+                        'can_use' => ['type' => 'boolean'],
                     ],
                 ],
                 'PlatformConnectionResponse' => [

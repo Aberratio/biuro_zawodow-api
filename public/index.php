@@ -5204,6 +5204,44 @@ try {
         exit;
     }
 
+    if ($path === '/superadmin/platform-integration' && $method === 'GET') {
+        requireAnyRole(['superadmin'], $resolveAuthenticatedUser);
+        jsonResponse(200, ['data' => ['mode' => PlatformIntegrationAccess::load($pdo)->mode]]);
+        exit;
+    }
+
+    if ($path === '/superadmin/platform-integration' && $method === 'PUT') {
+        $authUser = requireAnyRole(['superadmin'], $resolveAuthenticatedUser);
+        $input = readJsonBody();
+        $mode = $input['mode'] ?? null;
+
+        if (!PlatformIntegrationAccess::isValidMode($mode)) {
+            jsonResponse(422, ['error' => 'Nieznany tryb integracji z platformą', 'code' => 'validation_error']);
+            exit;
+        }
+
+        $previousMode = PlatformIntegrationAccess::load($pdo)->mode;
+        PlatformIntegrationAccess::save($pdo, $mode, (string)$authUser['id']);
+
+        addAuditLog($pdo, [
+            'category' => 'system',
+            'action_code' => 'platform_integration.mode_changed',
+            'action' => sprintf('Zmieniono dostępność integracji z platformą: %s → %s', $previousMode, $mode),
+            'severity' => 'warning',
+            'actor_user_id' => $authUser['id'],
+            'actor_name' => $authUser['name'],
+            'actor_role' => $authUser['role'],
+            'target_type' => 'app_setting',
+            'target_id' => PlatformIntegrationAccess::SETTING_KEY,
+            'organization_id' => null,
+            'event_id' => null,
+            'metadata' => ['previous_mode' => $previousMode, 'mode' => $mode],
+        ]);
+
+        jsonResponse(200, ['data' => ['mode' => $mode]]);
+        exit;
+    }
+
     if ($path === '/superadmin/logging-status' && $method === 'GET') {
         requireAnyRole(['superadmin'], $resolveAuthenticatedUser);
         jsonResponse(200, ['data' => ApplicationLogger::status()]);
@@ -6642,6 +6680,20 @@ try {
 
         return $row;
     };
+    // Superadmin-controlled rollout switch (PlatformIntegrationAccess); answers 403 when the caller may not use the integration yet.
+    $denyPlatformUseUnlessAllowed = static function (PDO $pdo, array $authUser): bool {
+        if (PlatformIntegrationAccess::load($pdo)->canUse((string)$authUser['role'])) {
+            return false;
+        }
+
+        jsonResponse(403, [
+            'error' => 'Integracja z platformą nie jest jeszcze dostępna dla Twojej roli.',
+            'code' => 'platform_integration_not_enabled',
+        ]);
+
+        return true;
+    };
+
     $platformUnavailableResponse = static function (PlatformIntegrationConfig $config): void {
         jsonResponse(503, [
             'error' => 'Integracja z platformą jest nieaktywna na tym serwerze.',
@@ -6669,7 +6721,8 @@ try {
         $platformRow = (new PlatformConnectionRepository($pdo))->find($eventId);
 
         jsonResponse(200, [
-            'data' => PlatformConnectionPresenter::present($withPlatformPushCounts($pdo, $platformRow), $platformConfig, $platformTokenReadable($platformConfig, $platformRow)),
+            'data' => PlatformConnectionPresenter::present($withPlatformPushCounts($pdo, $platformRow), $platformConfig, $platformTokenReadable($platformConfig, $platformRow))
+                + ['access' => PlatformIntegrationAccess::load($pdo)->presentFor((string)$authUser['role'])],
         ]);
         exit;
     }
@@ -6686,6 +6739,10 @@ try {
 
         if (!$canManageEventParticipants($authUser, $event)) {
             jsonResponse(403, ['error' => 'Brak uprawnień']);
+            exit;
+        }
+
+        if ($denyPlatformUseUnlessAllowed($pdo, $authUser)) {
             exit;
         }
 
@@ -6787,6 +6844,10 @@ try {
             exit;
         }
 
+        if ($denyPlatformUseUnlessAllowed($pdo, $authUser)) {
+            exit;
+        }
+
         $platformConfig = PlatformIntegrationConfig::fromProcess();
         if (!$platformConfig->isAvailable()) {
             $platformUnavailableResponse($platformConfig);
@@ -6866,6 +6927,10 @@ try {
 
         if (!$canManageEventParticipants($authUser, $event)) {
             jsonResponse(403, ['error' => 'Brak uprawnień']);
+            exit;
+        }
+
+        if ($denyPlatformUseUnlessAllowed($pdo, $authUser)) {
             exit;
         }
 
@@ -6949,6 +7014,10 @@ try {
 
         if (!$canManageEventParticipants($authUser, $event)) {
             jsonResponse(403, ['error' => 'Brak uprawnień']);
+            exit;
+        }
+
+        if ($denyPlatformUseUnlessAllowed($pdo, $authUser)) {
             exit;
         }
 
